@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A mettre dans le webhook Voice du numero Twilio (ou un TwiML Bin). -->
+<!-- Remplacer l'URL par le domaine Railway du service deploye. -->
+<Response>
+  <Connect>
+    <Stream url="wss://voice-reception-bridge-production.up.railway.app/twilio">
+      <Parameter name="from" value="{{From}}" />
+    </Stream>
+  </Connect>
+</Response>
