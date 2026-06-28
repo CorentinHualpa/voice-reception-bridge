@@ -16,6 +16,7 @@
 //   PORT               injecte par Railway
 
 import http from "http";
+import fs from "fs";
 import { WebSocketServer, WebSocket } from "ws";
 import { ulaw8kToPcm16, pcm16ToUlaw8k } from "./lib/audio.js";
 
@@ -36,9 +37,19 @@ const ADMIN_KEY = process.env.ADMIN_KEY || ""; // protege le tableau de bord /ad
 
 if (!XAI_API_KEY) console.error("[boot] ATTENTION: XAI_API_KEY manquante");
 
-// Historique en memoire des derniers appels (pour le tableau de bord /admin).
-const recentCalls = []; // { ts, from, sid, endReason, dialog }
-function pushCall(c) { recentCalls.unshift(c); if (recentCalls.length > 50) recentCalls.length = 50; }
+// Historique des derniers appels (pour le tableau de bord /admin).
+// Persiste sur un volume Railway si CALLS_FILE est defini (sinon en memoire, perdu au redeploiement).
+const CALLS_FILE = process.env.CALLS_FILE || "";
+function loadCalls() {
+  if (!CALLS_FILE) return [];
+  try { const a = JSON.parse(fs.readFileSync(CALLS_FILE, "utf8")); return Array.isArray(a) ? a : []; } catch { return []; }
+}
+function saveCalls() {
+  if (!CALLS_FILE) return;
+  try { fs.writeFileSync(CALLS_FILE, JSON.stringify(recentCalls)); } catch (e) { console.error("[calls] save KO", e.message); }
+}
+const recentCalls = loadCalls(); // { ts, from, sid, endReason, dialog }
+function pushCall(c) { recentCalls.unshift(c); if (recentCalls.length > 100) recentCalls.length = 100; saveCalls(); }
 function escHtml(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function normLine(s) { return String(s).toLowerCase().replace(/[^0-9a-zà-ÿ@ ]/gi, " ").replace(/\s+/g, " ").trim(); }
 
