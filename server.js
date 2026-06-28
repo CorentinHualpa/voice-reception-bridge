@@ -114,6 +114,19 @@ wss.on("connection", (twilio) => {
   let userBuf = "";
   let agentBuf = "";
   let finalized = false;
+  let endRequested = false;
+  let closingSaid = false;
+  let lastCallerMs = Date.now();
+
+  // Raccroche proprement : on laisse jouer l'audio de cloture deja envoye a Twilio (mark),
+  // puis on ferme le flux Twilio -> Twilio termine l'appel -> twilio.on("close") -> finalize() -> recap.
+  function requestHangup(reason) {
+    if (endRequested || finalized) return;
+    endRequested = true;
+    console.log(`[call] hangup (${reason}) sid=${callSid}`);
+    if (streamSid) { try { twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "hangup" } })); } catch {} }
+    setTimeout(() => { try { twilio.close(); } catch {} }, 7000); // filet si Twilio ne renvoie pas le mark
+  }
 
   function pushUser() { const t = userBuf.trim(); if (t) dialog.push({ who: "Client", msg: t }); userBuf = ""; }
   function pushAgent() { const t = agentBuf.trim(); if (t) dialog.push({ who: "Agent", msg: t }); agentBuf = ""; }
@@ -143,6 +156,12 @@ wss.on("connection", (twilio) => {
           voice: GROK_VOICE,
           turn_detection: { type: "server_vad", threshold: 0.6 },
           input_audio_transcription: { language: AGENT_LANG },
+          tools: [{
+            type: "function",
+            name: "end_call",
+            description: "Raccroche et termine l'appel telephonique en cours. A appeler UNIQUEMENT apres avoir prononce ta phrase de cloture finale et laisse le client dire son dernier mot. Ne jamais appeler avant la cloture.",
+            parameters: { type: "object", properties: {} },
+          }],
           audio: {
             input: { format: { type: "audio/pcm", rate: GROK_RATE } },
             output: { format: { type: "audio/pcm", rate: GROK_RATE } },
@@ -172,7 +191,7 @@ wss.on("connection", (twilio) => {
           break;
         }
         case "response.output_audio_transcript.delta":
-          if (e.delta) agentBuf += e.delta;
+          if (e.delta) { agentBuf += e.delta; if (/remercie pour votre appel/i.test(agentBuf)) closingSaid = true; }
           break;
         case "response.done":
           pushAgent();
@@ -180,7 +199,11 @@ wss.on("connection", (twilio) => {
         case "conversation.item.input_audio_transcription.updated":
           if (typeof e.transcript === "string") userBuf = e.transcript; // cumulatif sur le tour
           break;
+        case "response.function_call_arguments.done":
+          if (e.name === "end_call") requestHangup("end_call");
+          break;
         case "input_audio_buffer.speech_started":
+          lastCallerMs = Date.now();
           if (streamSid) twilio.send(JSON.stringify({ event: "clear", streamSid })); // barge-in : vider la file Twilio
           break;
       }
@@ -204,6 +227,8 @@ wss.on("connection", (twilio) => {
         const pcm = ulaw8kToPcm16(Buffer.from(m.media.payload, "base64"), GROK_RATE);
         grok.send(JSON.stringify({ type: "input_audio_buffer.append", audio: pcm.toString("base64") }));
       }
+    } else if (m.event === "mark") {
+      if (m.mark && m.mark.name === "hangup") { try { twilio.close(); } catch {} }
     } else if (m.event === "stop") {
       finalize();
     }
@@ -211,9 +236,19 @@ wss.on("connection", (twilio) => {
   twilio.on("close", finalize);
   twilio.on("error", (err) => { console.error("[twilio] ws error", err.message); finalize(); });
 
+  // Filet anti-credits : si le client se tait apres la cloture (8s) ou reste inactif longtemps (30s),
+  // on raccroche, au cas ou l'agent n'aurait pas appele end_call.
+  const inactivityTimer = setInterval(() => {
+    if (finalized || endRequested) return;
+    const idle = Date.now() - lastCallerMs;
+    if (closingSaid && idle > 8000) requestHangup("cloture+silence");
+    else if (idle > 30000) requestHangup("inactivite");
+  }, 2000);
+
   async function finalize() {
     if (finalized) return;
     finalized = true;
+    clearInterval(inactivityTimer);
     pushUser();
     pushAgent();
     try { if (grok && grok.readyState === WebSocket.OPEN) grok.close(); } catch {}
