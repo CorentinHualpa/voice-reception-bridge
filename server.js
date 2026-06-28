@@ -47,6 +47,23 @@ A la fin, tu dis une phrase de cloture ("toute l'equipe vous remercie, un consei
 Reponds toujours en ${AGENT_LANG === "es" ? "espagnol" : AGENT_LANG === "en" ? "anglais" : "francais"}.`;
 
 const server = http.createServer((req, res) => {
+  const path = (req.url || "/").split("?")[0];
+  if (path === "/twiml") {
+    // Webhook Voice de Twilio : renvoie le TwiML qui connecte l'appel au pont WS.
+    // On injecte le numero appelant (From) pour que le pont le connaisse (recap).
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const fromBody = new URLSearchParams(body).get("From");
+      const fromQuery = new URL(req.url, "http://x").searchParams.get("From");
+      const from = (fromBody || fromQuery || "").replace(/[<>&"']/g, "");
+      const host = req.headers.host;
+      const xml = `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="wss://${host}/twilio"><Parameter name="from" value="${from}"/></Stream></Connect></Response>`;
+      res.writeHead(200, { "Content-Type": "text/xml" });
+      res.end(xml);
+    });
+    return;
+  }
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("voice-reception-bridge ok");
 });
