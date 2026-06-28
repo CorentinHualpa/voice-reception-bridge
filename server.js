@@ -24,6 +24,9 @@ const XAI_API_KEY = process.env.XAI_API_KEY;
 const GROK_MODEL = process.env.GROK_MODEL || "grok-voice-latest";
 const GROK_VOICE = process.env.GROK_VOICE || "eve";
 const GROK_RATE = Number(process.env.GROK_RATE || 8000);
+const GROK_SPEED = Number(process.env.GROK_SPEED || 1.0);          // vitesse de parole (0.7..1.5)
+const GROK_VAD_THRESHOLD = Number(process.env.GROK_VAD_THRESHOLD || 0.6); // reactivite VAD (0.1..0.9 ; plus bas = plus sensible)
+const GROK_REASONING = process.env.GROK_REASONING || "high";       // "high" = profond, "none" = rapide
 const AGENT_LANG = process.env.AGENT_LANG || "fr";
 const AGENT_NAME = process.env.AGENT_NAME || "Dany";
 const BUSINESS_NAME = process.env.BUSINESS_NAME || "l'entreprise";
@@ -154,7 +157,8 @@ wss.on("connection", (twilio) => {
         session: {
           instructions: RECEPTION_PROMPT,
           voice: GROK_VOICE,
-          turn_detection: { type: "server_vad", threshold: 0.6 },
+          reasoning: { effort: GROK_REASONING },
+          turn_detection: { type: "server_vad", threshold: GROK_VAD_THRESHOLD },
           input_audio_transcription: { language: AGENT_LANG },
           tools: [{
             type: "function",
@@ -164,7 +168,7 @@ wss.on("connection", (twilio) => {
           }],
           audio: {
             input: { format: { type: "audio/pcm", rate: GROK_RATE } },
-            output: { format: { type: "audio/pcm", rate: GROK_RATE } },
+            output: { format: { type: "audio/pcm", rate: GROK_RATE }, speed: GROK_SPEED },
           },
         },
       }));
