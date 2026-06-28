@@ -174,6 +174,7 @@ wss.on("connection", (twilio) => {
   let endRequested = false;
   let endReason = "raccroche par le client";
   let closingSaid = false;
+  let closeTriggered = false;
   let lastCallerMs = Date.now();
 
   // Raccroche proprement : on laisse jouer l'audio de cloture deja envoye a Twilio (mark),
@@ -267,6 +268,7 @@ wss.on("connection", (twilio) => {
           break;
         case "response.done":
           pushAgent();
+          if (closeTriggered && !endRequested) requestHangup("cloture polie");
           break;
         case "conversation.item.input_audio_transcription.updated":
           if (typeof e.transcript === "string") userBuf = e.transcript; // cumulatif sur le tour
@@ -314,7 +316,16 @@ wss.on("connection", (twilio) => {
     if (finalized || endRequested) return;
     const idle = Date.now() - lastCallerMs;
     if (closingSaid && idle > 8000) requestHangup("cloture+silence");
-    else if (idle > 30000) requestHangup("inactivite");
+    else if (idle > 15000 && !closeTriggered && grok && grok.readyState === WebSocket.OPEN && grokReady) {
+      // Le client ne repond plus : on fait dire a Dany une phrase de conge polie AVANT de raccrocher.
+      closeTriggered = true;
+      lastCallerMs = Date.now();
+      try {
+        grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text: "(SYSTEME : le client est silencieux depuis un moment. Dis une breve phrase de conge polie, qui remercie pour l'appel et souhaite une bonne journee, et rien d'autre.)" }] } }));
+        grok.send(JSON.stringify({ type: "response.create" }));
+      } catch {}
+    }
+    else if (idle > 40000) requestHangup("inactivite"); // backstop dur si la cloture polie echoue
   }, 2000);
 
   async function finalize() {
