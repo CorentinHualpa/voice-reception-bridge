@@ -174,6 +174,7 @@ wss.on("connection", (twilio) => {
   let endRequested = false;
   let endReason = "raccroche par le client";
   let closingSaid = false;
+  let checkedIn = false;
   let closeTriggered = false;
   let lastCallerMs = Date.now();
 
@@ -278,6 +279,7 @@ wss.on("connection", (twilio) => {
           break;
         case "input_audio_buffer.speech_started":
           lastCallerMs = Date.now();
+          checkedIn = false; // le client reparle : on reinitialise la detection de silence
           if (streamSid) twilio.send(JSON.stringify({ event: "clear", streamSid })); // barge-in : vider la file Twilio
           break;
       }
@@ -312,20 +314,31 @@ wss.on("connection", (twilio) => {
 
   // Filet anti-credits : si le client se tait apres la cloture (8s) ou reste inactif longtemps (30s),
   // on raccroche, au cas ou l'agent n'aurait pas appele end_call.
+  // Fait parler Dany via une instruction systeme injectee (check-in ou conge).
+  function promptGrok(text) {
+    try {
+      grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text }] } }));
+      grok.send(JSON.stringify({ type: "response.create" }));
+    } catch {}
+  }
+
+  // Gestion du silence : 1) "vous etes toujours la ?" ; 2) si toujours silence, conge poli puis raccroche.
   const inactivityTimer = setInterval(() => {
     if (finalized || endRequested) return;
+    if (!(grok && grok.readyState === WebSocket.OPEN && grokReady)) return;
     const idle = Date.now() - lastCallerMs;
-    if (closingSaid && idle > 8000) requestHangup("cloture+silence");
-    else if (idle > 15000 && !closeTriggered && grok && grok.readyState === WebSocket.OPEN && grokReady) {
-      // Le client ne repond plus : on fait dire a Dany une phrase de conge polie AVANT de raccrocher.
-      closeTriggered = true;
+    if (closingSaid && idle > 8000) { requestHangup("cloture+silence"); return; }
+    if (closeTriggered) { if (idle > 25000) requestHangup("inactivite"); return; } // conge en cours, backstop
+    if (idle > 12000) {
       lastCallerMs = Date.now();
-      try {
-        grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text: "(SYSTEME : le client est silencieux depuis un moment. Dis une breve phrase de conge polie, qui remercie pour l'appel et souhaite une bonne journee, et rien d'autre.)" }] } }));
-        grok.send(JSON.stringify({ type: "response.create" }));
-      } catch {}
+      if (!checkedIn) {
+        checkedIn = true;
+        promptGrok("(SYSTEME : le client est silencieux. Demande-lui brievement s'il est toujours la, par exemple 'Allo, vous etes toujours la ?', et rien d'autre.)");
+      } else {
+        closeTriggered = true;
+        promptGrok("(SYSTEME : le client ne repond toujours pas. Dis une breve phrase de conge polie qui remercie pour l'appel et souhaite une bonne journee, et rien d'autre.)");
+      }
     }
-    else if (idle > 40000) requestHangup("inactivite"); // backstop dur si la cloture polie echoue
   }, 2000);
 
   async function finalize() {
