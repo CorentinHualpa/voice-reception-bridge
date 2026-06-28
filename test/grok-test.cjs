@@ -104,6 +104,7 @@ function runConversation(persona, maxTurns = 10) {
         session: {
           instructions: RECEPTION_PROMPT,
           voice: "eve",
+          reasoning: { effort: process.env.GROK_REASONING || "high" },
           turn_detection: { type: "server_vad", threshold: 0.6 },
           input_audio_transcription: { language: "fr" },
           audio: { input: { format: { type: "audio/pcm", rate: 24000 } }, output: { format: { type: "audio/pcm", rate: 24000 } } },
