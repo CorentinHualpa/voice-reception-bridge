@@ -46,6 +46,41 @@ A la fin, tu dis une phrase de cloture ("toute l'equipe vous remercie, un consei
 
 Reponds toujours en ${AGENT_LANG === "es" ? "espagnol" : AGENT_LANG === "en" ? "anglais" : "francais"}.`;
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// File de reessai en memoire : si n8n est injoignable au raccrochage, on garde
+// le recap et on retente, pour qu'un hoquet reseau ne perde jamais un appel.
+const pendingRecaps = [];
+
+async function postRecap(payload, attempts) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const r = await fetch(N8N_RECAP_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) return true;
+      console.error(`[recap] n8n status ${r.status} (essai ${i + 1}/${attempts}) sid=${payload.call_sid}`);
+    } catch (e) {
+      console.error(`[recap] echec POST essai ${i + 1}/${attempts} sid=${payload.call_sid}: ${e.message}`);
+    }
+    if (i < attempts - 1) await sleep(1000 * Math.pow(2, i)); // 1s, 2s, 4s...
+  }
+  return false;
+}
+
+// Reessai de fond toutes les 60s pour les recaps qui n'ont pas pu partir au raccrochage.
+setInterval(async () => {
+  if (!pendingRecaps.length || !N8N_RECAP_URL) return;
+  const batch = pendingRecaps.splice(0, pendingRecaps.length);
+  for (const p of batch) {
+    const ok = await postRecap(p, 2);
+    if (ok) console.log(`[recap] renvoye depuis la file sid=${p.call_sid}`);
+    else pendingRecaps.push(p);
+  }
+}, 60000);
+
 const server = http.createServer((req, res) => {
   const path = (req.url || "/").split("?")[0];
   if (path === "/twiml") {
@@ -174,7 +209,7 @@ wss.on("connection", (twilio) => {
     }
   });
   twilio.on("close", finalize);
-  twilio.on("error", (err) => console.error("[twilio] ws error", err.message));
+  twilio.on("error", (err) => { console.error("[twilio] ws error", err.message); finalize(); });
 
   async function finalize() {
     if (finalized) return;
@@ -186,16 +221,12 @@ wss.on("connection", (twilio) => {
     console.log(`[call] stop sid=${callSid} lignes=${dialog.length}`);
     const hasClient = dialog.some((l) => l.who === "Client");
     if (hasClient && N8N_RECAP_URL) {
-      try {
-        await fetch(N8N_RECAP_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ dialog: text, phone: fromNumber || "inconnu", call_sid: callSid }),
-        });
-        console.log("[recap] envoye a n8n");
-      } catch (e) {
-        console.error("[recap] echec POST n8n", e.message);
-      }
+      const payload = { dialog: text, phone: fromNumber || "inconnu", call_sid: callSid };
+      const ok = await postRecap(payload, 4); // essais immediats au raccrochage : 1s, 2s, 4s, 8s
+      if (ok) console.log(`[recap] envoye a n8n sid=${callSid}`);
+      else { pendingRecaps.push(payload); console.error(`[recap] n8n injoignable, mis en file de reessai sid=${callSid}`); }
+    } else if (!hasClient) {
+      console.log(`[call] raccroche sans parole, pas de recap sid=${callSid}`);
     }
   }
 });
