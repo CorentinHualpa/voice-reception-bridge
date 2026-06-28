@@ -35,6 +35,9 @@ const RECEPTION_PROMPT = process.env.PROMPT_FILE && fs.existsSync(process.env.PR
   ? fs.readFileSync(process.env.PROMPT_FILE, "utf8")
   : DEFAULT_PROMPT;
 
+const CALLER_NUMBER = process.env.CALLER_NUMBER || "0756964718";
+const SESSION_INSTRUCTIONS = `${RECEPTION_PROMPT}\n\n# Contexte de cet appel\nLe client appelle depuis le numéro ${CALLER_NUMBER}. C'est son numéro de rappel par défaut, tu le connais déjà et tu peux le lui relire.`;
+
 const PERSONAS = [
   { id: "devis-pompe", brief: "Tu t'appelles Marc Lefebvre. Tu appelles pour un devis sur une pompe immergee pour ton forage de jardin. Ton email est marc.lefebvre@gmail.com, tu habites Etrechy. Tu donnes tes infos au fur et a mesure qu'on te les demande. Tu es cooperatif et poli." },
   { id: "horaires", brief: "Tu veux juste connaitre les horaires d'ouverture de l'agence Motralec d'Herblay. Tu ne veux PAS laisser de coordonnees ni de rappel, juste l'info. Si on insiste pour tes coordonnees, tu refuses gentiment et tu redemandes juste les horaires." },
@@ -44,6 +47,8 @@ const PERSONAS = [
   { id: "horaires-etrechy", brief: "Tu veux connaitre l'adresse ET les horaires d'ouverture de l'agence Motralec d'Etrechy (91). Tu ne laisses aucune coordonnee, tu veux juste l'info." },
   { id: "dn-suivi", brief: "Tu suis un devis en cours, le devis DN360, et tu veux savoir ou ca en est et etre rappele. Tu t'appelles Paul Mercier, email paul.mercier@gmail.com, tu es a Herblay. Tu donnes le numero de devis quand on te le demande." },
   { id: "anglais", brief: "You ONLY speak English and you do not understand French at all. You are calling to ask: do you sell Grundfos pumps, and can someone call you back about a quote? Keep replying in English the whole time, even if the agent answers in French." },
+  { id: "appel-manque", brief: "Tu rappelles Motralec parce que tu as eu un appel manque de leur part et tu veux savoir pourquoi. Tu t'appelles juste Caroline, tu ne donnes JAMAIS de nom de famille (tu n'en donnes pas). Si on te demande un email : caroline.b@gmail.com. Tu es a Versailles. Tu es un peu confus et hesitant au debut." },
+  { id: "confirme-numero", brief: "Tu veux un devis pour un surpresseur pour ta maison. Tu t'appelles Thomas Petit, email thomas.petit@gmail.com, a Herblay. Quand l'agent te confirme le numero de rappel, tu veux entendre qu'il connait DEJA ton numero (il doit te le lire), tu confirmes que c'est le bon." },
 ];
 
 const CALLER_SYS = (persona) => `Tu joues un client qui telephone a Motralec (distributeur de pompes et moteurs electriques), un soir hors horaires d'ouverture. Tu tombes sur Dany, l'assistant vocal.
@@ -102,7 +107,7 @@ function runConversation(persona, maxTurns = 10) {
       grok.send(JSON.stringify({
         type: "session.update",
         session: {
-          instructions: RECEPTION_PROMPT,
+          instructions: SESSION_INSTRUCTIONS,
           voice: "eve",
           reasoning: { effort: process.env.GROK_REASONING || "high" },
           turn_detection: { type: "server_vad", threshold: 0.6 },

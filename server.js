@@ -52,6 +52,7 @@ const recentCalls = loadCalls(); // { ts, from, sid, endReason, dialog }
 function pushCall(c) { recentCalls.unshift(c); if (recentCalls.length > 100) recentCalls.length = 100; saveCalls(); }
 function escHtml(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function normLine(s) { return String(s).toLowerCase().replace(/[^0-9a-zà-ÿ@ ]/gi, " ").replace(/\s+/g, " ").trim(); }
+function frPhone(e164) { const m = String(e164 || "").replace(/\s/g, "").match(/^\+33(\d{9})$/); return m ? "0" + m[1] : (e164 || ""); }
 
 // Instruction de l'agent de reception (cf. agent-voiceflow-creator : voice_intake.md / voice_agent.md).
 // Configurable par env (AGENT_NAME / BUSINESS_NAME / BUSINESS_DESC), surchargeable via RECEPTION_PROMPT.
@@ -222,10 +223,14 @@ wss.on("connection", (twilio) => {
     grok = new WebSocket(`wss://api.x.ai/v1/realtime?model=${GROK_MODEL}`, [`xai-client-secret.${token}`]);
 
     grok.on("open", () => {
+      const callerFr = frPhone(fromNumber);
+      const sessionInstructions = callerFr
+        ? `${RECEPTION_PROMPT}\n\n# Contexte de cet appel\nLe client appelle depuis le numéro ${callerFr}. C'est son numéro de rappel par défaut, tu le connais déjà et tu peux le lui relire.`
+        : RECEPTION_PROMPT;
       grok.send(JSON.stringify({
         type: "session.update",
         session: {
-          instructions: RECEPTION_PROMPT,
+          instructions: sessionInstructions,
           voice: GROK_VOICE,
           reasoning: { effort: GROK_REASONING },
           turn_detection: { type: "server_vad", threshold: GROK_VAD_THRESHOLD },
