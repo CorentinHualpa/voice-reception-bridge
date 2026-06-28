@@ -3,7 +3,7 @@
 <!-- Remplacer l'URL par le domaine Railway du service deploye. -->
 <Response>
   <Connect>
-    <Stream url="wss://voice-reception-bridge-production.up.railway.app/twilio">
+    <Stream url="wss://bridge-production-0630.up.railway.app/twilio">
       <Parameter name="from" value="{{From}}" />
     </Stream>
   </Connect>
