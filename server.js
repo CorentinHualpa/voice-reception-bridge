@@ -40,6 +40,7 @@ if (!XAI_API_KEY) console.error("[boot] ATTENTION: XAI_API_KEY manquante");
 const recentCalls = []; // { ts, from, sid, endReason, dialog }
 function pushCall(c) { recentCalls.unshift(c); if (recentCalls.length > 50) recentCalls.length = 50; }
 function escHtml(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+function normLine(s) { return String(s).toLowerCase().replace(/[^0-9a-zà-ÿ@ ]/gi, " ").replace(/\s+/g, " ").trim(); }
 
 // Instruction de l'agent de reception (cf. agent-voiceflow-creator : voice_intake.md / voice_agent.md).
 // Configurable par env (AGENT_NAME / BUSINESS_NAME / BUSINESS_DESC), surchargeable via RECEPTION_PROMPT.
@@ -175,8 +176,20 @@ wss.on("connection", (twilio) => {
     setTimeout(() => { try { twilio.close(); } catch {} }, 7000); // filet si Twilio ne renvoie pas le mark
   }
 
-  function pushUser() { const t = userBuf.trim(); if (t) dialog.push({ who: "Client", msg: t }); userBuf = ""; }
-  function pushAgent() { const t = agentBuf.trim(); if (t) dialog.push({ who: "Agent", msg: t }); agentBuf = ""; }
+  // Anti-doublons : la transcription Grok est cumulative et peut etre flushee plusieurs fois
+  // par tour (pauses + barge-in). Si la nouvelle ligne prolonge la precedente du meme locuteur, on remplace.
+  function pushLine(who, raw) {
+    const t = (raw || "").trim();
+    if (!t) return;
+    const last = dialog[dialog.length - 1];
+    if (last && last.who === who) {
+      const a = normLine(last.msg), b = normLine(t);
+      if (a && b && (b.startsWith(a) || a.startsWith(b))) { last.msg = t.length >= last.msg.length ? t : last.msg; return; }
+    }
+    dialog.push({ who, msg: t });
+  }
+  function pushUser() { pushLine("Client", userBuf); userBuf = ""; }
+  function pushAgent() { pushLine("Agent", agentBuf); agentBuf = ""; }
 
   async function openGrok() {
     let token;
