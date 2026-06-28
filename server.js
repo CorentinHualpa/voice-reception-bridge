@@ -32,8 +32,14 @@ const AGENT_NAME = process.env.AGENT_NAME || "Dany";
 const BUSINESS_NAME = process.env.BUSINESS_NAME || "l'entreprise";
 const BUSINESS_DESC = process.env.BUSINESS_DESC || "";
 const N8N_RECAP_URL = process.env.N8N_RECAP_URL || "";
+const ADMIN_KEY = process.env.ADMIN_KEY || ""; // protege le tableau de bord /admin
 
 if (!XAI_API_KEY) console.error("[boot] ATTENTION: XAI_API_KEY manquante");
+
+// Historique en memoire des derniers appels (pour le tableau de bord /admin).
+const recentCalls = []; // { ts, from, sid, endReason, dialog }
+function pushCall(c) { recentCalls.unshift(c); if (recentCalls.length > 50) recentCalls.length = 50; }
+function escHtml(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 
 // Instruction de l'agent de reception (cf. agent-voiceflow-creator : voice_intake.md / voice_agent.md).
 // Configurable par env (AGENT_NAME / BUSINESS_NAME / BUSINESS_DESC), surchargeable via RECEPTION_PROMPT.
@@ -84,8 +90,44 @@ setInterval(async () => {
   }
 }, 60000);
 
+function renderDashboard() {
+  const cfg = `voix ${GROK_VOICE} · vitesse ${GROK_SPEED} · VAD ${GROK_VAD_THRESHOLD} · raisonnement ${GROK_REASONING} · rate ${GROK_RATE} · langue ${AGENT_LANG}`;
+  const calls = recentCalls.map((c) => {
+    const lines = escHtml(c.dialog).split("\n").map((l) => {
+      const m = l.match(/^(Client|Agent)\s*:\s*([\s\S]*)$/);
+      if (!m) return `<div>${l}</div>`;
+      const who = m[1] === "Client" ? "Client" : AGENT_NAME;
+      const color = m[1] === "Client" ? "#1d4ed8" : "#0a7d4b";
+      return `<div style="margin:2px 0"><span style="color:${color};font-weight:600">${who}</span> : ${m[2]}</div>`;
+    }).join("");
+    return `<div style="border:1px solid #e5e7eb;border-radius:10px;padding:14px 16px;margin:12px 0;background:#fff">
+      <div style="font-size:12px;color:#6b7280;margin-bottom:8px">${escHtml(c.ts)} &middot; ${escHtml(c.from || "inconnu")} &middot; fin : ${escHtml(c.endReason)}</div>
+      <div style="font-size:14px;line-height:1.5;color:#111827">${lines}</div>
+    </div>`;
+  }).join("") || '<p style="color:#6b7280">Aucun appel enregistre pour le moment.</p>';
+  return `<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escHtml(AGENT_NAME)} - ${escHtml(BUSINESS_NAME)} - suivi</title></head>
+  <body style="font-family:Segoe UI,Roboto,Arial,sans-serif;background:#f3f4f6;margin:0;padding:24px;color:#111827">
+  <div style="max-width:780px;margin:0 auto">
+    <h1 style="font-size:22px;margin:0 0 4px">${escHtml(AGENT_NAME)} &middot; ${escHtml(BUSINESS_NAME)}</h1>
+    <div style="color:#6b7280;font-size:13px;margin-bottom:18px">${escHtml(cfg)} &middot; ${recentCalls.length} appel(s) en memoire</div>
+    <details style="background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:14px 16px;margin-bottom:18px">
+      <summary style="cursor:pointer;font-weight:600">Prompt actuel de l'agent</summary>
+      <pre style="white-space:pre-wrap;font-size:12px;color:#374151;margin-top:10px">${escHtml(RECEPTION_PROMPT)}</pre>
+    </details>
+    <h2 style="font-size:16px;margin:0 0 4px">Derniers appels (le plus recent en haut)</h2>
+    ${calls}
+  </div></body></html>`;
+}
+
 const server = http.createServer((req, res) => {
   const path = (req.url || "/").split("?")[0];
+  if (path === "/admin") {
+    const key = new URL(req.url, "http://x").searchParams.get("key") || "";
+    if (!ADMIN_KEY || key !== ADMIN_KEY) { res.writeHead(401, { "Content-Type": "text/plain; charset=utf-8" }); res.end("non autorise"); return; }
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(renderDashboard());
+    return;
+  }
   if (path === "/twiml") {
     // Webhook Voice de Twilio : renvoie le TwiML qui connecte l'appel au pont WS.
     // On injecte le numero appelant (From) pour que le pont le connaisse (recap).
@@ -118,6 +160,7 @@ wss.on("connection", (twilio) => {
   let agentBuf = "";
   let finalized = false;
   let endRequested = false;
+  let endReason = "raccroche par le client";
   let closingSaid = false;
   let lastCallerMs = Date.now();
 
@@ -126,6 +169,7 @@ wss.on("connection", (twilio) => {
   function requestHangup(reason) {
     if (endRequested || finalized) return;
     endRequested = true;
+    endReason = reason;
     console.log(`[call] hangup (${reason}) sid=${callSid}`);
     if (streamSid) { try { twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "hangup" } })); } catch {} }
     setTimeout(() => { try { twilio.close(); } catch {} }, 7000); // filet si Twilio ne renvoie pas le mark
@@ -258,6 +302,7 @@ wss.on("connection", (twilio) => {
     try { if (grok && grok.readyState === WebSocket.OPEN) grok.close(); } catch {}
     const text = dialog.map((l) => `${l.who} : ${l.msg}`).join("\n");
     console.log(`[call] stop sid=${callSid} lignes=${dialog.length}`);
+    if (dialog.length) pushCall({ ts: new Date().toISOString(), from: fromNumber, sid: callSid, endReason, dialog: text });
     const hasClient = dialog.some((l) => l.who === "Client");
     if (hasClient && N8N_RECAP_URL) {
       const payload = { dialog: text, phone: fromNumber || "inconnu", call_sid: callSid };
