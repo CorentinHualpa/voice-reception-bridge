@@ -275,6 +275,7 @@ wss.on("connection", (twilio) => {
           break;
         case "response.done":
           pushAgent();
+          lastCallerMs = Date.now(); // l'agent vient de finir de parler : le compte a rebours du silence repart d'ici (jamais pendant qu'il parle)
           if (closeTriggered && !endRequested) requestHangup("cloture polie");
           break;
         case "conversation.item.input_audio_transcription.updated":
@@ -344,7 +345,7 @@ wss.on("connection", (twilio) => {
     const idle = Date.now() - lastCallerMs;
     if (closingSaid && idle > 8000) { requestHangup("cloture+silence"); return; }
     if (closeTriggered) { if (idle > 25000) requestHangup("inactivite"); return; } // conge en cours, backstop
-    if (idle > 12000) {
+    if (idle > 15000) {
       lastCallerMs = Date.now();
       if (!checkedIn) {
         checkedIn = true;
