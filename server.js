@@ -177,6 +177,7 @@ wss.on("connection", (twilio) => {
   let closingSaid = false;
   let checkedIn = false;
   let closeTriggered = false;
+  let greetRetry = 0;
   let lastCallerMs = Date.now();
 
   // Raccroche proprement : on laisse jouer l'audio de cloture deja envoye a Twilio (mark),
@@ -280,7 +281,16 @@ wss.on("connection", (twilio) => {
           if (typeof e.transcript === "string") userBuf = e.transcript; // cumulatif sur le tour
           break;
         case "response.function_call_arguments.done":
-          if (e.name === "end_call") requestHangup("end_call");
+          if (e.name === "end_call") {
+            // On ne raccroche QUE si une vraie conversation a eu lieu. Sinon c'est un mis-fire
+            // de Grok au decroche : on l'ignore et on relance l'accueil une fois.
+            if (dialog.some((l) => l.who === "Client") || closingSaid) {
+              requestHangup("end_call");
+            } else {
+              console.log(`[call] end_call premature ignore sid=${callSid}`);
+              if (greetRetry < 1) { greetRetry++; try { grok.send(JSON.stringify({ type: "response.create" })); } catch {} }
+            }
+          }
           break;
         case "input_audio_buffer.speech_started":
           lastCallerMs = Date.now();
