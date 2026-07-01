@@ -236,12 +236,6 @@ wss.on("connection", (twilio) => {
           reasoning: { effort: GROK_REASONING },
           turn_detection: { type: "server_vad", threshold: GROK_VAD_THRESHOLD },
           input_audio_transcription: { language: AGENT_LANG },
-          tools: [{
-            type: "function",
-            name: "end_call",
-            description: "Raccroche et termine l'appel telephonique en cours. A appeler UNIQUEMENT apres avoir prononce ta phrase de cloture finale et laisse le client dire son dernier mot. Ne jamais appeler avant la cloture.",
-            parameters: { type: "object", properties: {} },
-          }],
           audio: {
             input: { format: { type: "audio/pcm", rate: GROK_RATE } },
             output: { format: { type: "audio/pcm", rate: GROK_RATE }, speed: GROK_SPEED },
@@ -280,18 +274,6 @@ wss.on("connection", (twilio) => {
           break;
         case "conversation.item.input_audio_transcription.updated":
           if (typeof e.transcript === "string") userBuf = e.transcript; // cumulatif sur le tour
-          break;
-        case "response.function_call_arguments.done":
-          if (e.name === "end_call") {
-            // On ne raccroche QUE si une vraie conversation a eu lieu. Sinon c'est un mis-fire
-            // de Grok au decroche : on l'ignore et on relance l'accueil une fois.
-            if (dialog.some((l) => l.who === "Client") || closingSaid) {
-              requestHangup("end_call");
-            } else {
-              console.log(`[call] end_call premature ignore sid=${callSid}`);
-              if (greetRetry < 1) { greetRetry++; try { grok.send(JSON.stringify({ type: "response.create" })); } catch {} }
-            }
-          }
           break;
         case "input_audio_buffer.speech_started":
           lastCallerMs = Date.now();
