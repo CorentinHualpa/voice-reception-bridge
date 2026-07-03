@@ -179,6 +179,7 @@ wss.on("connection", (twilio) => {
   let closeTriggered = false;
   let greetRetry = 0;
   let lastCallerMs = Date.now();
+  let agentSpeaking = false, agentSpeakingSince = 0; // half-duplex anti-echo : tant que Dany parle (jusqu'a la fin de lecture Twilio, signalee par le mark "agentdone"), on ne renvoie PAS l'audio a Grok, sinon son propre echo declenche un faux tour et il enchaine les questions
 
   // Raccroche proprement : on laisse jouer l'audio de cloture deja envoye a Twilio (mark),
   // puis on ferme le flux Twilio -> Twilio termine l'appel -> twilio.on("close") -> finalize() -> recap.
@@ -234,7 +235,7 @@ wss.on("connection", (twilio) => {
           instructions: sessionInstructions,
           voice: GROK_VOICE,
           reasoning: { effort: GROK_REASONING },
-          turn_detection: { type: "server_vad", threshold: GROK_VAD_THRESHOLD },
+          turn_detection: { type: "server_vad", threshold: GROK_VAD_THRESHOLD, prefix_padding_ms: 300, silence_duration_ms: 600 },
           input_audio_transcription: { language: AGENT_LANG },
           audio: {
             input: { format: { type: "audio/pcm", rate: GROK_RATE } },
@@ -256,6 +257,8 @@ wss.on("connection", (twilio) => {
           break;
         case "response.created":
           pushUser(); // le tour du client est fini, l'agent repond
+          agentSpeaking = true; agentSpeakingSince = Date.now(); // Dany commence a parler -> on coupe l'ecoute (anti-echo)
+          console.log("[turn] Dany");
           break;
         case "response.output_audio.delta": {
           if (!e.delta || !streamSid) break;
@@ -269,7 +272,9 @@ wss.on("connection", (twilio) => {
           break;
         case "response.done":
           pushAgent();
-          lastCallerMs = Date.now(); // l'agent vient de finir de parler : le compte a rebours du silence repart d'ici (jamais pendant qu'il parle)
+          // Dany a fini de GENERER, mais Twilio joue encore l'audio en file. On rouvre l'ecoute seulement au mark "agentdone"
+          // (renvoye par Twilio quand la lecture est vraiment finie), pas maintenant, sinon on capte la fin de son propre audio.
+          if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "agentdone" } }));
           if (closeTriggered && !endRequested) requestHangup("cloture polie");
           break;
         case "conversation.item.input_audio_transcription.updated":
@@ -278,6 +283,7 @@ wss.on("connection", (twilio) => {
         case "input_audio_buffer.speech_started":
           lastCallerMs = Date.now();
           checkedIn = false; // le client reparle : on reinitialise la detection de silence
+          console.log("[turn] client");
           if (streamSid) twilio.send(JSON.stringify({ event: "clear", streamSid })); // barge-in : vider la file Twilio
           break;
       }
@@ -297,12 +303,14 @@ wss.on("connection", (twilio) => {
       console.log(`[call] start sid=${callSid} from=${fromNumber}`);
       openGrok();
     } else if (m.event === "media") {
-      if (grok && grok.readyState === WebSocket.OPEN && grokReady) {
+      if (agentSpeaking && Date.now() - agentSpeakingSince > 12000) { agentSpeaking = false; lastCallerMs = Date.now(); } // filet si le mark "agentdone" se perd
+      if (grok && grok.readyState === WebSocket.OPEN && grokReady && !agentSpeaking) {
         const pcm = ulaw8kToPcm16(Buffer.from(m.media.payload, "base64"), GROK_RATE);
         grok.send(JSON.stringify({ type: "input_audio_buffer.append", audio: pcm.toString("base64") }));
       }
     } else if (m.event === "mark") {
       if (m.mark && m.mark.name === "hangup") { try { twilio.close(); } catch {} }
+      else if (m.mark && m.mark.name === "agentdone") { agentSpeaking = false; lastCallerMs = Date.now(); } // Dany a fini de parler (audio joue) : on rouvre l'ecoute + on relance le compte a rebours du silence
     } else if (m.event === "stop") {
       finalize();
     }
