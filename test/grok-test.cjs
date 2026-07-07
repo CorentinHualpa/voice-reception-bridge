@@ -36,7 +36,11 @@ const RECEPTION_PROMPT = process.env.PROMPT_FILE && fs.existsSync(process.env.PR
   : DEFAULT_PROMPT;
 
 const CALLER_NUMBER = process.env.CALLER_NUMBER || "0756964718";
-const SESSION_INSTRUCTIONS = `${RECEPTION_PROMPT}\n\n# Contexte de cet appel\nLe client appelle depuis le numéro ${CALLER_NUMBER}. C'est son numéro de rappel par défaut, tu le connais déjà et tu peux le lui relire.`;
+// miroir de la prod (server.js frPhoneSpoken) : on donne a Grok la lecture orale finie, il ne recalcule pas
+function frUnit(n){return ["zéro","un","deux","trois","quatre","cinq","six","sept","huit","neuf","dix","onze","douze","treize","quatorze","quinze","seize","dix-sept","dix-huit","dix-neuf"][n];}
+function frTwoDigits(n){if(n<20)return frUnit(n);if(n<70){const t=Math.floor(n/10),u=n%10,tw={2:"vingt",3:"trente",4:"quarante",5:"cinquante",6:"soixante"}[t];return u===0?tw:u===1?tw+"-et-un":tw+"-"+frUnit(u);}if(n<80)return n===71?"soixante-et-onze":"soixante-"+frUnit(n-60);if(n===80)return"quatre-vingts";return"quatre-vingt-"+frUnit(n-80);}
+function frPhoneSpoken(fr){const d=String(fr).replace(/\D/g,""),out=[];for(let i=0;i<d.length;i+=2){const p=d.slice(i,i+2);if(p.length===1)out.push(frUnit(Number(p)));else if(p[0]==="0")out.push("zéro "+frUnit(Number(p[1])));else out.push(frTwoDigits(Number(p)));}return out.join(", ");}
+const SESSION_INSTRUCTIONS = `${RECEPTION_PROMPT}\n\n# Contexte de cet appel\nLe client appelle depuis le numéro ${CALLER_NUMBER}. Quand tu lui relis ce numéro à voix, tu prononces EXACTEMENT ceci, mot pour mot, sans le recalculer ni changer un seul groupe : « ${frPhoneSpoken(CALLER_NUMBER)} ». C'est son numéro de rappel par défaut, tu le connais déjà.`;
 
 const PERSONAS = [
   { id: "devis-pompe", brief: "Tu t'appelles Marc Lefebvre. Tu appelles pour un devis sur une pompe immergee pour ton forage de jardin. Ton email est marc.lefebvre@gmail.com, tu habites Etrechy. Tu donnes tes infos au fur et a mesure qu'on te les demande. Tu es cooperatif et poli." },
