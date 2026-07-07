@@ -53,6 +53,27 @@ function pushCall(c) { recentCalls.unshift(c); if (recentCalls.length > 100) rec
 function escHtml(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function normLine(s) { return String(s).toLowerCase().replace(/[^0-9a-zà-ÿ@ ]/gi, " ").replace(/\s+/g, " ").trim(); }
 function frPhone(e164) { const m = String(e164 || "").replace(/\s/g, "").match(/^\+33(\d{9})$/); return m ? "0" + m[1] : (e164 || ""); }
+// Numero FR -> lecture orale pre-calculee par paires (deterministe cote JS). On NE laisse PAS Grok
+// calculer les groupes/mots : il se trompe sur les longues suites de chiffres et les nombres composes
+// (quatre-vingt-seize, soixante-dix-huit...). On lui donne la phrase finie a repeter telle quelle.
+function frUnit(n) { return ["zéro","un","deux","trois","quatre","cinq","six","sept","huit","neuf","dix","onze","douze","treize","quatorze","quinze","seize","dix-sept","dix-huit","dix-neuf"][n]; }
+function frTwoDigits(n) {
+  if (n < 20) return frUnit(n);
+  if (n < 70) { const t = Math.floor(n / 10), u = n % 10, tw = { 2: "vingt", 3: "trente", 4: "quarante", 5: "cinquante", 6: "soixante" }[t]; return u === 0 ? tw : u === 1 ? tw + "-et-un" : tw + "-" + frUnit(u); }
+  if (n < 80) return n === 71 ? "soixante-et-onze" : "soixante-" + frUnit(n - 60);
+  if (n === 80) return "quatre-vingts";
+  return "quatre-vingt-" + frUnit(n - 80); // 81..99 (dont 90..99 = quatre-vingt-dix..dix-neuf)
+}
+function frPhoneSpoken(fr) {
+  const d = String(fr).replace(/\D/g, ""), out = [];
+  for (let i = 0; i < d.length; i += 2) {
+    const p = d.slice(i, i + 2);
+    if (p.length === 1) out.push(frUnit(Number(p)));
+    else if (p[0] === "0") out.push("zéro " + frUnit(Number(p[1])));
+    else out.push(frTwoDigits(Number(p)));
+  }
+  return out.join(", ");
+}
 
 // Instruction de l'agent de reception (cf. agent-voiceflow-creator : voice_intake.md / voice_agent.md).
 // Configurable par env (AGENT_NAME / BUSINESS_NAME / BUSINESS_DESC), surchargeable via RECEPTION_PROMPT.
@@ -226,8 +247,9 @@ wss.on("connection", (twilio) => {
 
     grok.on("open", () => {
       const callerFr = frPhone(fromNumber);
+      const callerSpoken = callerFr ? frPhoneSpoken(callerFr) : "";
       const sessionInstructions = callerFr
-        ? `${RECEPTION_PROMPT}\n\n# Contexte de cet appel\nLe client appelle depuis le numéro ${callerFr}. C'est son numéro de rappel par défaut, tu le connais déjà et tu peux le lui relire.`
+        ? `${RECEPTION_PROMPT}\n\n# Contexte de cet appel\nLe client appelle depuis le numéro ${callerFr}. Quand tu lui relis ce numéro à voix, tu prononces EXACTEMENT ceci, mot pour mot, sans le recalculer ni changer un seul groupe : « ${callerSpoken} ». C'est son numéro de rappel par défaut, tu le connais déjà.`
         : RECEPTION_PROMPT;
       grok.send(JSON.stringify({
         type: "session.update",
