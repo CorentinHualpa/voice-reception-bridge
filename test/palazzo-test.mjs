@@ -94,11 +94,14 @@ async function run(p) {
   });
   // Un tour agent = reponses successives tant que le modele appelle des outils (plafond comme en prod).
   let gardeFaite = false;
+  let recap = false, clientApresRecap = false; // miroir de la garde du pont (server.js RECAP_RE)
+  const RECAP_RE = /c'est bien ça|c'est correct|est-ce (bien )?(correct|ça)|je récapitule|récapitul|ça vous va|is that (right|correct)|does that sound|es correcto|está bien así|è corretto|va bene così/i;
   async function agentTurn() {
     for (let relance = 0; relance <= 4; relance++) {
       buf = ""; calls = [];
       await oneResponse();
       if (buf.trim()) dialog.push({ who: "Agent", msg: buf.trim() });
+      if (RECAP_RE.test(buf) || (/euro/i.test(buf) && /\?/.test(buf))) { recap = true; clientApresRecap = false; }
       if (!calls.length) {
         const consigne = !gardeFaite && pizzeria.consigneCloture(buf, { callSid: "banc", outils: [] });
         if (!consigne) return;
@@ -109,7 +112,8 @@ async function run(p) {
       }
       for (const c of calls) {
         let args = {}; try { args = JSON.parse(c.arguments || "{}"); } catch {}
-        const out = pizzeria.run(c.name, args, { callSid: "banc", from: "0612345678" });
+        if (c.name === "chiffrer_commande") { recap = false; clientApresRecap = false; }
+        const out = pizzeria.run(c.name, args, { callSid: "banc", from: "0612345678", recapConfirme: recap && clientApresRecap });
         dialog.push({ who: "Outil", msg: `${c.name} ${JSON.stringify(args)} -> ${JSON.stringify(out)}` });
         grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: c.call_id, output: JSON.stringify(out) } }));
       }
@@ -121,6 +125,7 @@ async function run(p) {
     const msg = await callerTurn(p, dialog);
     if (/\[RACCROCHE\]/i.test(msg)) break;
     dialog.push({ who: "Client", msg });
+    if (recap) clientApresRecap = true;
     grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text: msg }] } }));
     await agentTurn();
   }

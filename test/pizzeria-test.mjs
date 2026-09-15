@@ -98,6 +98,13 @@ cas("un rechiffrage qui perd des articles est signale", () => {
   assert.equal(r2.attention, undefined);
 });
 
+cas("pas d'enregistrement sans recapitulatif confirme quand le pont le verifie", () => {
+  const p = mk();
+  const args = { prenom: "Julien", heure_retrait: "20:00", articles: [{ produit: "Regina", quantite: 1 }] };
+  assert.match(p.run("enregistrer_commande", args, { callSid: "H", recapConfirme: false }).raison, /récapitulatif/);
+  assert.equal(p.run("enregistrer_commande", args, { callSid: "H", recapConfirme: true }).ok, true);
+});
+
 cas("un prenom de remplissage est refuse", () => {
   const r = mk().run("enregistrer_commande", { prenom: "Client", heure_retrait: "20:00", articles: [{ produit: "Roma", quantite: 2 }] }, { callSid: "D" });
   assert.equal(r.ok, false);

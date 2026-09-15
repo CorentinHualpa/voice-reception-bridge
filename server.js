@@ -42,7 +42,9 @@ const N8N_RECAP_URL = process.env.N8N_RECAP_URL || "";
 const ADMIN_KEY = process.env.ADMIN_KEY || ""; // protege le tableau de bord /admin
 const CLOSING_RE = new RegExp(process.env.CLOSING_REGEX || "remercie pour votre appel", "i");
 const AGENT_SPEAKING_MAX_MS = Number(process.env.AGENT_SPEAKING_MAX_MS || 12000); // filet anti-surdite si le mark de fin de parole se perd ; un recapitulatif de commande depasse 12 s
-const MAX_RELANCES_OUTILS = 4; // relances apres outil par tour client : au-dela, l'agent s'enchaine tout seul
+const MAX_RELANCES_OUTILS = 4;
+// Phrase de recapitulatif qui appelle un oui du client (sinon : une reponse qui cite des euros et pose une question).
+const RECAP_RE = /c'est bien ça|c'est correct|est-ce (bien )?(correct|ça)|je récapitule|récapitul|ça vous va|is that (right|correct)|does that sound|es correcto|está bien así|è corretto|va bene così/i; // relances apres outil par tour client : au-dela, l'agent s'enchaine tout seul
 
 if (!XAI_API_KEY) console.error("[boot] ATTENTION: XAI_API_KEY manquante");
 
@@ -247,6 +249,7 @@ wss.on("connection", (twilio) => {
   let pendingCalls = [];   // appels d'outils de la reponse en cours, traites en response.done
   let relancesOutils = 0;  // relances apres outil depuis le dernier tour client
   let clotureVerifiee = false; // garde « commande annoncee sans enregistrement » : une seule consigne par appel
+  let recapTs = 0, clientApresRecap = false; // garde « pas d'enregistrement sans recapitulatif suivi d'une reponse du client »
   let respSeq = 0;         // numero de la reponse en cours : le mark "agentdone" d'une reponse finie ne doit pas rouvrir l'ecoute pendant la suivante
   let agentSpeaking = false, agentSpeakingSince = 0; // half-duplex anti-echo : tant que Dany parle (jusqu'a la fin de lecture Twilio, signalee par le mark "agentdone"), on ne renvoie PAS l'audio a Grok, sinon son propre echo declenche un faux tour et il enchaine les questions
 
@@ -273,7 +276,22 @@ wss.on("connection", (twilio) => {
     }
     dialog.push({ who, msg: t });
   }
-  function pushUser() { pushLine("Client", userBuf); userBuf = ""; }
+  // Ligne client du tour en cours. La transcription arrive souvent APRES response.created : on reserve
+  // alors la place de la ligne pour qu'elle reste avant la reponse de l'agent, et on la remplit ensuite.
+  let tourClient = null; // { idx } depuis le dernier speech_started
+  function pushUser() {
+    if (!tourClient || tourClient.idx != null) { if (userBuf.trim()) pushLine("Client", userBuf); userBuf = ""; return; }
+    tourClient.idx = dialog.length;
+    dialog.push({ who: "Client", msg: userBuf.trim() });
+    userBuf = "";
+  }
+  function setUser(texte, cumule) {
+    if (typeof texte !== "string") return;
+    if (tourClient && tourClient.idx != null && dialog[tourClient.idx]) {
+      const l = dialog[tourClient.idx];
+      l.msg = (cumule ? l.msg + texte : texte).replace(/^\s+/, "");
+    } else userBuf = cumule ? userBuf + texte : texte;
+  }
   function pushAgent() { pushLine("Agent", agentBuf); agentBuf = ""; }
 
   async function openGrok() {
@@ -309,9 +327,9 @@ wss.on("connection", (twilio) => {
           voice: GROK_VOICE,
           reasoning: { effort: GROK_REASONING },
           turn_detection: { type: "server_vad", threshold: GROK_VAD_THRESHOLD, prefix_padding_ms: 300, silence_duration_ms: 600 },
-          input_audio_transcription: { language: AGENT_LANG },
+          input_audio_transcription: { language: AGENT_LANG }, // ancien schema, ignore en silence par xAI : garde pour compatibilite
           audio: {
-            input: { format: { type: "audio/pcm", rate: GROK_RATE } },
+            input: { format: { type: "audio/pcm", rate: GROK_RATE }, transcription: { model: "grok-transcribe", language_hint: AGENT_LANG } },
             output: { format: { type: "audio/pcm", rate: GROK_RATE }, speed: GROK_SPEED },
           },
         },
@@ -350,6 +368,7 @@ wss.on("connection", (twilio) => {
         case "response.done": {
           const texteReponse = agentBuf;
           pushAgent();
+          if (RECAP_RE.test(texteReponse) || (/euro/i.test(texteReponse) && /\?/.test(texteReponse))) { recapTs = Date.now(); clientApresRecap = false; }
           // Dany a fini de GENERER, mais Twilio joue encore l'audio en file. On rouvre l'ecoute seulement au mark "agentdone"
           // (renvoye par Twilio quand la lecture est vraiment finie), pas maintenant, sinon on capte la fin de son propre audio.
           if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `agentdone:${respSeq}` } }));
@@ -368,9 +387,15 @@ wss.on("connection", (twilio) => {
           break;
         }
         case "conversation.item.input_audio_transcription.updated":
-          if (typeof e.transcript === "string") userBuf = e.transcript; // cumulatif sur le tour
+        case "conversation.item.input_audio_transcription.completed":
+          setUser(e.transcript, false); // cumulatif ou final : remplace
+          break;
+        case "conversation.item.input_audio_transcription.delta":
+          setUser(e.delta, true);
           break;
         case "input_audio_buffer.speech_started":
+          tourClient = { idx: null };
+          if (recapTs) clientApresRecap = true;
           lastCallerMs = Date.now();
           relancesOutils = 0;
           checkedIn = false; // le client reparle : on reinitialise la detection de silence
@@ -427,7 +452,8 @@ wss.on("connection", (twilio) => {
       let args = {};
       try { args = JSON.parse(c.args || "{}"); } catch {}
       let out;
-      try { out = pizzeria.run(c.name, args, { callSid, from: frPhone(fromNumber) }); }
+      if (c.name === "chiffrer_commande") { recapTs = 0; clientApresRecap = false; } // commande modifiee : nouveau recapitulatif exige
+      try { out = pizzeria.run(c.name, args, { callSid, from: frPhone(fromNumber), recapConfirme: recapTs > 0 && clientApresRecap }); }
       catch (err) { out = { ok: false, erreur: err.message }; console.error(`[outil] ${c.name} KO`, err); }
       console.log(`[outil] ${c.name} ${JSON.stringify(args)} -> ${JSON.stringify(out)}`);
       dialog.push({ who: "Outil", msg: `${c.name} ${JSON.stringify(args)} -> ${JSON.stringify(out)}` });
@@ -463,10 +489,11 @@ wss.on("connection", (twilio) => {
     pushUser();
     pushAgent();
     try { if (grok && grok.readyState === WebSocket.OPEN) grok.close(); } catch {}
-    const text = dialog.map((l) => `${l.who} : ${l.msg}`).join("\n");
-    console.log(`[call] stop sid=${callSid} lignes=${dialog.length}`);
-    if (dialog.length) pushCall({ ts: new Date().toISOString(), from: fromNumber, sid: callSid, endReason, dialog: text });
-    const hasClient = dialog.some((l) => l.who === "Client");
+    const lignes = dialog.filter((l) => String(l.msg || "").trim()); // une place reservee a une transcription jamais arrivee reste vide
+    const text = lignes.map((l) => `${l.who} : ${l.msg}`).join("\n");
+    console.log(`[call] stop sid=${callSid} lignes=${lignes.length}`);
+    if (lignes.length) pushCall({ ts: new Date().toISOString(), from: fromNumber, sid: callSid, endReason, dialog: text });
+    const hasClient = lignes.some((l) => l.who === "Client");
     if (hasClient && N8N_RECAP_URL) {
       const payload = { dialog: text, phone: fromNumber || "inconnu", call_sid: callSid };
       const ok = await postRecap(payload, 4); // essais immediats au raccrochage : 1s, 2s, 4s, 8s
