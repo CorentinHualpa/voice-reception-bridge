@@ -300,6 +300,7 @@ wss.on("connection", (twilio) => {
           if (closeTriggered && !endRequested) requestHangup("cloture polie");
           break;
         case "conversation.item.input_audio_transcription.updated":
+        case "conversation.item.input_audio_transcription.completed": // 15/09/2026 : xAI n'emet plus que .completed avec ce schema ; sans lui, aucune ligne client et aucun recap
           if (typeof e.transcript === "string") userBuf = e.transcript; // cumulatif sur le tour
           break;
         case "input_audio_buffer.speech_started":
