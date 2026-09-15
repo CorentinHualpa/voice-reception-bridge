@@ -1,0 +1,73 @@
+{
+  "source": "https://palazzo-pizza.fr/ relevé le 2026-09-15. Boissons et desserts : prix présents seulement dans le code de la page (non affichés), à faire confirmer par le restaurant.",
+  "produits": [
+    { "nom": "Fiorella", "categorie": "Pizzas classiques", "pizzas": 1, "prix_eur": 11, "description": "Sauce tomate, mozzarella fior di latte, olives noires" },
+    { "nom": "Roma", "categorie": "Pizzas classiques", "pizzas": 1, "prix_eur": 13, "description": "Sauce tomate, mozzarella fior di latte, jambon blanc super cotto, olives noires" },
+    { "nom": "Regina", "categorie": "Pizzas classiques", "pizzas": 1, "prix_eur": 15, "alias": ["reine"], "description": "Crème fraîche, mozzarella fior di latte, jambon blanc super cotto, champignons de Paris, olives noires" },
+    { "nom": "4 Formaggi", "categorie": "Pizzas classiques", "pizzas": 1, "prix_eur": 15, "alias": ["quatre formaggi", "quattro formaggi", "quatre fromages", "4 fromages"], "description": "Sauce tomate, mozzarella fior di latte, chèvre, gorgonzola AOP, Parmigiano Reggiano" },
+    { "nom": "Veggie", "categorie": "Pizzas classiques", "pizzas": 1, "prix_eur": 15, "alias": ["végétarienne", "vegetale"], "description": "Sauce tomate, mozzarella fior di latte, champignons de Paris, oignons rouges, poivrons, olives noires, roquette, tomates cerises semi-confites" },
+
+    { "nom": "Antica Margherita", "categorie": "Pizzas historiques", "pizzas": 1, "prix_eur": 14, "alias": ["margherita", "margarita", "marguerite"], "description": "Sauce tomate, basilic, Parmigiano Reggiano, mozzarella di bufala" },
+    { "nom": "Sicilia", "categorie": "Pizzas historiques", "pizzas": 1, "prix_eur": 13, "alias": ["sicilienne"], "description": "Sauce tomate, mozzarella fior di latte, anchois, fleurs de câpres, oignons rouges, olives noires" },
+    { "nom": "Pacino", "categorie": "Pizzas historiques", "pizzas": 1, "prix_eur": 17, "description": "Sauce tomate, mozzarella fior di latte, jambon blanc super cotto, champignons de Paris, poivrons, spianata piccante, olives noires" },
+    { "nom": "Bellucci", "categorie": "Pizzas historiques", "pizzas": 1, "prix_eur": 17, "description": "Crème fraîche, mozzarella fior di latte, mortadella à la pistache IGP, stracciatella, éclats de pistaches" },
+    { "nom": "Rucola", "categorie": "Pizzas historiques", "pizzas": 1, "prix_eur": 16, "alias": ["roquette"], "description": "Sauce tomate, mozzarella fior di latte, roquette, jambon de Parme, Parmigiano Reggiano, tomates cerises semi-confites" },
+
+    { "nom": "Palazzo", "categorie": "Pizzas contemporaines", "pizzas": 1, "prix_eur": 16, "description": "Crème d'aubergines, mozzarella fior di latte, jambon de Parme, Parmigiano Reggiano, tomates cerises semi-confites, basilic" },
+    { "nom": "Etna", "categorie": "Pizzas contemporaines", "pizzas": 1, "prix_eur": 18, "description": "Crème de truffes, mozzarella fior di latte, jambon blanc truffé, ricotta, roquette, tomates cerises semi-confites" },
+    { "nom": "Bari", "categorie": "Pizzas contemporaines", "pizzas": 1, "prix_eur": 16, "description": "Crème de basilic, mozzarella fior di latte, tomates cerises semi-confites, burrata, éclats de noisettes, basilic" },
+    { "nom": "Fiamma", "categorie": "Pizzas contemporaines", "pizzas": 1, "prix_eur": 17, "description": "Crème de poivrons jaunes, mozzarella fior di latte, spianata piccante, poivrons gouttes, paillettes de piments, basilic (pizza piquante)" },
+    { "nom": "Salmon Joe", "categorie": "Pizzas contemporaines", "pizzas": 1, "prix_eur": 17, "alias": ["saumon"], "description": "Crème fraîche, mozzarella fior di latte, saumon fumé, oignons rouges, tomates cerises semi-confites, zestes de citron, basilic" },
+    { "nom": "Celentano", "categorie": "Pizzas contemporaines", "pizzas": 1, "prix_eur": 17, "description": "Crème fraîche, mozzarella fior di latte, guanciale poivré, ricotta, crème d'œuf au Parmesan" },
+    { "nom": "Capri", "categorie": "Pizzas contemporaines", "pizzas": 1, "prix_eur": 14, "description": "Crème fraîche, mozzarella fior di latte, chèvre, miel, éclats de noisettes" },
+    { "nom": "Parma", "categorie": "Pizzas contemporaines", "pizzas": 1, "prix_eur": 18, "description": "Sauce tomate, mozzarella fior di latte, mozzarella di bufala, jambon de Parme, tomates cerises semi-confites, basilic" },
+
+    { "nom": "Formule midi Pizz&Sweet", "categorie": "Formule midi (du lundi au vendredi, au service du midi)", "pizzas": 1, "prix_eur": 15, "alias": ["formule midi", "pizz and sweet", "formule"], "description": "Une pizzetta au choix (Fiorella, Regina, 3 Formaggi, Vegetale), un dessert (Tiramisu ou Portofino) et un soft italien. Noter les choix en remarque" },
+    { "nom": "Formule midi Pizz&Sweet avec bière italienne", "categorie": "Formule midi (du lundi au vendredi, au service du midi)", "pizzas": 1, "prix_eur": 16, "alias": ["formule midi bière", "formule avec bière"], "description": "La même formule avec une bière italienne à la place du soft (plus 1 euro)" },
+
+    { "nom": "Planche Dolce Vita", "categorie": "Planche", "pizzas": 0, "prix_eur": 19, "alias": ["planche", "dolce vita"], "description": "Jambon de Parme, jambon blanc truffé, mortadelle à la pistache, spianata piccante, parmigiano reggiano, ricotta, roquette, tomates cerises semi-confites, olives noires, basilic. Supplément burrata ou bufala 4,50 €" },
+
+    { "nom": "Tiramisu al caffè", "categorie": "Desserts (prix à confirmer)", "pizzas": 0, "prix_eur": 4.5, "alias": ["tiramisu"], "description": "Dessert maison" },
+    { "nom": "Portofino", "categorie": "Desserts (prix à confirmer)", "pizzas": 0, "prix_eur": null, "alias": ["dessert du moment"], "description": "Dessert du moment, composition non communiquée" },
+
+    { "nom": "Limonata", "categorie": "Boissons (prix à confirmer)", "pizzas": 0, "prix_eur": 3.5, "alias": ["limonade italienne"], "description": "Soft italien 27,5 cl" },
+    { "nom": "Aranciata", "categorie": "Boissons (prix à confirmer)", "pizzas": 0, "prix_eur": 3.5, "alias": ["orangeade", "orangina"], "description": "Soft italien 27,5 cl" },
+    { "nom": "Cola", "categorie": "Boissons (prix à confirmer)", "pizzas": 0, "prix_eur": 3.5, "alias": ["coca", "coca cola"], "description": "Soft italien 27,5 cl" },
+    { "nom": "San Pellegrino", "categorie": "Boissons (prix à confirmer)", "pizzas": 0, "prix_eur": 3.5, "alias": ["eau gazeuse", "pellegrino"], "description": "Eau gazeuse 50 cl" },
+    { "nom": "Moretti", "categorie": "Boissons (prix à confirmer)", "pizzas": 0, "prix_eur": 5, "alias": ["bière moretti", "bière italienne"], "description": "Bière italienne 33 cl" },
+    { "nom": "Moretti IPA", "categorie": "Boissons (prix à confirmer)", "pizzas": 0, "prix_eur": 5, "alias": ["moretti i p a"], "description": "Bière italienne 33 cl" },
+    { "nom": "Nero d'Avola DOC", "categorie": "Boissons (prix à confirmer)", "pizzas": 0, "prix_eur": 19, "alias": ["nero d avola", "vin rouge"], "description": "Vin rouge italien 75 cl" },
+    { "nom": "Lambrusco DOC rouge", "categorie": "Boissons (prix à confirmer)", "pizzas": 0, "prix_eur": 13, "alias": ["lambrusco"], "description": "Vin italien 75 cl" },
+    { "nom": "Lambrusco DOC rosé", "categorie": "Boissons (prix à confirmer)", "pizzas": 0, "prix_eur": 13, "alias": ["lambrusco rosé"], "description": "Vin italien 75 cl" }
+  ],
+  "supplements": [
+    { "nom": "Changement de base", "prix_eur": 1, "alias": ["modification base", "base crème", "base tomate", "changer la base"] },
+    { "nom": "Jaune d'œuf", "prix_eur": 1, "alias": ["oeuf", "jaune d oeuf"] },
+    { "nom": "Roquette", "prix_eur": 1 },
+    { "nom": "Olives noires", "prix_eur": 1, "alias": ["olives"] },
+    { "nom": "Oignons rouges", "prix_eur": 1, "alias": ["oignons"] },
+    { "nom": "Miel", "prix_eur": 1 },
+    { "nom": "Champignons", "prix_eur": 2.5, "alias": ["champignons de paris"] },
+    { "nom": "Poivrons", "prix_eur": 2.5 },
+    { "nom": "Fleurs de câpres", "prix_eur": 2.5, "alias": ["câpres"] },
+    { "nom": "Tomates semi-confites", "prix_eur": 2.5, "alias": ["tomates cerises", "tomates cerises semi-confites"] },
+    { "nom": "Parmesan", "prix_eur": 2.5, "alias": ["parmigiano", "parmigiano reggiano"] },
+    { "nom": "Chèvre", "prix_eur": 2.5 },
+    { "nom": "Gorgonzola", "prix_eur": 2.5 },
+    { "nom": "Ricotta", "prix_eur": 2.5 },
+    { "nom": "Anchois", "prix_eur": 2.5 },
+    { "nom": "Noisettes", "prix_eur": 2.5, "alias": ["éclats de noisettes"] },
+    { "nom": "Jambon blanc", "prix_eur": 3.5, "alias": ["jambon super cotto"] },
+    { "nom": "Jambon de Parme", "prix_eur": 3.5, "alias": ["parme"] },
+    { "nom": "Mortadelle", "prix_eur": 3.5, "alias": ["mortadella"] },
+    { "nom": "Spianata", "prix_eur": 3.5, "alias": ["spianata piccante", "salami piquant"] },
+    { "nom": "Guanciale", "prix_eur": 3.5 },
+    { "nom": "Crème de truffe", "prix_eur": 3.5, "alias": ["truffe"] },
+    { "nom": "Saumon", "prix_eur": 3.5, "alias": ["saumon fumé"] },
+    { "nom": "Pistaches", "prix_eur": 3.5, "alias": ["éclats de pistaches"] },
+    { "nom": "Bufala", "prix_eur": 4.5, "alias": ["mozzarella di bufala", "bufflonne"] },
+    { "nom": "Burrata", "prix_eur": 4.5 },
+    { "nom": "Stracciatella", "prix_eur": 4.5 },
+    { "nom": "Jambon truffé", "prix_eur": 4.5, "alias": ["jambon blanc truffé"] }
+  ]
+}

@@ -13,12 +13,18 @@
 //   BUSINESS_NAME      nom du commerce
 //   BUSINESS_DESC      description courte (pour cadrer l'agent)
 //   N8N_RECAP_URL      webhook n8n qui fait extraction + format + mail
+//   PROMPT_FILE        fichier du prompt (si RECEPTION_PROMPT absent). {{CARTE}} y est remplace par la carte.
+//   CLOSING_REGEX      phrase de cloture qui arme le raccrochage (defaut "remercie pour votre appel")
+//   AGENT_TOOLS        "pizzeria" active les outils de prise de commande (voir lib/pizzeria.js)
+//   MENU_FILE, DATA_FILE, CAPACITE_PAR_QUART, RESERVE_PAR_QUART, DELAI_MIN_MINUTES,
+//   MAX_PIZZAS, SERVICES, TIME_ZONE   reglages du profil pizzeria
 //   PORT               injecte par Railway
 
 import http from "http";
 import fs from "fs";
 import { WebSocketServer, WebSocket } from "ws";
 import { ulaw8kToPcm16, pcm16ToUlaw8k } from "./lib/audio.js";
+import { createPizzeria } from "./lib/pizzeria.js";
 
 const PORT = process.env.PORT || 8080;
 const XAI_API_KEY = process.env.XAI_API_KEY;
@@ -34,8 +40,24 @@ const BUSINESS_NAME = process.env.BUSINESS_NAME || "l'entreprise";
 const BUSINESS_DESC = process.env.BUSINESS_DESC || "";
 const N8N_RECAP_URL = process.env.N8N_RECAP_URL || "";
 const ADMIN_KEY = process.env.ADMIN_KEY || ""; // protege le tableau de bord /admin
+const CLOSING_RE = new RegExp(process.env.CLOSING_REGEX || "remercie pour votre appel", "i");
+const AGENT_SPEAKING_MAX_MS = Number(process.env.AGENT_SPEAKING_MAX_MS || 12000); // filet anti-surdite si le mark de fin de parole se perd ; un recapitulatif de commande depasse 12 s
+const MAX_RELANCES_OUTILS = 4; // relances apres outil par tour client : au-dela, l'agent s'enchaine tout seul
 
 if (!XAI_API_KEY) console.error("[boot] ATTENTION: XAI_API_KEY manquante");
+
+const pizzeria = process.env.AGENT_TOOLS === "pizzeria"
+  ? createPizzeria({
+      menuFile: process.env.MENU_FILE || "menus/palazzo.json",
+      dataFile: process.env.DATA_FILE || "",
+      capaciteParQuart: Number(process.env.CAPACITE_PAR_QUART || 15),
+      reserveParQuart: Number(process.env.RESERVE_PAR_QUART || 0),
+      delaiMinMinutes: Number(process.env.DELAI_MIN_MINUTES || 20),
+      maxPizzas: Number(process.env.MAX_PIZZAS || 20),
+      services: process.env.SERVICES || "11:30-14:30,18:30-22:30",
+      timeZone: process.env.TIME_ZONE || "Europe/Paris",
+    })
+  : null;
 
 // Historique des derniers appels (pour le tableau de bord /admin).
 // Persiste sur un volume Railway si CALLS_FILE est defini (sinon en memoire, perdu au redeploiement).
@@ -77,7 +99,10 @@ function frPhoneSpoken(fr) {
 
 // Instruction de l'agent de reception (cf. agent-voiceflow-creator : voice_intake.md / voice_agent.md).
 // Configurable par env (AGENT_NAME / BUSINESS_NAME / BUSINESS_DESC), surchargeable via RECEPTION_PROMPT.
-const RECEPTION_PROMPT = process.env.RECEPTION_PROMPT || `Tu es ${AGENT_NAME}, l'assistant vocal telephonique de ${BUSINESS_NAME}${BUSINESS_DESC ? " (" + BUSINESS_DESC + ")" : ""}. Tu decroches quand le standard est ferme (hors horaires). Tu vouvoies, tu es chaleureux, calme et clair, une idee par phrase, une seule question a la fois.
+const PROMPT_FROM_FILE = process.env.PROMPT_FILE
+  ? fs.readFileSync(process.env.PROMPT_FILE, "utf8").replace("{{CARTE}}", pizzeria ? pizzeria.carteTexte() : "")
+  : "";
+const RECEPTION_PROMPT = process.env.RECEPTION_PROMPT || PROMPT_FROM_FILE || `Tu es ${AGENT_NAME}, l'assistant vocal telephonique de ${BUSINESS_NAME}${BUSINESS_DESC ? " (" + BUSINESS_DESC + ")" : ""}. Tu decroches quand le standard est ferme (hors horaires). Tu vouvoies, tu es chaleureux, calme et clair, une idee par phrase, une seule question a la fois.
 
 Tu fais le tri :
 - Question simple que tu connais (horaires, adresse, services) : tu reponds directement, tu ne demandes aucune coordonnee.
@@ -124,6 +149,24 @@ setInterval(async () => {
   }
 }, 60000);
 
+function renderCommandes() {
+  if (!pizzeria) return "";
+  const euros = (x) => (x == null ? "?" : x.toFixed(2).replace(".", ",") + " €");
+  const cmds = pizzeria.commandes().map((c) => `<div style="border:1px solid #e5e7eb;border-radius:10px;padding:12px 16px;margin:10px 0;background:#fff">
+      <div style="font-weight:600">N° ${escHtml(c.numero)} &middot; ${escHtml(c.prenom)} &middot; retrait ${escHtml(c.jour)} à ${escHtml(c.heure_retrait)} &middot; ${euros(c.total_eur)}</div>
+      <div style="font-size:12px;color:#4b5563;margin:2px 0 6px">prise le ${escHtml(c.ts)} &middot; ${escHtml(c.telephone || "numéro inconnu")}</div>
+      ${c.lignes.map((l) => `<div style="font-size:14px">${l.quantite} × ${escHtml(l.produit)}${l.supplements.length ? " + " + escHtml(l.supplements.join(", ")) : ""}${l.retraits.length ? " sans " + escHtml(l.retraits.join(", ")) : ""}${l.remarque ? " (" + escHtml(l.remarque) + ")" : ""} &middot; ${euros(l.sous_total_eur)}</div>`).join("")}
+      ${c.remarque ? `<div style="font-size:13px;margin-top:4px">Remarque : ${escHtml(c.remarque)}</div>` : ""}
+    </div>`).join("") || '<p style="color:#4b5563">Aucune commande.</p>';
+  const msgs = pizzeria.messages().map((m) => `<div style="border:1px solid #fde68a;border-radius:10px;padding:10px 16px;margin:8px 0;background:#fffbeb">
+      <div style="font-weight:600">${escHtml(m.motif)} &middot; ${escHtml(m.prenom || "sans prénom")} &middot; ${escHtml(m.telephone || "numéro inconnu")}</div>
+      <div style="font-size:12px;color:#4b5563">${escHtml(m.ts)}</div>
+      ${m.details ? `<div style="font-size:14px;margin-top:4px">${escHtml(m.details)}</div>` : ""}
+    </div>`).join("") || '<p style="color:#4b5563">Aucun message.</p>';
+  return `<h2 style="font-size:16px;margin:0 0 4px">Commandes</h2>${cmds}
+    <h2 style="font-size:16px;margin:18px 0 4px">Messages à rappeler</h2>${msgs}<div style="height:18px"></div>`;
+}
+
 function renderDashboard() {
   const cfg = `voix ${GROK_VOICE} · vitesse ${GROK_SPEED} · VAD ${GROK_VAD_THRESHOLD} · raisonnement ${GROK_REASONING} · rate ${GROK_RATE} · langue ${AGENT_LANG}`;
   const calls = recentCalls.map((c) => {
@@ -148,6 +191,7 @@ function renderDashboard() {
       <summary style="cursor:pointer;font-weight:600">Prompt actuel de l'agent</summary>
       <pre style="white-space:pre-wrap;font-size:12px;color:#374151;margin-top:10px">${escHtml(RECEPTION_PROMPT)}</pre>
     </details>
+    ${renderCommandes()}
     <h2 style="font-size:16px;margin:0 0 4px">Derniers appels (le plus recent en haut)</h2>
     ${calls}
   </div></body></html>`;
@@ -200,6 +244,9 @@ wss.on("connection", (twilio) => {
   let closeTriggered = false;
   let greetRetry = 0;
   let lastCallerMs = Date.now();
+  let pendingCalls = [];   // appels d'outils de la reponse en cours, traites en response.done
+  let relancesOutils = 0;  // relances apres outil depuis le dernier tour client
+  let respSeq = 0;         // numero de la reponse en cours : le mark "agentdone" d'une reponse finie ne doit pas rouvrir l'ecoute pendant la suivante
   let agentSpeaking = false, agentSpeakingSince = 0; // half-duplex anti-echo : tant que Dany parle (jusqu'a la fin de lecture Twilio, signalee par le mark "agentdone"), on ne renvoie PAS l'audio a Grok, sinon son propre echo declenche un faux tour et il enchaine les questions
 
   // Raccroche proprement : on laisse jouer l'audio de cloture deja envoye a Twilio (mark),
@@ -248,13 +295,16 @@ wss.on("connection", (twilio) => {
     grok.on("open", () => {
       const callerFr = frPhone(fromNumber);
       const callerSpoken = callerFr ? frPhoneSpoken(callerFr) : "";
-      const sessionInstructions = callerFr
-        ? `${RECEPTION_PROMPT}\n\n# Contexte de cet appel\nLe client appelle depuis le numéro ${callerFr}. Quand tu lui relis ce numéro à voix, tu prononces EXACTEMENT ceci, mot pour mot, sans le recalculer ni changer un seul groupe : « ${callerSpoken} ». C'est son numéro de rappel par défaut, tu le connais déjà.`
-        : RECEPTION_PROMPT;
+      const contexte = [
+        pizzeria ? pizzeria.contexteAppel() : "",
+        callerFr ? `Le client appelle depuis le numéro ${callerFr}. Quand tu lui relis ce numéro à voix, tu prononces EXACTEMENT ceci, mot pour mot, sans le recalculer ni changer un seul groupe : « ${callerSpoken} ». C'est son numéro de rappel par défaut, tu le connais déjà.` : "",
+      ].filter(Boolean).join("\n");
+      const sessionInstructions = contexte ? `${RECEPTION_PROMPT}\n\n# Contexte de cet appel\n${contexte}` : RECEPTION_PROMPT;
       grok.send(JSON.stringify({
         type: "session.update",
         session: {
           instructions: sessionInstructions,
+          ...(pizzeria ? { tools: pizzeria.tools, tool_choice: "auto" } : {}),
           voice: GROK_VOICE,
           reasoning: { effort: GROK_REASONING },
           turn_detection: { type: "server_vad", threshold: GROK_VAD_THRESHOLD, prefix_padding_ms: 300, silence_duration_ms: 600 },
@@ -279,8 +329,12 @@ wss.on("connection", (twilio) => {
           break;
         case "response.created":
           pushUser(); // le tour du client est fini, l'agent repond
+          respSeq++;
           agentSpeaking = true; agentSpeakingSince = Date.now(); // Dany commence a parler -> on coupe l'ecoute (anti-echo)
           console.log("[turn] Dany");
+          break;
+        case "response.function_call_arguments.done":
+          pendingCalls.push({ name: e.name, callId: e.call_id, args: e.arguments });
           break;
         case "response.output_audio.delta": {
           if (!e.delta || !streamSid) break;
@@ -290,13 +344,14 @@ wss.on("connection", (twilio) => {
           break;
         }
         case "response.output_audio_transcript.delta":
-          if (e.delta) { agentBuf += e.delta; if (/remercie pour votre appel/i.test(agentBuf)) closingSaid = true; }
+          if (e.delta) { agentBuf += e.delta; if (CLOSING_RE.test(agentBuf)) closingSaid = true; }
           break;
         case "response.done":
           pushAgent();
           // Dany a fini de GENERER, mais Twilio joue encore l'audio en file. On rouvre l'ecoute seulement au mark "agentdone"
           // (renvoye par Twilio quand la lecture est vraiment finie), pas maintenant, sinon on capte la fin de son propre audio.
-          if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "agentdone" } }));
+          if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `agentdone:${respSeq}` } }));
+          if (pendingCalls.length) runTools(pendingCalls.splice(0));
           if (closeTriggered && !endRequested) requestHangup("cloture polie");
           break;
         case "conversation.item.input_audio_transcription.updated":
@@ -304,6 +359,7 @@ wss.on("connection", (twilio) => {
           break;
         case "input_audio_buffer.speech_started":
           lastCallerMs = Date.now();
+          relancesOutils = 0;
           checkedIn = false; // le client reparle : on reinitialise la detection de silence
           console.log("[turn] client");
           if (streamSid) twilio.send(JSON.stringify({ event: "clear", streamSid })); // barge-in : vider la file Twilio
@@ -325,14 +381,14 @@ wss.on("connection", (twilio) => {
       console.log(`[call] start sid=${callSid} from=${fromNumber}`);
       openGrok();
     } else if (m.event === "media") {
-      if (agentSpeaking && Date.now() - agentSpeakingSince > 12000) { agentSpeaking = false; lastCallerMs = Date.now(); } // filet si le mark "agentdone" se perd
+      if (agentSpeaking && Date.now() - agentSpeakingSince > AGENT_SPEAKING_MAX_MS) { agentSpeaking = false; lastCallerMs = Date.now(); } // filet si le mark "agentdone" se perd
       if (grok && grok.readyState === WebSocket.OPEN && grokReady && !agentSpeaking) {
         const pcm = ulaw8kToPcm16(Buffer.from(m.media.payload, "base64"), GROK_RATE);
         grok.send(JSON.stringify({ type: "input_audio_buffer.append", audio: pcm.toString("base64") }));
       }
     } else if (m.event === "mark") {
       if (m.mark && m.mark.name === "hangup") { try { twilio.close(); } catch {} }
-      else if (m.mark && m.mark.name === "agentdone") { agentSpeaking = false; lastCallerMs = Date.now(); } // Dany a fini de parler (audio joue) : on rouvre l'ecoute + on relance le compte a rebours du silence
+      else if (m.mark && /^agentdone(:|$)/.test(m.mark.name) && (m.mark.name === "agentdone" || Number(m.mark.name.split(":")[1]) === respSeq)) { agentSpeaking = false; lastCallerMs = Date.now(); } // Dany a fini de parler (audio joue) : on rouvre l'ecoute + on relance le compte a rebours du silence. Le mark d'une reponse anterieure (outil suivi d'une relance) est ignore.
     } else if (m.event === "stop") {
       finalize();
     }
@@ -348,6 +404,24 @@ wss.on("connection", (twilio) => {
       grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text }] } }));
       grok.send(JSON.stringify({ type: "response.create" }));
     } catch {}
+  }
+
+  // Outils : un appel d'outil termine la reponse du modele. On renvoie le resultat PUIS on relance,
+  // sinon il reste muet. Plafond de relances par tour client, sinon il s'enchaine tout seul.
+  function runTools(calls) {
+    if (!pizzeria || !(grok && grok.readyState === WebSocket.OPEN)) return;
+    for (const c of calls) {
+      let args = {};
+      try { args = JSON.parse(c.args || "{}"); } catch {}
+      let out;
+      try { out = pizzeria.run(c.name, args, { callSid, from: frPhone(fromNumber) }); }
+      catch (err) { out = { ok: false, erreur: err.message }; console.error(`[outil] ${c.name} KO`, err); }
+      console.log(`[outil] ${c.name} ${JSON.stringify(args)} -> ${JSON.stringify(out)}`);
+      dialog.push({ who: "Outil", msg: `${c.name} ${JSON.stringify(args)} -> ${JSON.stringify(out)}` });
+      grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: c.callId, output: JSON.stringify(out) } }));
+    }
+    if (relancesOutils < MAX_RELANCES_OUTILS) { relancesOutils++; grok.send(JSON.stringify({ type: "response.create" })); }
+    else console.log(`[outil] plafond de relances atteint sid=${callSid}`);
   }
 
   // Gestion du silence : 1) "vous etes toujours la ?" ; 2) si toujours silence, conge poli puis raccroche.
