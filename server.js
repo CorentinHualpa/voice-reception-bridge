@@ -25,6 +25,14 @@ import fs from "fs";
 import { WebSocketServer, WebSocket } from "ws";
 import { ulaw8kToPcm16, pcm16ToUlaw8k } from "./lib/audio.js";
 import { createPizzeria } from "./lib/pizzeria.js";
+import {
+  chargerSession,
+  dalevozActif,
+  enregistrerAppel,
+  executerOutil,
+  resoudreNumero,
+  signatureTwilioValide,
+} from "./lib/dalevoz.js";
 
 const PORT = process.env.PORT || 8080;
 const XAI_API_KEY = process.env.XAI_API_KEY;
@@ -210,15 +218,49 @@ const server = http.createServer((req, res) => {
   }
   if (path === "/twiml") {
     // Webhook Voice de Twilio : renvoie le TwiML qui connecte l'appel au pont WS.
-    // On injecte le numero appelant (From) pour que le pont le connaisse (recap).
+    // On injecte le numero appelant (From), le numero appele (To) et le CallSid :
+    // le pont resout ensuite l'agent Dale Voz a partir du numero appele.
     let body = "";
     req.on("data", (c) => (body += c));
-    req.on("end", () => {
-      const fromBody = new URLSearchParams(body).get("From");
-      const fromQuery = new URL(req.url, "http://x").searchParams.get("From");
-      const from = (fromBody || fromQuery || "").replace(/[<>&"']/g, "");
+    req.on("end", async () => {
+      const post = Object.fromEntries(new URLSearchParams(body));
+      const query = new URL(req.url, "http://x").searchParams;
+      const propre = (v) => String(v || "").replace(/[<>&"']/g, "");
+      const from = propre(post.From || query.get("From"));
+      const to = propre(post.To || query.get("To"));
+      const callSid = propre(post.CallSid || query.get("CallSid"));
       const host = req.headers.host;
-      const xml = `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="wss://${host}/twilio"><Parameter name="from" value="${from}"/></Stream></Connect></Response>`;
+
+      // Numero rattache a un agent Dale Voz : on verifie que l'appel vient bien
+      // de Twilio avant de decrocher. L'adresse du webhook est publique, sans
+      // cette verification n'importe qui ferait parler l'agent d'un client.
+      let tenantId = "";
+      if (dalevozActif && to) {
+        const canal = await resoudreNumero(to);
+        if (!canal) {
+          console.error(`[twiml] numero inconnu ${to}`);
+          res.writeHead(404, { "Content-Type": "text/xml" });
+          res.end(`<?xml version="1.0" encoding="UTF-8"?><Response><Say language="fr-FR">Ce numéro n'est pas configuré.</Say><Hangup/></Response>`);
+          return;
+        }
+        const urlComplete = `https://${host}${req.url}`;
+        const signature = req.headers["x-twilio-signature"] || "";
+        if (!signatureTwilioValide({ authToken: canal.authToken, url: urlComplete, params: post, signature })) {
+          console.error(`[twiml] signature Twilio refusee sid=${callSid} to=${to}`);
+          res.writeHead(403, { "Content-Type": "text/plain" });
+          res.end("signature invalide");
+          return;
+        }
+        tenantId = canal.tenantId;
+      }
+
+      const params = [
+        `<Parameter name="from" value="${from}"/>`,
+        to ? `<Parameter name="to" value="${to}"/>` : "",
+        callSid ? `<Parameter name="callSid" value="${callSid}"/>` : "",
+      ].join("");
+      const xml = `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="wss://${host}/twilio">${params}</Stream></Connect></Response>`;
+      if (tenantId) console.log(`[twiml] appel accepte to=${to} sid=${callSid}`);
       res.writeHead(200, { "Content-Type": "text/xml" });
       res.end(xml);
     });
@@ -233,6 +275,11 @@ wss.on("connection", (twilio) => {
   let streamSid = null;
   let callSid = null;
   let fromNumber = null;
+  let toNumber = null;    // numero APPELE : c'est lui qui designe l'agent Dale Voz
+  let canalDV = null;     // { tenantId, agentSlug, locale... } quand le numero est rattache
+  let sessionDV = null;   // instructions, voix et outils de la version publiee de l'agent
+  let sessionIdDV = null; // fil Dale Voz, cree a l'ecriture de l'appel
+  const debutAppelMs = Date.now();
   let grok = null;
   let grokReady = false;
   const dialog = []; // { who: 'Client' | 'Agent', msg }
@@ -295,6 +342,21 @@ wss.on("connection", (twilio) => {
   function pushAgent() { pushLine("Agent", agentBuf); agentBuf = ""; }
 
   async function openGrok() {
+    // L'agent joué vient de Dale Voz quand le numéro appelé y est rattaché ;
+    // sinon le pont garde sa configuration locale (prompt en fichier), ce qui
+    // fait tourner Motralec et Palazzo tant que leur numéro n'est pas branché.
+    if (dalevozActif && toNumber) {
+      canalDV = await resoudreNumero(toNumber);
+      if (canalDV) {
+        sessionDV = await chargerSession({
+          tenantId: canalDV.tenantId,
+          agentSlug: canalDV.agentSlug,
+          locale: canalDV.locale,
+        });
+        if (!sessionDV) console.error(`[dalevoz] config introuvable pour ${canalDV.agentSlug}, repli sur la config locale`);
+        else console.log(`[dalevoz] agent ${canalDV.agentSlug} (${sessionDV.tools?.length ?? 0} outils) pour ${toNumber}`);
+      }
+    }
     let token;
     try {
       const tok = await fetch("https://api.x.ai/v1/realtime/client_secrets", {
@@ -318,13 +380,15 @@ wss.on("connection", (twilio) => {
         pizzeria ? pizzeria.contexteAppel() : "",
         callerFr ? `Le client appelle depuis le numéro ${callerFr}. Quand tu lui relis ce numéro à voix, tu prononces EXACTEMENT ceci, mot pour mot, sans le recalculer ni changer un seul groupe : « ${callerSpoken} ». C'est son numéro de rappel par défaut, tu le connais déjà.` : "",
       ].filter(Boolean).join("\n");
-      const sessionInstructions = contexte ? `${RECEPTION_PROMPT}\n\n# Contexte de cet appel\n${contexte}` : RECEPTION_PROMPT;
+      const instructionsBase = sessionDV?.instructions || RECEPTION_PROMPT;
+      const sessionInstructions = contexte ? `${instructionsBase}\n\n# Contexte de cet appel\n${contexte}` : instructionsBase;
+      const outils = [...(pizzeria ? pizzeria.tools : []), ...(sessionDV?.tools ?? [])];
       grok.send(JSON.stringify({
         type: "session.update",
         session: {
           instructions: sessionInstructions,
-          ...(pizzeria ? { tools: pizzeria.tools, tool_choice: "auto" } : {}),
-          voice: GROK_VOICE,
+          ...(outils.length ? { tools: outils, tool_choice: "auto" } : {}),
+          voice: sessionDV?.voice || GROK_VOICE,
           reasoning: { effort: GROK_REASONING },
           turn_detection: { type: "server_vad", threshold: GROK_VAD_THRESHOLD, prefix_padding_ms: 300, silence_duration_ms: 600 },
           input_audio_transcription: { language: AGENT_LANG }, // ancien schema, ignore en silence par xAI : garde pour compatibilite
@@ -373,7 +437,7 @@ wss.on("connection", (twilio) => {
           // (renvoye par Twilio quand la lecture est vraiment finie), pas maintenant, sinon on capte la fin de son propre audio.
           if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `agentdone:${respSeq}` } }));
           const calls = pendingCalls.splice(0);
-          if (calls.length) runTools(calls);
+          if (calls.length) runTools(calls).catch((err) => console.error("[outil] echec du cycle", err));
           else if (pizzeria && !clotureVerifiee) {
             const consigne = pizzeria.consigneCloture(texteReponse, { callSid, outils: calls.map((c) => c.name) });
             if (consigne) {
@@ -416,7 +480,8 @@ wss.on("connection", (twilio) => {
       streamSid = m.start.streamSid;
       callSid = m.start.callSid;
       fromNumber = (m.start.customParameters && (m.start.customParameters.from || m.start.customParameters.From)) || null;
-      console.log(`[call] start sid=${callSid} from=${fromNumber}`);
+      toNumber = (m.start.customParameters && (m.start.customParameters.to || m.start.customParameters.To)) || null;
+      console.log(`[call] start sid=${callSid} from=${fromNumber} to=${toNumber}`);
       openGrok();
     } else if (m.event === "media") {
       if (agentSpeaking && Date.now() - agentSpeakingSince > AGENT_SPEAKING_MAX_MS) { agentSpeaking = false; lastCallerMs = Date.now(); } // filet si le mark "agentdone" se perd
@@ -446,18 +511,41 @@ wss.on("connection", (twilio) => {
 
   // Outils : un appel d'outil termine la reponse du modele. On renvoie le resultat PUIS on relance,
   // sinon il reste muet. Plafond de relances par tour client, sinon il s'enchaine tout seul.
-  function runTools(calls) {
-    if (!pizzeria || !(grok && grok.readyState === WebSocket.OPEN)) return;
+  const outilLocal = (nom) => Boolean(pizzeria) && pizzeria.tools.some((t) => t.name === nom);
+
+  async function runTools(calls) {
+    if (!(grok && grok.readyState === WebSocket.OPEN)) return;
     for (const c of calls) {
       let args = {};
       try { args = JSON.parse(c.args || "{}"); } catch {}
       let out;
-      if (c.name === "chiffrer_commande") { recapTs = 0; clientApresRecap = false; } // commande modifiee : nouveau recapitulatif exige
-      try { out = pizzeria.run(c.name, args, { callSid, from: frPhone(fromNumber), recapConfirme: recapTs > 0 && clientApresRecap }); }
-      catch (err) { out = { ok: false, erreur: err.message }; console.error(`[outil] ${c.name} KO`, err); }
-      console.log(`[outil] ${c.name} ${JSON.stringify(args)} -> ${JSON.stringify(out)}`);
-      dialog.push({ who: "Outil", msg: `${c.name} ${JSON.stringify(args)} -> ${JSON.stringify(out)}` });
-      grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: c.callId, output: JSON.stringify(out) } }));
+      if (c.name === "end_call") {
+        // Outil de Dale Voz : cote web la surface raccroche, ici c'est Twilio.
+        out = { ok: true };
+        setTimeout(() => requestHangup("end_call"), 1500);
+      } else if (outilLocal(c.name)) {
+        if (c.name === "chiffrer_commande") { recapTs = 0; clientApresRecap = false; } // commande modifiee : nouveau recapitulatif exige
+        try { out = pizzeria.run(c.name, args, { callSid, from: frPhone(fromNumber), recapConfirme: recapTs > 0 && clientApresRecap }); }
+        catch (err) { out = { ok: false, erreur: err.message }; console.error(`[outil] ${c.name} KO`, err); }
+      } else if (canalDV) {
+        const reponse = await executerOutil({
+          tenantId: canalDV.tenantId,
+          agentSlug: canalDV.agentSlug,
+          outil: c.name,
+          args,
+          sessionId: sessionIdDV,
+          locale: canalDV.locale,
+        });
+        // La plateforme renvoie { output } deja serialise ; null = elle n'a pas repondu.
+        out = reponse?.output ?? { ok: false, erreur: "outil indisponible" };
+      } else {
+        out = { ok: false, erreur: `outil inconnu ${c.name}` };
+      }
+      const sortie = typeof out === "string" ? out : JSON.stringify(out);
+      console.log(`[outil] ${c.name} ${JSON.stringify(args)} -> ${sortie.slice(0, 300)}`);
+      dialog.push({ who: "Outil", msg: `${c.name} ${JSON.stringify(args)} -> ${sortie}` });
+      if (!(grok && grok.readyState === WebSocket.OPEN)) return;
+      grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: c.callId, output: sortie } }));
     }
     if (relancesOutils < MAX_RELANCES_OUTILS) { relancesOutils++; grok.send(JSON.stringify({ type: "response.create" })); }
     else console.log(`[outil] plafond de relances atteint sid=${callSid}`);
@@ -494,6 +582,26 @@ wss.on("connection", (twilio) => {
     console.log(`[call] stop sid=${callSid} lignes=${lignes.length}`);
     if (lignes.length) pushCall({ ts: new Date().toISOString(), from: fromNumber, sid: callSid, endReason, dialog: text });
     const hasClient = lignes.some((l) => l.who === "Client");
+
+    // Dale Voz : l'appel entre dans Conversations et la minute est comptee.
+    // Les lignes d'outil ne sont pas du dialogue, elles restent dans le journal du pont.
+    if (canalDV) {
+      const tours = lignes
+        .filter((l) => l.who === "Client" || l.who === "Agent")
+        .map((l) => ({ role: l.who === "Client" ? "user" : "assistant", text: l.msg }));
+      const ecrit = await enregistrerAppel({
+        tenantId: canalDV.tenantId,
+        agentSlug: canalDV.agentSlug,
+        turns: tours,
+        appelId: callSid,
+        dureeMs: Date.now() - debutAppelMs,
+        userId: frPhone(fromNumber) || undefined,
+        locale: canalDV.locale,
+        diagnostic: endReason,
+      });
+      sessionIdDV = ecrit?.sessionId ?? null;
+      console.log(`[dalevoz] appel ${sessionIdDV ? "ecrit " + sessionIdDV : "NON ecrit"} sid=${callSid}`);
+    }
     if (hasClient && N8N_RECAP_URL) {
       const payload = { dialog: text, phone: fromNumber || "inconnu", call_sid: callSid };
       const ok = await postRecap(payload, 4); // essais immediats au raccrochage : 1s, 2s, 4s, 8s
