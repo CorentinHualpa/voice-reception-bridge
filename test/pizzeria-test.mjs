@@ -89,6 +89,43 @@ cas("heure refusee si trop proche ou hors service", () => {
   assert.equal(p.run("enregistrer_commande", { prenom: "Max", heure_retrait: "12:00", jour: "demain", articles: [{ produit: "Bari", quantite: 1 }] }, {}).ok, true);
 });
 
+cas("un rechiffrage qui perd des articles est signale", () => {
+  const p = mk();
+  p.run("chiffrer_commande", { articles: [{ produit: "Pacino", quantite: 1 }, { produit: "Celentano", quantite: 1 }] }, { callSid: "G" });
+  const r = p.run("chiffrer_commande", { articles: [{ produit: "Bellucci", quantite: 1 }] }, { callSid: "G" });
+  assert.match(r.attention, /Pacino, Celentano/);
+  const r2 = p.run("chiffrer_commande", { articles: [{ produit: "Pacino", quantite: 1 }, { produit: "Celentano", quantite: 1 }, { produit: "Bellucci", quantite: 1 }] }, { callSid: "G" });
+  assert.equal(r2.attention, undefined);
+});
+
+cas("un prenom de remplissage est refuse", () => {
+  const r = mk().run("enregistrer_commande", { prenom: "Client", heure_retrait: "20:00", articles: [{ produit: "Roma", quantite: 2 }] }, { callSid: "D" });
+  assert.equal(r.ok, false);
+  assert.match(r.raison, /prénom/);
+});
+
+cas("un message transmis deux fois dans le meme appel reste unique et se complete", () => {
+  const p = mk();
+  p.run("transmettre_message", { motif: "demande de réservation", details: "4 personnes samedi 20h" }, { callSid: "E" });
+  const r = p.run("transmettre_message", { prenom: "Élodie", motif: "demande de réservation" }, { callSid: "E" });
+  assert.equal(r.deja_transmis, true);
+  assert.equal(p.messages().length, 1);
+  assert.equal(p.messages()[0].prenom, "Élodie");
+});
+
+cas("la carte montree au modele porte les prononciations des clients", () => {
+  assert.match(mk().carteTexte(), /Celentano.*selentina/);
+});
+
+cas("garde de cloture : seulement si rien n'est enregistre", () => {
+  const p = mk();
+  assert.ok(p.consigneCloture("Merci pour votre commande, à tout à l'heure !", { callSid: "F", outils: [] }));
+  assert.equal(p.consigneCloture("C'est noté, une Regina.", { callSid: "F", outils: [] }), null);
+  assert.equal(p.consigneCloture("Merci pour votre commande", { callSid: "F", outils: ["enregistrer_commande"] }), null);
+  p.run("enregistrer_commande", { prenom: "Léo", heure_retrait: "20:00", articles: [{ produit: "Roma", quantite: 1 }] }, { callSid: "F" });
+  assert.equal(p.consigneCloture("Merci pour votre commande", { callSid: "F", outils: [] }), null);
+});
+
 cas("contexte d'appel : heure locale et salutation", () => {
   const t = mk().contexteAppel();
   assert.match(t, /19:00/);

@@ -27,6 +27,11 @@ const PERSONAS = [
   { id: "anglais", brief: "You ONLY speak English. You are a tourist. You want to order one Parma pizza and one San Pellegrino for pickup as soon as possible. Your name is Tom. Keep speaking English the whole time." },
   { id: "heure-pleine", pre: [{ prenom: "Luc", heure_retrait: "19:30", articles: [{ produit: "Roma", quantite: 15 }] }, { prenom: "Ana", heure_retrait: "19:30", articles: [{ produit: "Capri", quantite: 15 }] }], brief: "Tu t'appelles Sophie. Tu veux quatre Fiorella pour 19h30 précises. Si on te dit que ce n'est pas possible, tu acceptes l'heure proposée. Pas de dessert." },
   { id: "formule-soir", brief: "Tu t'appelles Paul. Tu veux la formule midi Pizz&Sweet parce que c'est moins cher, même si c'est le soir. Si on refuse, tu prends une Fiorella et une Limonata pour 20 heures." },
+  { id: "sans-gluten", brief: "Tu t'appelles Marion. Tu es intolérante au gluten et tu demandes s'ils font des pizzas sans gluten. Si ce n'est pas possible, tu demandes s'ils font du halal pour ton mari, puis tu remercies et tu raccroches sans commander." },
+  { id: "pratique", brief: "Tu t'appelles Hugo. Avant de commander, tu demandes où te garer, puis si tu peux payer en tickets restaurant. Ensuite tu commandes une Rucola pour le plus tôt possible, sans dessert." },
+  { id: "reservation", brief: "Tu t'appelles Élodie. Tu veux réserver une table pour quatre personnes samedi à 20 heures. Tu donnes ton prénom si on te le demande." },
+  { id: "ecorche", brief: "Tu t'appelles Karim. Tu écorches les noms : tu demandes une « Patino » et une « Selentina ». Puis tu demandes si on peut remplacer la mortadelle de la Bellucci par du jambon blanc, et tu en prends une comme ça. Tu prends une Moretti. Pour 20h30." },
+  { id: "robot-bis", brief: "Tu t'appelles Denise. Tu demandes d'emblée si c'est une machine, tu dis que tu n'aimes pas trop ça, puis tu commandes quand même deux Roma pour 21 heures. Pas de dessert. Tu confirmes le récapitulatif." },
   { id: "changement", brief: "Tu t'appelles Inès. Tu commandes une Salmon Joe pour 20h15. Au moment du récapitulatif, tu changes d'avis : tu veux finalement deux Salmon Joe. Pas de dessert." },
 ];
 
@@ -88,12 +93,20 @@ async function run(p) {
     grok.send(JSON.stringify({ type: "response.create" }));
   });
   // Un tour agent = reponses successives tant que le modele appelle des outils (plafond comme en prod).
+  let gardeFaite = false;
   async function agentTurn() {
     for (let relance = 0; relance <= 4; relance++) {
       buf = ""; calls = [];
       await oneResponse();
       if (buf.trim()) dialog.push({ who: "Agent", msg: buf.trim() });
-      if (!calls.length) return;
+      if (!calls.length) {
+        const consigne = !gardeFaite && pizzeria.consigneCloture(buf, { callSid: "banc", outils: [] });
+        if (!consigne) return;
+        gardeFaite = true;
+        dialog.push({ who: "Garde", msg: "commande annoncée sans enregistrement, consigne renvoyée" });
+        grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text: consigne }] } }));
+        continue;
+      }
       for (const c of calls) {
         let args = {}; try { args = JSON.parse(c.arguments || "{}"); } catch {}
         const out = pizzeria.run(c.name, args, { callSid: "banc", from: "0612345678" });

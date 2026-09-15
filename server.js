@@ -246,6 +246,7 @@ wss.on("connection", (twilio) => {
   let lastCallerMs = Date.now();
   let pendingCalls = [];   // appels d'outils de la reponse en cours, traites en response.done
   let relancesOutils = 0;  // relances apres outil depuis le dernier tour client
+  let clotureVerifiee = false; // garde « commande annoncee sans enregistrement » : une seule consigne par appel
   let respSeq = 0;         // numero de la reponse en cours : le mark "agentdone" d'une reponse finie ne doit pas rouvrir l'ecoute pendant la suivante
   let agentSpeaking = false, agentSpeakingSince = 0; // half-duplex anti-echo : tant que Dany parle (jusqu'a la fin de lecture Twilio, signalee par le mark "agentdone"), on ne renvoie PAS l'audio a Grok, sinon son propre echo declenche un faux tour et il enchaine les questions
 
@@ -346,14 +347,26 @@ wss.on("connection", (twilio) => {
         case "response.output_audio_transcript.delta":
           if (e.delta) { agentBuf += e.delta; if (CLOSING_RE.test(agentBuf)) closingSaid = true; }
           break;
-        case "response.done":
+        case "response.done": {
+          const texteReponse = agentBuf;
           pushAgent();
           // Dany a fini de GENERER, mais Twilio joue encore l'audio en file. On rouvre l'ecoute seulement au mark "agentdone"
           // (renvoye par Twilio quand la lecture est vraiment finie), pas maintenant, sinon on capte la fin de son propre audio.
           if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `agentdone:${respSeq}` } }));
-          if (pendingCalls.length) runTools(pendingCalls.splice(0));
+          const calls = pendingCalls.splice(0);
+          if (calls.length) runTools(calls);
+          else if (pizzeria && !clotureVerifiee) {
+            const consigne = pizzeria.consigneCloture(texteReponse, { callSid, outils: calls.map((c) => c.name) });
+            if (consigne) {
+              clotureVerifiee = true; closingSaid = false;
+              console.log(`[garde] commande annoncee sans enregistrement sid=${callSid}`);
+              dialog.push({ who: "Garde", msg: "commande annoncée sans enregistrement, consigne renvoyée" });
+              promptGrok(consigne);
+            }
+          }
           if (closeTriggered && !endRequested) requestHangup("cloture polie");
           break;
+        }
         case "conversation.item.input_audio_transcription.updated":
           if (typeof e.transcript === "string") userBuf = e.transcript; // cumulatif sur le tour
           break;

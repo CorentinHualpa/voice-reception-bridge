@@ -9,7 +9,7 @@
 
     { "nom": "Antica Margherita", "categorie": "Pizzas historiques", "pizzas": 1, "prix_eur": 14, "alias": ["margherita", "margarita", "marguerite"], "description": "Sauce tomate, basilic, Parmigiano Reggiano, mozzarella di bufala" },
     { "nom": "Sicilia", "categorie": "Pizzas historiques", "pizzas": 1, "prix_eur": 13, "alias": ["sicilienne"], "description": "Sauce tomate, mozzarella fior di latte, anchois, fleurs de câpres, oignons rouges, olives noires" },
-    { "nom": "Pacino", "categorie": "Pizzas historiques", "pizzas": 1, "prix_eur": 17, "description": "Sauce tomate, mozzarella fior di latte, jambon blanc super cotto, champignons de Paris, poivrons, spianata piccante, olives noires" },
+    { "nom": "Pacino", "categorie": "Pizzas historiques", "pizzas": 1, "prix_eur": 17, "alias": ["patino", "patini", "pacini"], "description": "Sauce tomate, mozzarella fior di latte, jambon blanc super cotto, champignons de Paris, poivrons, spianata piccante, olives noires" },
     { "nom": "Bellucci", "categorie": "Pizzas historiques", "pizzas": 1, "prix_eur": 17, "description": "Crème fraîche, mozzarella fior di latte, mortadella à la pistache IGP, stracciatella, éclats de pistaches" },
     { "nom": "Rucola", "categorie": "Pizzas historiques", "pizzas": 1, "prix_eur": 16, "alias": ["roquette"], "description": "Sauce tomate, mozzarella fior di latte, roquette, jambon de Parme, Parmigiano Reggiano, tomates cerises semi-confites" },
 
@@ -18,7 +18,7 @@
     { "nom": "Bari", "categorie": "Pizzas contemporaines", "pizzas": 1, "prix_eur": 16, "description": "Crème de basilic, mozzarella fior di latte, tomates cerises semi-confites, burrata, éclats de noisettes, basilic" },
     { "nom": "Fiamma", "categorie": "Pizzas contemporaines", "pizzas": 1, "prix_eur": 17, "description": "Crème de poivrons jaunes, mozzarella fior di latte, spianata piccante, poivrons gouttes, paillettes de piments, basilic (pizza piquante)" },
     { "nom": "Salmon Joe", "categorie": "Pizzas contemporaines", "pizzas": 1, "prix_eur": 17, "alias": ["saumon"], "description": "Crème fraîche, mozzarella fior di latte, saumon fumé, oignons rouges, tomates cerises semi-confites, zestes de citron, basilic" },
-    { "nom": "Celentano", "categorie": "Pizzas contemporaines", "pizzas": 1, "prix_eur": 17, "description": "Crème fraîche, mozzarella fior di latte, guanciale poivré, ricotta, crème d'œuf au Parmesan" },
+    { "nom": "Celentano", "categorie": "Pizzas contemporaines", "pizzas": 1, "prix_eur": 17, "alias": ["selentino", "celentino", "selentina", "celantano"], "description": "Crème fraîche, mozzarella fior di latte, guanciale poivré, ricotta, crème d'œuf au Parmesan" },
     { "nom": "Capri", "categorie": "Pizzas contemporaines", "pizzas": 1, "prix_eur": 14, "description": "Crème fraîche, mozzarella fior di latte, chèvre, miel, éclats de noisettes" },
     { "nom": "Parma", "categorie": "Pizzas contemporaines", "pizzas": 1, "prix_eur": 18, "description": "Sauce tomate, mozzarella fior di latte, mozzarella di bufala, jambon de Parme, tomates cerises semi-confites, basilic" },
 
