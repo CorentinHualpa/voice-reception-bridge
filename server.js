@@ -18,6 +18,8 @@
 //   AGENT_TOOLS        "pizzeria" active les outils de prise de commande (voir lib/pizzeria.js)
 //   MENU_FILE, DATA_FILE, CAPACITE_PAR_QUART, RESERVE_PAR_QUART, DELAI_MIN_MINUTES,
 //   MAX_PIZZAS, SERVICES, TIME_ZONE   reglages du profil pizzeria
+//   TRANSFERT_NUMERO   numero vers lequel l'agent bascule l'appel quand le client demande un humain (lib/transfert.js)
+//   TRANSFERT_NOM      prenom annonce au client (« Je vous passe Lorenzo »)
 //   PORT               injecte par Railway
 
 import http from "http";
@@ -33,6 +35,7 @@ import {
   resoudreNumero,
   signatureTwilioValide,
 } from "./lib/dalevoz.js";
+import { basculerAppel, numeroE164, outilTransfert, twimlApresTransfert, twimlTransfert } from "./lib/transfert.js";
 
 const PORT = process.env.PORT || 8080;
 const XAI_API_KEY = process.env.XAI_API_KEY;
@@ -56,6 +59,13 @@ const BARGE_IN_DEFAUT = process.env.BARGE_IN === "1"; // repli quand l'agent ne 
 const RECAP_RE = /c'est bien ça|c'est correct|est-ce (bien )?(correct|ça)|je récapitule|récapitul|ça vous va|is that (right|correct)|does that sound|es correcto|está bien así|è corretto|va bene così/i; // relances apres outil par tour client : au-dela, l'agent s'enchaine tout seul
 
 if (!XAI_API_KEY) console.error("[boot] ATTENTION: XAI_API_KEY manquante");
+
+// Transfert vers un humain : offert seulement si le numero est lisible. Un numero mal saisi
+// se dit au demarrage, plutot que de promettre au client un transfert qui echouerait.
+const TRANSFERT_NUMERO = numeroE164(process.env.TRANSFERT_NUMERO);
+const TRANSFERT_NOM = (process.env.TRANSFERT_NOM || "").trim();
+if (process.env.TRANSFERT_NUMERO && !TRANSFERT_NUMERO) console.error("[boot] TRANSFERT_NUMERO illisible, transfert desactive");
+else if (TRANSFERT_NUMERO) console.log(`[boot] transfert d'appel vers ${TRANSFERT_NOM || "l'equipe"} actif`);
 
 const pizzeria = process.env.AGENT_TOOLS === "pizzeria"
   ? createPizzeria({
@@ -273,12 +283,50 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
+  if (path === "/apres-transfert") {
+    // Fin de la sonnerie ou de la conversation avec l'humain (attribut action du <Dial>).
+    // Meme verification de signature que /twiml : sans elle, n'importe qui pourrait
+    // deposer de faux messages « a rappeler » dans le tableau de bord.
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", async () => {
+      const post = Object.fromEntries(new URLSearchParams(body));
+      const statut = String(post.DialCallStatus || "");
+      let signatureOk = !dalevozActif;
+      if (dalevozActif && post.To) {
+        const r = await resoudreNumero(post.To);
+        signatureOk = Boolean(r.canal) && signatureTwilioValide({
+          authToken: r.canal.authToken,
+          url: `https://${req.headers.host}${req.url}`,
+          params: post,
+          signature: req.headers["x-twilio-signature"] || "",
+        });
+      }
+      if (!signatureOk) {
+        console.error(`[transfert] fin refusee (signature) sid=${post.CallSid}`);
+        res.writeHead(403, { "Content-Type": "text/plain" });
+        res.end("signature invalide");
+        return;
+      }
+      console.log(`[transfert] fin statut=${statut} duree=${post.DialCallDuration || 0}s sid=${post.CallSid}`);
+      if (statut !== "completed" && statut !== "answered" && pizzeria) {
+        // Personne n'a decroche : l'equipe doit rappeler, comme pour un message transmis.
+        pizzeria.run("transmettre_message", {
+          motif: `Voulait parler à ${TRANSFERT_NOM || "un humain"}, transfert sans réponse (${statut || "inconnu"})`,
+        }, { callSid: post.CallSid || null, from: frPhone(post.From) });
+      }
+      res.writeHead(200, { "Content-Type": "text/xml" });
+      res.end(twimlApresTransfert({ statut, nom: TRANSFERT_NOM }));
+    });
+    return;
+  }
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("voice-reception-bridge ok");
 });
 const wss = new WebSocketServer({ server, path: "/twilio" });
 
-wss.on("connection", (twilio) => {
+wss.on("connection", (twilio, requete) => {
+  const hotePont = requete?.headers?.host || ""; // pour l'adresse de fin de transfert
   let streamSid = null;
   let callSid = null;
   let fromNumber = null;
@@ -316,6 +364,10 @@ wss.on("connection", (twilio) => {
   // On garde l'octet orphelin pour le delta suivant et on n'envoie jamais de charge vide.
   let resteAudio = Buffer.alloc(0);
   let mediasVides = 0;
+  // TRANSFERT (16/09/2026) : null, puis { etat, motif, filet }. « annonce » : l'outil est appele, l'agent
+  // dit sa phrase ; « attente » : la phrase est generee, on attend que Twilio ait fini de la jouer (mark
+  // "transfert") ; « lance » : l'appel est bascule chez Twilio, le flux va se fermer.
+  let transfert = null;
   let agentSpeaking = false, agentSpeakingSince = 0; // half-duplex anti-echo : tant que Dany parle (jusqu'a la fin de lecture Twilio, signalee par le mark "agentdone"), on ne renvoie PAS l'audio a Grok, sinon son propre echo declenche un faux tour et il enchaine les questions
 
   // Raccroche proprement : on laisse jouer l'audio de cloture deja envoye a Twilio (mark),
@@ -407,7 +459,16 @@ wss.on("connection", (twilio) => {
       ].filter(Boolean).join("\n");
       const instructionsBase = sessionDV?.instructions || RECEPTION_PROMPT;
       const sessionInstructions = contexte ? `${instructionsBase}\n\n# Contexte de cet appel\n${contexte}` : instructionsBase;
-      const outils = [...(pizzeria ? pizzeria.tools : []), ...(sessionDV?.tools ?? [])];
+      // Le transfert n'est offert que si l'appel peut vraiment basculer : un numero lisible et les
+      // identifiants Twilio du numero appele. Il remplace alors request_handoff de Dale Voz, qui ne
+      // fait qu'ouvrir une demande dans la messagerie : au telephone, le client attendrait pour rien.
+      const transfertPossible = Boolean(TRANSFERT_NUMERO && canalDV?.accountSid && canalDV?.authToken);
+      const outilsDV = (sessionDV?.tools ?? []).filter((t) => !(transfertPossible && t.name === "request_handoff"));
+      const outils = [
+        ...(pizzeria ? pizzeria.tools : []),
+        ...(transfertPossible ? [outilTransfert(TRANSFERT_NOM)] : []),
+        ...outilsDV,
+      ];
       grok.send(JSON.stringify({
         type: "session.update",
         session: {
@@ -477,6 +538,8 @@ wss.on("connection", (twilio) => {
           // (renvoye par Twilio quand la lecture est vraiment finie), pas maintenant, sinon on capte la fin de son propre audio.
           if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `agentdone:${respSeq}` } }));
           const calls = pendingCalls.splice(0);
+          // La phrase d'annonce du transfert vient d'etre generee : on attend qu'elle soit jouee, puis on bascule.
+          if (!calls.length && transfert && transfert.etat === "annonce") preparerTransfert();
           if (calls.length) runTools(calls).catch((err) => console.error("[outil] echec du cycle", err));
           else if (pizzeria && !clotureVerifiee) {
             const consigne = pizzeria.consigneCloture(texteReponse, { callSid, outils: calls.map((c) => c.name) });
@@ -545,12 +608,15 @@ wss.on("connection", (twilio) => {
       // l'arreter. L'echo qui avait motive le demi-duplex venait d'un haut-parleur ; un
       // combine n'en produit pas, et une fausse coupure coute moins qu'un agent qu'on ne
       // peut pas faire taire.
+      // Une fois l'annonce du transfert partie, plus rien ne va a Grok : le client parle deja a l'humain.
+      if (transfert && transfert.etat !== "annonce") return;
       if (grok && grok.readyState === WebSocket.OPEN && grokReady && (bargeIn || !agentSpeaking)) {
         const pcm = ulaw8kToPcm16(Buffer.from(m.media.payload, "base64"), GROK_RATE);
         grok.send(JSON.stringify({ type: "input_audio_buffer.append", audio: pcm.toString("base64") }));
       }
     } else if (m.event === "mark") {
       if (m.mark && m.mark.name === "hangup") { try { twilio.close(); } catch {} }
+      else if (m.mark && m.mark.name === "transfert") lancerTransfert("fin de l'annonce");
       else if (m.mark && /^agentdone(:|$)/.test(m.mark.name) && (m.mark.name === "agentdone" || Number(m.mark.name.split(":")[1]) === respSeq)) { agentSpeaking = false; lastCallerMs = Date.now(); } // Dany a fini de parler (audio joue) : on rouvre l'ecoute + on relance le compte a rebours du silence. Le mark d'une reponse anterieure (outil suivi d'une relance) est ignore.
     } else if (m.event === "stop") {
       finalize();
@@ -586,6 +652,18 @@ wss.on("connection", (twilio) => {
         // Outil de Dale Voz : cote web la surface raccroche, ici c'est Twilio.
         out = { ok: true };
         setTimeout(() => requestHangup("end_call"), 1500);
+      } else if (c.name === "transferer_appel") {
+        const qui = TRANSFERT_NOM || "quelqu'un de l'équipe";
+        if (!(TRANSFERT_NUMERO && canalDV?.accountSid && canalDV?.authToken && callSid)) {
+          out = { ok: false, erreur: "transfert indisponible", consigne: "Le transfert n'est pas possible pour le moment : dis-le simplement et propose de transmettre un message pour que l'équipe rappelle." };
+        } else if (transfert) {
+          out = { ok: true, deja_en_cours: true, consigne: "Le transfert est déjà en cours : ne dis plus rien." };
+        } else {
+          transfert = { etat: "annonce", motif: String(args.motif || "").slice(0, 200), filet: null };
+          // Filet : si la phrase d'annonce ne vient jamais (relance plafonnee, reponse perdue), on bascule quand meme.
+          transfert.filet = setTimeout(() => lancerTransfert("filet"), 12000);
+          out = { ok: true, consigne: `Le transfert vers ${qui} est lancé. Si tu n'as pas déjà prévenu le client, dis seulement : « Je vous passe ${qui}, ne quittez pas. » Sinon, ne dis rien. Ensuite, plus un mot.` };
+        }
       } else if (outilLocal(c.name)) {
         if (c.name === "chiffrer_commande") { recapTs = 0; clientApresRecap = false; } // commande modifiee : nouveau recapitulatif exige
         try { out = pizzeria.run(c.name, args, { callSid, from: frPhone(fromNumber), recapConfirme: recapTs > 0 && clientApresRecap }); }
@@ -611,12 +689,51 @@ wss.on("connection", (twilio) => {
       grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: c.callId, output: sortie } }));
     }
     if (relancesOutils < MAX_RELANCES_OUTILS) { relancesOutils++; grok.send(JSON.stringify({ type: "response.create" })); }
-    else console.log(`[outil] plafond de relances atteint sid=${callSid}`);
+    else {
+      console.log(`[outil] plafond de relances atteint sid=${callSid}`);
+      if (transfert && transfert.etat === "annonce") preparerTransfert(); // pas de phrase d'annonce a attendre
+    }
+  }
+
+  // L'annonce est generee : on pose un mark derriere l'audio en file chez Twilio, qui le renvoie
+  // quand tout a ete joue. Le filet repart de la fin de lecture estimee, pour le cas ou le mark se perd.
+  function preparerTransfert() {
+    if (!transfert || transfert.etat !== "annonce") return;
+    transfert.etat = "attente";
+    clearTimeout(transfert.filet);
+    if (streamSid) { try { twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "transfert" } })); } catch {} }
+    transfert.filet = setTimeout(() => lancerTransfert("filet apres annonce"), Math.max(0, finLecture - Date.now()) + 4000);
+  }
+
+  // Bascule l'appel chez Twilio. Reussi, Twilio ferme le flux : finalize() ecrit l'appel dans Dale Voz
+  // avec le motif de fin. Rate, l'agent reprend la parole et propose un message a transmettre.
+  async function lancerTransfert(pourquoi) {
+    if (!transfert || transfert.etat === "lance" || finalized) return;
+    transfert.etat = "lance";
+    clearTimeout(transfert.filet);
+    const twiml = twimlTransfert({
+      numero: TRANSFERT_NUMERO,
+      callerId: toNumber,
+      actionUrl: hotePont ? `https://${hotePont}/apres-transfert` : "",
+    });
+    const r = await basculerAppel({ accountSid: canalDV?.accountSid, authToken: canalDV?.authToken, callSid, twiml });
+    if (r.ok) {
+      endReason = `transfert vers ${TRANSFERT_NOM || "l'equipe"}`;
+      dialog.push({ who: "Garde", msg: `appel transféré à ${TRANSFERT_NOM || "l'équipe"} (${pourquoi})${transfert.motif ? ", motif : " + transfert.motif : ""}` });
+      console.log(`[transfert] appel bascule (${pourquoi}) sid=${callSid}`);
+      return;
+    }
+    console.error(`[transfert] echec ${r.erreur} sid=${callSid}`);
+    dialog.push({ who: "Garde", msg: `transfert échoué : ${r.erreur}` });
+    transfert = null;
+    if (grok && grok.readyState === WebSocket.OPEN) {
+      promptGrok("(SYSTÈME : le transfert n'a pas pu se faire. Excuse-toi en une phrase courte, puis propose de transmettre un message pour que l'équipe rappelle le client.)");
+    }
   }
 
   // Gestion du silence : 1) "vous etes toujours la ?" ; 2) si toujours silence, conge poli puis raccroche.
   const inactivityTimer = setInterval(() => {
-    if (finalized || endRequested) return;
+    if (finalized || endRequested || transfert) return; // pendant un transfert, le silence n'est pas celui du client
     if (!(grok && grok.readyState === WebSocket.OPEN && grokReady)) return;
     // Lea parle encore (reponse en cours ou audio encore en file chez Twilio) : ce n'est pas un silence du client.
     if (Date.now() < finLecture || (agentSpeaking && Date.now() - agentSpeakingSince < AGENT_SPEAKING_MAX_MS)) return;
