@@ -84,6 +84,9 @@ const SEUIL_SON_RMS = Number(process.env.SEUIL_SON_RMS || 600); // PCM16 ; le jo
 // 3) un son bref pendant que l'agent parle (« mmm », « oui ») n'est plus un tour : il est efface.
 // TOURS=grok remet l'ancien fonctionnement (detecteur de Grok) sans toucher au code.
 const TOURS_PAR_LE_PONT = (process.env.TOURS || "pont").toLowerCase() !== "grok";
+// Repli seulement : l'attente de fin de phrase reglee dans l'onglet Voix de l'agent (silenceMs) prime. A 600 ms,
+// « Euh des pizzas pour… deux personnes » faisait deux tours (appel de Coq, 16/09 19:17) : l'agent repondait
+// pendant la pause, puis la suite de la phrase le coupait au premier mot.
 const FIN_DE_TOUR_MS = Number(process.env.FIN_DE_TOUR_MS || 600);
 const PREROLL_PAQUETS = 15;   // 300 ms de son envoyes avant le debut detecte d'une prise de parole
 const TOUR_MAX_MS = 20000;    // filet : une ligne trop bruyante ne garde pas le tour ouvert indefiniment
@@ -391,6 +394,8 @@ wss.on("connection", (twilio, requete) => {
   let lastCallerMs = Date.now();
   let pendingCalls = [];   // appels d'outils de la reponse en cours, traites en response.done
   let relancesOutils = 0;  // relances apres outil depuis le dernier tour client
+  let finDeTourMs = FIN_DE_TOUR_MS;                 // remplace par le reglage de l'agent Dale Voz a l'ouverture
+  let relanceOutilDemandee = false, reponseApresOutil = false; // la relance de suite ne vaut qu'apres un outil
   let clotureVerifiee = false; // garde « commande annoncee sans enregistrement » : une seule consigne par appel
   let recapTs = 0, clientApresRecap = false; // garde « pas d'enregistrement sans recapitulatif suivi d'une reponse du client »
   let audioReponseOctets = 0, debutReponseMs = 0; // audio mu-law envoye a Twilio pour la reponse en cours (8000 octets = 1 s)
@@ -612,6 +617,7 @@ wss.on("connection", (twilio, requete) => {
     const modele = sessionDV?.model || GROK_MODEL;
     const vitesse = Number(sessionDV?.speed) || GROK_SPEED;
     const seuilVad = Number(sessionDV?.threshold) || GROK_VAD_THRESHOLD;
+    if (Number(sessionDV?.silenceMs) > 0) finDeTourMs = Math.min(1500, Math.max(500, Number(sessionDV.silenceMs)));
     grok = new WebSocket(`wss://api.x.ai/v1/realtime?model=${modele}`, [`xai-client-secret.${token}`]);
 
     grok.on("open", () => {
@@ -649,7 +655,7 @@ wss.on("connection", (twilio, requete) => {
       // envoyait toujours GROK_REASONING (defaut "high") : un agent regle sur « Rapide » dans l'onglet
       // Voix (Palazzo) reflechissait quand meme avant chaque reponse, d'ou la latence remontee par Jacky.
       const effort = sessionDV?.reasoning === "none" || sessionDV?.reasoning === "high" ? sessionDV.reasoning : GROK_REASONING;
-      console.log(`[session] modele=${modele} reflexion=${effort} tours=${TOURS_PAR_LE_PONT ? "pont" : "grok seuil=" + seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} carte=${carteAjoutee ? "ajoutee" : "non"} ${t()} sid=${callSid}`);
+      console.log(`[session] modele=${modele} reflexion=${effort} tours=${TOURS_PAR_LE_PONT ? "pont fin_de_tour=" + finDeTourMs + "ms" : "grok seuil=" + seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} carte=${carteAjoutee ? "ajoutee" : "non"} ${t()} sid=${callSid}`);
       grok.send(JSON.stringify({
         type: "session.update",
         session: {
@@ -693,6 +699,8 @@ wss.on("connection", (twilio, requete) => {
         case "response.created":
           if (TOURS_PAR_LE_PONT) { marquerGeneration(); reponseActive = true; }
           attenteSuite = null;
+          reponseApresOutil = relanceOutilDemandee;
+          relanceOutilDemandee = false;
           resteAudio = Buffer.alloc(0);
           audioReponseOctets = 0; debutReponseMs = Date.now(); premierSon = false;
           pushUser(); // le tour du client est fini, l'agent repond
@@ -746,7 +754,9 @@ wss.on("connection", (twilio, requete) => {
           if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `agentdone:${respSeq}` } }));
           const calls = pendingCalls.splice(0);
           const phrase = texteReponse.trim();
-          attenteSuite = TOURS_PAR_LE_PONT && respSeq > 1 && !calls.length && phrase && !/\?\s*$/.test(phrase) && !closingSaid && !closeTriggered && !relanceSuiteFaite ? { respSeq } : null;
+          // Seulement une reponse de relance apres outil : la transcription de Grok omet souvent le « ? » final
+          // (« Que désirez-vous commander »), et la relance partait a tort sur une vraie question.
+          attenteSuite = TOURS_PAR_LE_PONT && reponseApresOutil && !calls.length && phrase && !/\?\s*$/.test(phrase) && !closingSaid && !closeTriggered && !relanceSuiteFaite ? { respSeq } : null;
           // La phrase d'annonce du transfert vient d'etre generee : on attend qu'elle soit jouee, puis on bascule.
           if (!calls.length && transfert && transfert.etat === "annonce") preparerTransfert();
           if (calls.length) runTools(calls).catch((err) => console.error("[outil] echec du cycle", err));
@@ -886,7 +896,7 @@ wss.on("connection", (twilio, requete) => {
         if (tour) {
           envoyerAGrok([pcm]);
           verifierCoupure();
-          if (tour && ((!voix && maintenant - tour.derniereVoix >= FIN_DE_TOUR_MS) || maintenant - tour.debut > TOUR_MAX_MS)) finDuTour();
+          if (tour && ((!voix && maintenant - tour.derniereVoix >= finDeTourMs) || maintenant - tour.debut > TOUR_MAX_MS)) finDuTour();
         } else {
           preroll.push(pcm);
           if (preroll.length > PREROLL_PAQUETS) preroll.shift();
@@ -991,6 +1001,7 @@ wss.on("connection", (twilio, requete) => {
     if (tourPendant) validerTour();
     if (relancesOutils < MAX_RELANCES_OUTILS || tourPendant) {
       relancesOutils++;
+      relanceOutilDemandee = true;
       if (TOURS_PAR_LE_PONT) marquerGeneration();
       grok.send(JSON.stringify({ type: "response.create" }));
     } else {
