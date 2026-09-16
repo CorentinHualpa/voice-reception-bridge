@@ -353,6 +353,7 @@ wss.on("connection", (twilio, requete) => {
   let relancesOutils = 0;  // relances apres outil depuis le dernier tour client
   let clotureVerifiee = false; // garde « commande annoncee sans enregistrement » : une seule consigne par appel
   let recapTs = 0, clientApresRecap = false; // garde « pas d'enregistrement sans recapitulatif suivi d'une reponse du client »
+  let audioReponseOctets = 0, debutReponseMs = 0; // audio mu-law envoye a Twilio pour la reponse en cours (8000 octets = 1 s)
   let respSeq = 0;         // numero de la reponse en cours : le mark "agentdone" d'une reponse finie ne doit pas rouvrir l'ecoute pendant la suivante
   // FIN DE LECTURE ESTIMEE (16/09/2026) : chaque octet mu-law envoye a Twilio dure 1/8000 s. Le compte a rebours
   // du silence part de la fin REELLE de ce que Lea dit, pas du dernier mot du client : une reponse de 15 s
@@ -506,6 +507,7 @@ wss.on("connection", (twilio, requete) => {
           break;
         case "response.created":
           resteAudio = Buffer.alloc(0);
+          audioReponseOctets = 0; debutReponseMs = Date.now();
           pushUser(); // le tour du client est fini, l'agent repond
           respSeq++;
           agentSpeaking = true; agentSpeakingSince = Date.now(); // Dany commence a parler -> on coupe l'ecoute (anti-echo)
@@ -525,6 +527,7 @@ wss.on("connection", (twilio, requete) => {
           if (ulaw.length === 0) { mediasVides++; break; }
           twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: ulaw.toString("base64") } }));
           finLecture = Math.max(finLecture, Date.now()) + (ulaw.length / 8000) * 1000;
+          audioReponseOctets += ulaw.length;
           break;
         }
         case "response.output_audio_transcript.delta":
@@ -532,6 +535,12 @@ wss.on("connection", (twilio, requete) => {
           break;
         case "response.done": {
           const texteReponse = agentBuf;
+          // JOURNAL PAR REPONSE (16/09/2026) : une phrase d'accueil de 17 s s'est arretee au milieu chez le client
+          // alors que la transcription etait complete, et rien dans le journal ne permettait de dire si Grok avait
+          // tronque l'audio ou si la ligne l'avait perdu. Le statut de Grok, ses details, les secondes d'audio
+          // reellement envoyees a Twilio et la duree de generation le disent en une ligne.
+          const r = e.response || {};
+          console.log(`[reponse] n°${respSeq} statut=${r.status || "?"}${r.status_details ? " " + JSON.stringify(r.status_details).slice(0, 200) : ""} audio=${(audioReponseOctets / 8000).toFixed(1)}s generee_en=${((Date.now() - debutReponseMs) / 1000).toFixed(1)}s texte=${texteReponse.length}car${r.usage ? " usage=" + JSON.stringify(r.usage).slice(0, 200) : ""} sid=${callSid}`);
           pushAgent();
           if (RECAP_RE.test(texteReponse) || (/euro/i.test(texteReponse) && /\?/.test(texteReponse))) { recapTs = Date.now(); clientApresRecap = false; }
           // Dany a fini de GENERER, mais Twilio joue encore l'audio en file. On rouvre l'ecoute seulement au mark "agentdone"
@@ -579,10 +588,16 @@ wss.on("connection", (twilio, requete) => {
             console.log(`[turn] client coupe l'agent sid=${callSid}`);
           }
           break;
+        case "error":
+          // Ignorees en silence jusqu'au 16/09/2026 : une erreur de Grok ne laissait aucune trace.
+          console.error(`[grok] erreur ${JSON.stringify(e.error || e).slice(0, 300)} sid=${callSid}`);
+          break;
       }
     });
 
-    grok.on("close", () => {});
+    grok.on("close", (code, raison) => {
+      if (!finalized) console.error(`[grok] ws fermee en cours d'appel code=${code} ${String(raison || "").slice(0, 120)} sid=${callSid}`);
+    });
     grok.on("error", (err) => console.error("[grok] ws error", err.message));
   }
 
@@ -617,7 +632,7 @@ wss.on("connection", (twilio, requete) => {
     } else if (m.event === "mark") {
       if (m.mark && m.mark.name === "hangup") { try { twilio.close(); } catch {} }
       else if (m.mark && m.mark.name === "transfert") lancerTransfert("fin de l'annonce");
-      else if (m.mark && /^agentdone(:|$)/.test(m.mark.name) && (m.mark.name === "agentdone" || Number(m.mark.name.split(":")[1]) === respSeq)) { agentSpeaking = false; lastCallerMs = Date.now(); } // Dany a fini de parler (audio joue) : on rouvre l'ecoute + on relance le compte a rebours du silence. Le mark d'une reponse anterieure (outil suivi d'une relance) est ignore.
+      else if (m.mark && /^agentdone(:|$)/.test(m.mark.name) && (m.mark.name === "agentdone" || Number(m.mark.name.split(":")[1]) === respSeq)) { agentSpeaking = false; lastCallerMs = Date.now(); console.log(`[turn] lecture finie ${m.mark.name} sid=${callSid}`); } // Dany a fini de parler (audio joue) : on rouvre l'ecoute + on relance le compte a rebours du silence. Le mark d'une reponse anterieure (outil suivi d'une relance) est ignore.
     } else if (m.event === "stop") {
       finalize();
     }
