@@ -51,6 +51,7 @@ const ADMIN_KEY = process.env.ADMIN_KEY || ""; // protege le tableau de bord /ad
 const CLOSING_RE = new RegExp(process.env.CLOSING_REGEX || "remercie pour votre appel", "i");
 const AGENT_SPEAKING_MAX_MS = Number(process.env.AGENT_SPEAKING_MAX_MS || 12000); // filet anti-surdite si le mark de fin de parole se perd ; un recapitulatif de commande depasse 12 s
 const MAX_RELANCES_OUTILS = 4;
+const BARGE_IN = process.env.BARGE_IN === "1"; // le client peut couper la parole a l'agent (voir le handler media)
 // Phrase de recapitulatif qui appelle un oui du client (sinon : une reponse qui cite des euros et pose une question).
 const RECAP_RE = /c'est bien ça|c'est correct|est-ce (bien )?(correct|ça)|je récapitule|récapitul|ça vous va|is that (right|correct)|does that sound|es correcto|está bien así|è corretto|va bene così/i; // relances apres outil par tour client : au-dela, l'agent s'enchaine tout seul
 
@@ -471,6 +472,15 @@ wss.on("connection", (twilio) => {
           checkedIn = false; // le client reparle : on reinitialise la detection de silence
           console.log("[turn] client");
           if (streamSid) twilio.send(JSON.stringify({ event: "clear", streamSid })); // barge-in : vider la file Twilio
+          if (BARGE_IN && agentSpeaking) {
+            // Couper la reponse en cours cote Grok, pas seulement l'audio deja en file chez
+            // Twilio : sinon il continue de generer et la suite arrive apres la question du
+            // client. « no active response » en retour est benin (la reponse etait finie).
+            try { grok.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+            pushAgent();
+            agentSpeaking = false;
+            console.log(`[turn] client coupe l'agent sid=${callSid}`);
+          }
           break;
       }
     });
@@ -491,7 +501,15 @@ wss.on("connection", (twilio) => {
       openGrok();
     } else if (m.event === "media") {
       if (agentSpeaking && Date.now() - agentSpeakingSince > AGENT_SPEAKING_MAX_MS) { agentSpeaking = false; lastCallerMs = Date.now(); } // filet si le mark "agentdone" se perd
-      if (grok && grok.readyState === WebSocket.OPEN && grokReady && !agentSpeaking) {
+      // BARGE_IN=1 : la voix du client part TOUJOURS a Grok, meme pendant que l'agent parle,
+      // et un debut de parole coupe la reponse en cours. Sans lui (Motralec), le demi-duplex
+      // reste : on n'ecoute pas tant que Twilio n'a pas fini de lire, et le client ne peut
+      // pas interrompre. Constate le 16/09/2026 sur Palazzo : l'agent lit la carte et
+      // relance apres chaque outil, le client reste sourd jusqu'a 25 s et n'arrive pas a
+      // l'arreter. L'echo qui avait motive le demi-duplex venait d'un haut-parleur ; un
+      // combine n'en produit pas, et une fausse coupure coute moins qu'un agent qu'on ne
+      // peut pas faire taire.
+      if (grok && grok.readyState === WebSocket.OPEN && grokReady && (BARGE_IN || !agentSpeaking)) {
         const pcm = ulaw8kToPcm16(Buffer.from(m.media.payload, "base64"), GROK_RATE);
         grok.send(JSON.stringify({ type: "input_audio_buffer.append", audio: pcm.toString("base64") }));
       }
