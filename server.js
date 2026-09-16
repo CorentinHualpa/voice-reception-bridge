@@ -306,6 +306,10 @@ wss.on("connection", (twilio) => {
   let clotureVerifiee = false; // garde « commande annoncee sans enregistrement » : une seule consigne par appel
   let recapTs = 0, clientApresRecap = false; // garde « pas d'enregistrement sans recapitulatif suivi d'une reponse du client »
   let respSeq = 0;         // numero de la reponse en cours : le mark "agentdone" d'une reponse finie ne doit pas rouvrir l'ecoute pendant la suivante
+  // FIN DE LECTURE ESTIMEE (16/09/2026) : chaque octet mu-law envoye a Twilio dure 1/8000 s. Le compte a rebours
+  // du silence part de la fin REELLE de ce que Lea dit, pas du dernier mot du client : une reponse de 15 s
+  // declenchait « Allo, vous etes toujours la ? » juste apres sa derniere phrase.
+  let finLecture = 0;
   let agentSpeaking = false, agentSpeakingSince = 0; // half-duplex anti-echo : tant que Dany parle (jusqu'a la fin de lecture Twilio, signalee par le mark "agentdone"), on ne renvoie PAS l'audio a Grok, sinon son propre echo declenche un faux tour et il enchaine les questions
 
   // Raccroche proprement : on laisse jouer l'audio de cloture deja envoye a Twilio (mark),
@@ -447,6 +451,7 @@ wss.on("connection", (twilio) => {
           const pcm = Buffer.from(e.delta, "base64");
           const ulaw = pcm16ToUlaw8k(pcm, GROK_RATE);
           twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: ulaw.toString("base64") } }));
+          finLecture = Math.max(finLecture, Date.now()) + (ulaw.length / 8000) * 1000;
           break;
         }
         case "response.output_audio_transcript.delta":
@@ -488,6 +493,7 @@ wss.on("connection", (twilio) => {
           checkedIn = false; // le client reparle : on reinitialise la detection de silence
           console.log("[turn] client");
           if (streamSid) twilio.send(JSON.stringify({ event: "clear", streamSid })); // barge-in : vider la file Twilio
+          finLecture = Date.now(); // la file est videe : plus rien ne joue
           if (bargeIn && agentSpeaking) {
             // Couper la reponse en cours cote Grok, pas seulement l'audio deja en file chez
             // Twilio : sinon il continue de generer et la suite arrive apres la question du
@@ -516,7 +522,9 @@ wss.on("connection", (twilio) => {
       console.log(`[call] start sid=${callSid} from=${fromNumber} to=${toNumber}`);
       openGrok();
     } else if (m.event === "media") {
-      if (agentSpeaking && Date.now() - agentSpeakingSince > AGENT_SPEAKING_MAX_MS) { agentSpeaking = false; lastCallerMs = Date.now(); } // filet si le mark "agentdone" se perd
+      // Filet si le mark "agentdone" se perd : jamais tant que l'audio envoye n'a pas fini de jouer (une longue
+      // reponse depasse AGENT_SPEAKING_MAX_MS), et le silence repart de la fin de lecture.
+      if (agentSpeaking && Date.now() - agentSpeakingSince > AGENT_SPEAKING_MAX_MS && Date.now() > finLecture + 2000) { agentSpeaking = false; lastCallerMs = Math.max(Date.now(), finLecture); }
       // BARGE_IN=1 : la voix du client part TOUJOURS a Grok, meme pendant que l'agent parle,
       // et un debut de parole coupe la reponse en cours. Sans lui (Motralec), le demi-duplex
       // reste : on n'ecoute pas tant que Twilio n'a pas fini de lire, et le client ne peut
@@ -595,7 +603,9 @@ wss.on("connection", (twilio) => {
   const inactivityTimer = setInterval(() => {
     if (finalized || endRequested) return;
     if (!(grok && grok.readyState === WebSocket.OPEN && grokReady)) return;
-    const idle = Date.now() - lastCallerMs;
+    // Lea parle encore (reponse en cours ou audio encore en file chez Twilio) : ce n'est pas un silence du client.
+    if (Date.now() < finLecture || (agentSpeaking && Date.now() - agentSpeakingSince < AGENT_SPEAKING_MAX_MS)) return;
+    const idle = Date.now() - Math.max(lastCallerMs, finLecture);
     if (closingSaid && idle > 8000) { requestHangup("cloture+silence"); return; }
     if (closeTriggered) { if (idle > 25000) requestHangup("inactivite"); return; } // conge en cours, backstop
     if (idle > 15000) {
