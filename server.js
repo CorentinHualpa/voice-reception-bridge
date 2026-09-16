@@ -55,7 +55,19 @@ const CLOSING_RE = new RegExp(process.env.CLOSING_REGEX || "remercie pour votre 
 const AGENT_SPEAKING_MAX_MS = Number(process.env.AGENT_SPEAKING_MAX_MS || 12000); // filet anti-surdite si le mark de fin de parole se perd ; un recapitulatif de commande depasse 12 s
 const MAX_RELANCES_OUTILS = 4;
 const BARGE_IN_DEFAUT = process.env.BARGE_IN === "1"; // repli quand l'agent ne vient pas de Dale Voz (voir le handler media)
-const DELAI_COUPURE_MS = Number(process.env.DELAI_COUPURE_MS || 450); // parole du client assez longue pour couper l'agent (un « mmm » ne coupe plus)
+// COUPER L'AGENT SUR UNE VRAIE PRISE DE PAROLE (16/09/2026). Voix du client mesuree par le pont lui-meme,
+// en millisecondes de son au-dessus de SEUIL_SON_RMS depuis que Grok a detecte le debut de parole : un « mmm »
+// ou un « oui » d'acquiescement n'y arrive pas, une phrase si. Voir couperAgent.
+// 700 ms : le « Mmm » de l'appel de test enregistre dure 620 ms de voix, une vraie interruption depasse la seconde.
+const PAROLE_COUPURE_MS = Number(process.env.PAROLE_COUPURE_MS || 700);
+const SEUIL_SON_RMS = Number(process.env.SEUIL_SON_RMS || 600); // PCM16 ; le journal [son] de fin d'appel sert a le regler
+function rmsPcm16(buf) {
+  const n = buf.length >> 1;
+  if (!n) return 0;
+  let s = 0;
+  for (let i = 0; i < n; i++) { const v = buf.readInt16LE(i * 2); s += v * v; }
+  return Math.sqrt(s / n);
+}
 // Phrase de recapitulatif qui appelle un oui du client (sinon : une reponse qui cite des euros et pose une question).
 const RECAP_RE = /c'est bien ça|c'est correct|est-ce (bien )?(correct|ça)|je récapitule|récapitul|ça vous va|is that (right|correct)|does that sound|es correcto|está bien así|è corretto|va bene così/i; // relances apres outil par tour client : au-dela, l'agent s'enchaine tout seul
 
@@ -356,7 +368,8 @@ wss.on("connection", (twilio, requete) => {
   let recapTs = 0, clientApresRecap = false; // garde « pas d'enregistrement sans recapitulatif suivi d'une reponse du client »
   let audioReponseOctets = 0, debutReponseMs = 0; // audio mu-law envoye a Twilio pour la reponse en cours (8000 octets = 1 s)
   let premierSon = false, finParoleClientMs = 0; // mesure de la latence percue par l'appelant
-  let coupureEnAttente = null, reponseCoupee = 0; // coupure differee et reponse dont l'audio restant est jete
+  let ecouteCoupure = null, reponseCoupee = 0; // { sonMs } tant que le client parle pendant l'agent ; reponse dont l'audio restant est jete
+  const sonHisto = [0, 0, 0, 0, 0, 0];         // niveaux de la voix du client par paquet : <150 <300 <600 <1200 <2400 >=2400
   let respSeq = 0;         // numero de la reponse en cours : le mark "agentdone" d'une reponse finie ne doit pas rouvrir l'ecoute pendant la suivante
   // FIN DE LECTURE ESTIMEE (16/09/2026) : chaque octet mu-law envoye a Twilio dure 1/8000 s. Le compte a rebours
   // du silence part de la fin REELLE de ce que Lea dit, pas du dernier mot du client : une reponse de 15 s
@@ -387,14 +400,14 @@ wss.on("connection", (twilio, requete) => {
 
   // Le client parle vraiment par-dessus l'agent : on vide la file Twilio et on jette la suite de la reponse
   // en cours. Plus de response.cancel : la doc xAI le dit non supporte, il ne rendait qu'une erreur.
-  function couperAgent() {
+  function couperAgent(sonMs) {
     if (finalized) return;
     if (streamSid) { try { twilio.send(JSON.stringify({ event: "clear", streamSid })); } catch {} }
     finLecture = Date.now();
     reponseCoupee = respSeq;
     pushAgent();
     agentSpeaking = false;
-    console.log(`[turn] client coupe l'agent (reponse n°${respSeq}) sid=${callSid}`);
+    console.log(`[turn] client coupe l'agent (reponse n°${respSeq}, ${Math.round(sonMs)} ms de voix) sid=${callSid}`);
   }
 
   // Anti-doublons : la transcription Grok est cumulative et peut etre flushee plusieurs fois
@@ -607,22 +620,21 @@ wss.on("connection", (twilio, requete) => {
           checkedIn = false; // le client reparle : on reinitialise la detection de silence
           finParoleClientMs = 0;
           console.log("[turn] client");
-          // COUPURE DIFFEREE (16/09/2026). Jacky : « des fins de phrase coupees ». Chaque debut de parole
-          // detecte videait tout de suite la file Twilio, et un « mmm », un souffle ou un « oui » d'acquiescement
-          // coupait donc la fin de la phrase de l'agent. On attend DELAI_COUPURE_MS : si le client s'est deja tu
-          // (speech_stopped), c'etait un son bref et l'agent finit sa phrase ; sinon on coupe.
-          // Et jamais pendant l'accueil (reponse n°1) : c'est lui qui annonce l'IA, il doit etre entendu en entier.
-          clearTimeout(coupureEnAttente); coupureEnAttente = null;
-          const agentEnLecture = agentSpeaking || Date.now() < finLecture;
-          if (!bargeIn || !agentEnLecture || respSeq <= 1) break;
-          coupureEnAttente = setTimeout(() => { coupureEnAttente = null; couperAgent(); }, DELAI_COUPURE_MS);
+          // COUPURE SUR VRAIE PRISE DE PAROLE (16/09/2026). Jacky : « des fins de phrase coupees ». Chaque debut
+          // de parole detecte videait tout de suite la file Twilio : un « mmm », un souffle ou un « oui »
+          // d'acquiescement coupait la fin de la phrase de l'agent. Attendre speech_stopped ne marche pas : xAI ne
+          // l'envoie qu'apres le delai de silence (600 ms), donc toujours trop tard pour un son bref (essai
+          // enregistre du 16/09). Le pont compte donc lui-meme la voix du client (voir le handler media) et ne
+          // coupe qu'a PAROLE_COUPURE_MS. Jamais pendant l'accueil (reponse n°1) : il annonce l'IA.
+          ecouteCoupure = null;
+          if (bargeIn && (agentSpeaking || Date.now() < finLecture) && respSeq > 1) ecouteCoupure = { sonMs: 0 };
           break;
         }
         case "input_audio_buffer.speech_stopped":
           finParoleClientMs = Date.now();
-          if (coupureEnAttente) {
-            clearTimeout(coupureEnAttente); coupureEnAttente = null;
-            console.log(`[turn] son bref ignore, l'agent finit sa phrase sid=${callSid}`);
+          if (ecouteCoupure) {
+            console.log(`[turn] son bref ignore (${Math.round(ecouteCoupure.sonMs)} ms de voix), l'agent finit sa phrase sid=${callSid}`);
+            ecouteCoupure = null;
           }
           break;
         case "error":
@@ -662,8 +674,17 @@ wss.on("connection", (twilio, requete) => {
       // peut pas faire taire.
       // Une fois l'annonce du transfert partie, plus rien ne va a Grok : le client parle deja a l'humain.
       if (transfert && transfert.etat !== "annonce") return;
+      const pcm = ulaw8kToPcm16(Buffer.from(m.media.payload, "base64"), GROK_RATE);
+      const rms = rmsPcm16(pcm);
+      sonHisto[rms < 150 ? 0 : rms < 300 ? 1 : rms < 600 ? 2 : rms < 1200 ? 3 : rms < 2400 ? 4 : 5]++;
+      if (ecouteCoupure) {
+        if (!(agentSpeaking || Date.now() < finLecture)) ecouteCoupure = null; // l'agent a fini : plus rien a couper
+        else if (rms >= SEUIL_SON_RMS) {
+          ecouteCoupure.sonMs += (pcm.length / 2 / GROK_RATE) * 1000;
+          if (ecouteCoupure.sonMs >= PAROLE_COUPURE_MS) { const s = ecouteCoupure.sonMs; ecouteCoupure = null; couperAgent(s); }
+        }
+      }
       if (grok && grok.readyState === WebSocket.OPEN && grokReady && (bargeIn || !agentSpeaking)) {
-        const pcm = ulaw8kToPcm16(Buffer.from(m.media.payload, "base64"), GROK_RATE);
         grok.send(JSON.stringify({ type: "input_audio_buffer.append", audio: pcm.toString("base64") }));
       }
     } else if (m.event === "mark") {
@@ -814,6 +835,9 @@ wss.on("connection", (twilio, requete) => {
     const lignes = dialog.filter((l) => String(l.msg || "").trim()); // une place reservee a une transcription jamais arrivee reste vide
     const text = lignes.map((l) => `${l.who} : ${l.msg}`).join("\n");
     console.log(`[call] stop sid=${callSid} lignes=${lignes.length}`);
+    // Niveaux de la voix du client sur tout l'appel (paquets de 20 ms) : ce qui sert a regler SEUIL_SON_RMS
+    // d'apres de vraies lignes (bruit de fond d'un portable, d'une rue, d'une cuisine).
+    console.log(`[son] rms <150:${sonHisto[0]} <300:${sonHisto[1]} <600:${sonHisto[2]} <1200:${sonHisto[3]} <2400:${sonHisto[4]} >=2400:${sonHisto[5]} seuil=${SEUIL_SON_RMS} sid=${callSid}`);
     if (lignes.length) pushCall({ ts: new Date().toISOString(), from: fromNumber, sid: callSid, endReason, dialog: text });
     const hasClient = lignes.some((l) => l.who === "Client");
 
