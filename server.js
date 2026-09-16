@@ -64,8 +64,12 @@ const BARGE_IN_DEFAUT = process.env.BARGE_IN === "1"; // repli quand l'agent ne 
 // 400 ms (16/09/2026, appel de Coq) : a 700 ms, calibre sur le « Mmm » de synthese de l'appel de test (620 ms),
 // ses vraies interruptions pendant que l'agent parlait mesuraient 680 et 620 ms de voix, et Chiara ne
 // s'arretait jamais. Une interjection humaine (« attendez », « stop », « non non ») tient en 400 a 700 ms ;
-// un souffle ou un clic reste en dessous. Pendant l'accueil, il faut toujours PAROLE_ACCUEIL_MS pour faire un tour.
+// un souffle ou un clic reste en dessous.
 const PAROLE_COUPURE_MS = Number(process.env.PAROLE_COUPURE_MS || 400);
+// L'ACCUEIL SE COUPE APRES L'ANNONCE DE L'IA (16/09/2026, appel de Coq) : il ne se coupait jamais, et un client
+// qui parlait dessus attendait ses 14 s. Ses ACCUEIL_PROTEGE_MS premieres secondes, celles qui disent que c'est
+// une IA, restent protegees ; pendant ce temps un son doit faire PAROLE_ACCUEIL_MS pour devenir un tour.
+const ACCUEIL_PROTEGE_MS = 5000;
 const PAROLE_ACCUEIL_MS = 700;
 const FENETRE_VOIX_MS = Number(process.env.FENETRE_VOIX_MS || 1500);
 const SEUIL_SON_RMS = Number(process.env.SEUIL_SON_RMS || 600); // PCM16 ; le journal [son] de fin d'appel sert a le regler
@@ -393,7 +397,7 @@ wss.on("connection", (twilio, requete) => {
   let reponseCoupee = 0;                        // reponse dont l'audio restant est jete
   let parleSelonGrok = false;                   // entre speech_started et speech_stopped
   let entenduSurAgent = false, voixMaxTour = 0, coupeCeTour = false; // pour le journal « son bref ignore »
-  let finAccueil = 0;                           // fin de lecture estimee de l'accueil : jamais coupe
+  let accueilProtegeJusqua = Infinity;          // rien ne se coupe avant le premier son, puis l'annonce de l'IA
   const voixFenetre = new Array(Math.max(1, Math.round(FENETRE_VOIX_MS / 20))).fill(0); // ms de voix par paquet de 20 ms
   let voixFenetreIdx = 0, voixRecenteMs = 0;
   const sonHisto = [0, 0, 0, 0, 0, 0];         // niveaux de la voix du client par paquet : <150 <300 <600 <1200 <2400 >=2400
@@ -460,7 +464,7 @@ wss.on("connection", (twilio, requete) => {
   function verifierCoupure() {
     if (!bargeIn || finalized || !(TOURS_PAR_LE_PONT ? tour : parleSelonGrok)) return;
     const maintenant = Date.now();
-    if (maintenant >= finLecture || maintenant < finAccueil || respSeq <= 1) return; // rien d'audible, ou l'accueil
+    if (maintenant >= finLecture || maintenant < accueilProtegeJusqua) return; // rien d'audible, ou l'annonce de l'IA
     entenduSurAgent = true;
     if (voixRecenteMs > voixMaxTour) voixMaxTour = voixRecenteMs;
     if (voixRecenteMs >= PAROLE_COUPURE_MS && reponseCoupee !== respSeq) {
@@ -510,7 +514,7 @@ wss.on("connection", (twilio, requete) => {
     // L'agent parle encore bien apres ce son : « mmm », « oui », un souffle. Sans coupure possible (demi-duplex),
     // tout ce qui est dit par-dessus l'agent est ignore, comme quand l'audio ne partait pas a Grok.
     const agentContinue = !fini.coupe && finLecture > fini.derniereVoix + 500;
-    const pendantAccueil = respSeq <= 1 || fini.derniereVoix < finAccueil; // l'accueil ne se coupe pas
+    const pendantAccueil = fini.derniereVoix < accueilProtegeJusqua; // l'annonce de l'IA ne se coupe pas
     const voixMinimale = pendantAccueil ? PAROLE_ACCUEIL_MS : PAROLE_COUPURE_MS;
     if (fini.voixMs < 150 || (agentContinue && (fini.voixMs < voixMinimale || !bargeIn))) {
       toursIgnores++;
@@ -708,6 +712,7 @@ wss.on("connection", (twilio, requete) => {
           if (!premierSon) {
             // LATENCE MESUREE : ce que l'appelant attend vraiment, depuis la fin de sa phrase.
             premierSon = true;
+            if (accueilProtegeJusqua === Infinity) accueilProtegeJusqua = Date.now() + (respSeq === 1 ? ACCUEIL_PROTEGE_MS : 0);
             console.log(`[latence] n°${respSeq} premier son ${Date.now() - debutReponseMs} ms apres la creation${finParoleClientMs ? `, ${Date.now() - finParoleClientMs} ms apres la fin de parole du client` : ""} ${t()} sid=${callSid}`);
             finParoleClientMs = 0;
           }
@@ -724,7 +729,6 @@ wss.on("connection", (twilio, requete) => {
           // reellement envoyees a Twilio et la duree de generation le disent en une ligne.
           const r = e.response || {};
           console.log(`[reponse] n°${respSeq} statut=${r.status || "?"}${r.status_details ? " " + JSON.stringify(r.status_details).slice(0, 200) : ""} audio=${(audioReponseOctets / 8000).toFixed(1)}s generee_en=${((Date.now() - debutReponseMs) / 1000).toFixed(1)}s texte=${texteReponse.length}car${pendingCalls.length ? " outils=" + pendingCalls.map((c) => c.name).join(",") : ""}${r.usage ? " usage=" + JSON.stringify(r.usage).slice(0, 200) : ""} ${t()} sid=${callSid}`);
-          if (respSeq === 1) finAccueil = finLecture;
           if (TOURS_PAR_LE_PONT) { reponseActive = false; generation = false; lacherRetenue(); } // Grok peut de nouveau entendre le client
           pushAgent();
           if (RECAP_RE.test(texteReponse) || (/euro/i.test(texteReponse) && /\?/.test(texteReponse))) { recapTs = Date.now(); clientApresRecap = false; }
