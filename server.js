@@ -423,7 +423,15 @@ wss.on("connection", (twilio) => {
           grok.send(JSON.stringify({ type: "pong", ...(e.event_id ? { event_id: e.event_id } : {}) }));
           break;
         case "session.updated":
-          if (!grokReady) { grokReady = true; grok.send(JSON.stringify({ type: "response.create" })); } // salut une fois
+          if (!grokReady) {
+            grokReady = true;
+            // L'accueil de la porte Telephone (Format et Accueil de Dale Voz) se dit MOT POUR MOT au premier tour.
+            // Laisse au modele, il perdait contre un prompt qui imposait sa propre premiere phrase.
+            const accueil = typeof sessionDV?.greeting === "string" ? sessionDV.greeting.trim() : "";
+            grok.send(JSON.stringify(accueil
+              ? { type: "response.create", response: { instructions: `Dis exactement cette phrase, mot pour mot, sans rien ajouter avant ni apres, puis ecoute : « ${accueil} »` } }
+              : { type: "response.create" }));
+          } // salut une fois
           break;
         case "response.created":
           pushUser(); // le tour du client est fini, l'agent repond
