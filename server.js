@@ -55,11 +55,15 @@ const CLOSING_RE = new RegExp(process.env.CLOSING_REGEX || "remercie pour votre 
 const AGENT_SPEAKING_MAX_MS = Number(process.env.AGENT_SPEAKING_MAX_MS || 12000); // filet anti-surdite si le mark de fin de parole se perd ; un recapitulatif de commande depasse 12 s
 const MAX_RELANCES_OUTILS = 4;
 const BARGE_IN_DEFAUT = process.env.BARGE_IN === "1"; // repli quand l'agent ne vient pas de Dale Voz (voir le handler media)
-// COUPER L'AGENT SUR UNE VRAIE PRISE DE PAROLE (16/09/2026). Voix du client mesuree par le pont lui-meme,
-// en millisecondes de son au-dessus de SEUIL_SON_RMS depuis que Grok a detecte le debut de parole : un « mmm »
-// ou un « oui » d'acquiescement n'y arrive pas, une phrase si. Voir couperAgent.
+// COUPER L'AGENT SUR UNE VRAIE PRISE DE PAROLE (16/09/2026). Deux signaux doivent s'accorder : Grok dit que
+// le client parle (speech_started), et le pont mesure lui-meme au moins PAROLE_COUPURE_MS de voix au-dessus de
+// SEUIL_SON_RMS sur les FENETRE_VOIX_MS dernieres millisecondes. Un « mmm » ou un « oui » n'y arrive pas, une
+// phrase si. La voix se compte sur une fenetre glissante et non depuis l'evenement de Grok : son speech_started
+// arrive jusqu'a 1,5 s apres le debut reel de la parole (appel de test enregistre), et un client qui parlait
+// deux secondes par-dessus l'agent n'etait credite que de 320 ms, donc jamais entendu. Voir verifierCoupure.
 // 700 ms : le « Mmm » de l'appel de test enregistre dure 620 ms de voix, une vraie interruption depasse la seconde.
 const PAROLE_COUPURE_MS = Number(process.env.PAROLE_COUPURE_MS || 700);
+const FENETRE_VOIX_MS = Number(process.env.FENETRE_VOIX_MS || 1500);
 const SEUIL_SON_RMS = Number(process.env.SEUIL_SON_RMS || 600); // PCM16 ; le journal [son] de fin d'appel sert a le regler
 function rmsPcm16(buf) {
   const n = buf.length >> 1;
@@ -368,8 +372,19 @@ wss.on("connection", (twilio, requete) => {
   let recapTs = 0, clientApresRecap = false; // garde « pas d'enregistrement sans recapitulatif suivi d'une reponse du client »
   let audioReponseOctets = 0, debutReponseMs = 0; // audio mu-law envoye a Twilio pour la reponse en cours (8000 octets = 1 s)
   let premierSon = false, finParoleClientMs = 0; // mesure de la latence percue par l'appelant
-  let ecouteCoupure = null, reponseCoupee = 0; // { sonMs } tant que le client parle pendant l'agent ; reponse dont l'audio restant est jete
+  let reponseCoupee = 0;                        // reponse dont l'audio restant est jete
+  let parleSelonGrok = false;                   // entre speech_started et speech_stopped
+  let entenduSurAgent = false, voixMaxTour = 0, coupeCeTour = false; // pour le journal « son bref ignore »
+  let finAccueil = 0;                           // fin de lecture estimee de l'accueil : jamais coupe
+  const voixFenetre = new Array(Math.max(1, Math.round(FENETRE_VOIX_MS / 20))).fill(0); // ms de voix par paquet de 20 ms
+  let voixFenetreIdx = 0, voixRecenteMs = 0;
   const sonHisto = [0, 0, 0, 0, 0, 0];         // niveaux de la voix du client par paquet : <150 <300 <600 <1200 <2400 >=2400
+  const sonHistoAgent = [0, 0, 0, 0, 0, 0];    // les memes, seulement pendant que l'agent est audible : l'echo d'une ligne se voit ici
+  // HORODATAGE RELATIF (16/09/2026) : Railway regroupe les lignes de journal et leur donne parfois la meme
+  // heure a plusieurs secondes d'ecart, ce qui rendait illisible l'ordre reel des evenements d'un tour.
+  const t = () => `t+${((Date.now() - debutAppelMs) / 1000).toFixed(2)}`;
+  let audioEnvoyeMs = 0;                        // audio du client envoye a Grok : a comparer au audio_start_ms de ses evenements
+  const typesVus = new Set();
   let respSeq = 0;         // numero de la reponse en cours : le mark "agentdone" d'une reponse finie ne doit pas rouvrir l'ecoute pendant la suivante
   // FIN DE LECTURE ESTIMEE (16/09/2026) : chaque octet mu-law envoye a Twilio dure 1/8000 s. Le compte a rebours
   // du silence part de la fin REELLE de ce que Lea dit, pas du dernier mot du client : une reponse de 15 s
@@ -407,7 +422,17 @@ wss.on("connection", (twilio, requete) => {
     reponseCoupee = respSeq;
     pushAgent();
     agentSpeaking = false;
-    console.log(`[turn] client coupe l'agent (reponse n°${respSeq}, ${Math.round(sonMs)} ms de voix) sid=${callSid}`);
+    console.log(`[turn] client coupe l'agent (reponse n°${respSeq}, ${Math.round(sonMs)} ms de voix) ${t()} sid=${callSid}`);
+  }
+
+  // Appele a chaque paquet du client et au debut de parole signale par Grok.
+  function verifierCoupure() {
+    if (!bargeIn || !parleSelonGrok || finalized) return;
+    const maintenant = Date.now();
+    if (maintenant >= finLecture || maintenant < finAccueil || respSeq <= 1) return; // rien d'audible, ou l'accueil
+    entenduSurAgent = true;
+    if (voixRecenteMs > voixMaxTour) voixMaxTour = voixRecenteMs;
+    if (voixRecenteMs >= PAROLE_COUPURE_MS && reponseCoupee !== respSeq) { coupeCeTour = true; couperAgent(voixRecenteMs); }
   }
 
   // Anti-doublons : la transcription Grok est cumulative et peut etre flushee plusieurs fois
@@ -482,11 +507,21 @@ wss.on("connection", (twilio, requete) => {
     grok.on("open", () => {
       const callerFr = frPhone(fromNumber);
       const callerSpoken = callerFr ? frPhoneSpoken(callerFr) : "";
+      const instructionsBase = sessionDV?.instructions || RECEPTION_PROMPT;
+      // LA CARTE DANS LA SESSION (16/09/2026). Branche sur Dale Voz, l'agent cherchait chaque question sur les
+      // pizzas dans la base de connaissance : « Je vais vérifier ça pour vous », un outil, puis une seconde
+      // reponse, soit deux a trois secondes de plus au telephone (et une fois 11 s de silence). La carte qui
+      // chiffre les commandes est deja dans le pont : on la donne, sauf si le prompt la contient deja.
+      const carte = pizzeria ? pizzeria.carteTexte() : "";
+      const premiereLigneCarte = carte.split("\n").find((l) => l.startsWith("- ")) || "";
+      const carteAjoutee = carte && !(premiereLigneCarte && instructionsBase.includes(premiereLigneCarte))
+        ? `La carte complète et à jour, avec les prix, est ci-dessous. Pour une question sur les pizzas, les formules, les desserts, les boissons, leurs ingrédients ou leurs prix, réponds directement à partir d'elle, sans outil de recherche et sans annoncer que tu vérifies.\n\n${carte}`
+        : "";
       const contexte = [
         pizzeria ? pizzeria.contexteAppel() : "",
         callerFr ? `Le client appelle depuis le numéro ${callerFr}. Quand tu lui relis ce numéro à voix, tu prononces EXACTEMENT ceci, mot pour mot, sans le recalculer ni changer un seul groupe : « ${callerSpoken} ». C'est son numéro de rappel par défaut, tu le connais déjà.` : "",
+        carteAjoutee,
       ].filter(Boolean).join("\n");
-      const instructionsBase = sessionDV?.instructions || RECEPTION_PROMPT;
       const sessionInstructions = contexte ? `${instructionsBase}\n\n# Contexte de cet appel\n${contexte}` : instructionsBase;
       // Le transfert n'est offert que si l'appel peut vraiment basculer : un numero lisible et les
       // identifiants Twilio du numero appele. Il remplace alors request_handoff de Dale Voz, qui ne
@@ -503,7 +538,7 @@ wss.on("connection", (twilio, requete) => {
       // envoyait toujours GROK_REASONING (defaut "high") : un agent regle sur « Rapide » dans l'onglet
       // Voix (Palazzo) reflechissait quand meme avant chaque reponse, d'ou la latence remontee par Jacky.
       const effort = sessionDV?.reasoning === "none" || sessionDV?.reasoning === "high" ? sessionDV.reasoning : GROK_REASONING;
-      console.log(`[session] modele=${modele} reflexion=${effort} seuil=${seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} sid=${callSid}`);
+      console.log(`[session] modele=${modele} reflexion=${effort} seuil=${seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} carte=${carteAjoutee ? "ajoutee" : "non"} ${t()} sid=${callSid}`);
       grok.send(JSON.stringify({
         type: "session.update",
         session: {
@@ -545,7 +580,7 @@ wss.on("connection", (twilio, requete) => {
           pushUser(); // le tour du client est fini, l'agent repond
           respSeq++;
           agentSpeaking = true; agentSpeakingSince = Date.now(); // Dany commence a parler -> on coupe l'ecoute (anti-echo)
-          console.log("[turn] Dany");
+          console.log(`[turn] Dany n°${respSeq} ${t()}`);
           break;
         case "response.function_call_arguments.done":
           pendingCalls.push({ name: e.name, callId: e.call_id, args: e.arguments });
@@ -568,7 +603,7 @@ wss.on("connection", (twilio, requete) => {
           if (!premierSon) {
             // LATENCE MESUREE : ce que l'appelant attend vraiment, depuis la fin de sa phrase.
             premierSon = true;
-            console.log(`[latence] n°${respSeq} premier son ${Date.now() - debutReponseMs} ms apres la creation${finParoleClientMs ? `, ${Date.now() - finParoleClientMs} ms apres la fin de parole du client` : ""} sid=${callSid}`);
+            console.log(`[latence] n°${respSeq} premier son ${Date.now() - debutReponseMs} ms apres la creation${finParoleClientMs ? `, ${Date.now() - finParoleClientMs} ms apres la fin de parole du client` : ""} ${t()} sid=${callSid}`);
             finParoleClientMs = 0;
           }
           break;
@@ -583,7 +618,8 @@ wss.on("connection", (twilio, requete) => {
           // tronque l'audio ou si la ligne l'avait perdu. Le statut de Grok, ses details, les secondes d'audio
           // reellement envoyees a Twilio et la duree de generation le disent en une ligne.
           const r = e.response || {};
-          console.log(`[reponse] n°${respSeq} statut=${r.status || "?"}${r.status_details ? " " + JSON.stringify(r.status_details).slice(0, 200) : ""} audio=${(audioReponseOctets / 8000).toFixed(1)}s generee_en=${((Date.now() - debutReponseMs) / 1000).toFixed(1)}s texte=${texteReponse.length}car${r.usage ? " usage=" + JSON.stringify(r.usage).slice(0, 200) : ""} sid=${callSid}`);
+          console.log(`[reponse] n°${respSeq} statut=${r.status || "?"}${r.status_details ? " " + JSON.stringify(r.status_details).slice(0, 200) : ""} audio=${(audioReponseOctets / 8000).toFixed(1)}s generee_en=${((Date.now() - debutReponseMs) / 1000).toFixed(1)}s texte=${texteReponse.length}car${pendingCalls.length ? " outils=" + pendingCalls.map((c) => c.name).join(",") : ""}${r.usage ? " usage=" + JSON.stringify(r.usage).slice(0, 200) : ""} ${t()} sid=${callSid}`);
+          if (respSeq === 1) finAccueil = finLecture;
           pushAgent();
           if (RECAP_RE.test(texteReponse) || (/euro/i.test(texteReponse) && /\?/.test(texteReponse))) { recapTs = Date.now(); clientApresRecap = false; }
           // Dany a fini de GENERER, mais Twilio joue encore l'audio en file. On rouvre l'ecoute seulement au mark "agentdone"
@@ -619,27 +655,34 @@ wss.on("connection", (twilio, requete) => {
           relancesOutils = 0;
           checkedIn = false; // le client reparle : on reinitialise la detection de silence
           finParoleClientMs = 0;
-          console.log("[turn] client");
           // COUPURE SUR VRAIE PRISE DE PAROLE (16/09/2026). Jacky : « des fins de phrase coupees ». Chaque debut
           // de parole detecte videait tout de suite la file Twilio : un « mmm », un souffle ou un « oui »
-          // d'acquiescement coupait la fin de la phrase de l'agent. Attendre speech_stopped ne marche pas : xAI ne
-          // l'envoie qu'apres le delai de silence (600 ms), donc toujours trop tard pour un son bref (essai
-          // enregistre du 16/09). Le pont compte donc lui-meme la voix du client (voir le handler media) et ne
-          // coupe qu'a PAROLE_COUPURE_MS. Jamais pendant l'accueil (reponse n°1) : il annonce l'IA.
-          ecouteCoupure = null;
-          if (bargeIn && (agentSpeaking || Date.now() < finLecture) && respSeq > 1) ecouteCoupure = { sonMs: 0 };
+          // d'acquiescement coupait la fin de la phrase de l'agent. La decision se prend dans verifierCoupure,
+          // sur la voix mesuree par le pont. Jamais pendant l'accueil : il annonce l'IA.
+          parleSelonGrok = true;
+          entenduSurAgent = false; coupeCeTour = false; voixMaxTour = 0;
+          console.log(`[turn] client ${t()} voix_pont=${Math.round(voixRecenteMs)}ms${e.audio_start_ms != null ? ` debut_audio=${e.audio_start_ms} pos=${Math.round(audioEnvoyeMs)}` : ""}`);
+          verifierCoupure();
           break;
         }
         case "input_audio_buffer.speech_stopped":
           finParoleClientMs = Date.now();
-          if (ecouteCoupure) {
-            console.log(`[turn] son bref ignore (${Math.round(ecouteCoupure.sonMs)} ms de voix), l'agent finit sa phrase sid=${callSid}`);
-            ecouteCoupure = null;
-          }
+          parleSelonGrok = false;
+          console.log(`[turn] client se tait ${t()}${e.audio_end_ms != null ? ` fin_audio=${e.audio_end_ms} pos=${Math.round(audioEnvoyeMs)}` : ""}`);
+          if (entenduSurAgent && !coupeCeTour) console.log(`[turn] son bref ignore (${Math.round(voixMaxTour)} ms de voix), l'agent finit sa phrase sid=${callSid}`);
           break;
         case "error":
           // Ignorees en silence jusqu'au 16/09/2026 : une erreur de Grok ne laissait aucune trace.
-          console.error(`[grok] erreur ${JSON.stringify(e.error || e).slice(0, 300)} sid=${callSid}`);
+          console.error(`[grok] erreur ${JSON.stringify(e.error || e).slice(0, 300)} ${t()} sid=${callSid}`);
+          break;
+        default:
+          // Tout le reste une fois par appel, sauf ce qui peut expliquer une reponse perdue (annulation,
+          // remplacement, tampon valide), journalise a chaque fois : l'essai du 16/09 a vu une reponse creee
+          // disparaitre sans response.done, et rien ne disait pourquoi.
+          if (/cancel|truncat|interrupt|commit|clear|fail|incomplete|delete/i.test(e.type) || !typesVus.has(e.type)) {
+            typesVus.add(e.type);
+            console.log(`[grok] ${e.type}${e.response?.id ? " " + e.response.id : ""}${e.item?.type ? " " + e.item.type : ""} ${t()}`);
+          }
           break;
       }
     });
@@ -676,21 +719,23 @@ wss.on("connection", (twilio, requete) => {
       if (transfert && transfert.etat !== "annonce") return;
       const pcm = ulaw8kToPcm16(Buffer.from(m.media.payload, "base64"), GROK_RATE);
       const rms = rmsPcm16(pcm);
-      sonHisto[rms < 150 ? 0 : rms < 300 ? 1 : rms < 600 ? 2 : rms < 1200 ? 3 : rms < 2400 ? 4 : 5]++;
-      if (ecouteCoupure) {
-        if (!(agentSpeaking || Date.now() < finLecture)) ecouteCoupure = null; // l'agent a fini : plus rien a couper
-        else if (rms >= SEUIL_SON_RMS) {
-          ecouteCoupure.sonMs += (pcm.length / 2 / GROK_RATE) * 1000;
-          if (ecouteCoupure.sonMs >= PAROLE_COUPURE_MS) { const s = ecouteCoupure.sonMs; ecouteCoupure = null; couperAgent(s); }
-        }
-      }
+      const niveau = rms < 150 ? 0 : rms < 300 ? 1 : rms < 600 ? 2 : rms < 1200 ? 3 : rms < 2400 ? 4 : 5;
+      sonHisto[niveau]++;
+      if (Date.now() < finLecture) sonHistoAgent[niveau]++;
+      const paquetMs = (pcm.length / 2 / GROK_RATE) * 1000;
+      const voixMs = rms >= SEUIL_SON_RMS ? paquetMs : 0;
+      voixRecenteMs += voixMs - voixFenetre[voixFenetreIdx];
+      voixFenetre[voixFenetreIdx] = voixMs;
+      voixFenetreIdx = (voixFenetreIdx + 1) % voixFenetre.length;
+      verifierCoupure();
       if (grok && grok.readyState === WebSocket.OPEN && grokReady && (bargeIn || !agentSpeaking)) {
         grok.send(JSON.stringify({ type: "input_audio_buffer.append", audio: pcm.toString("base64") }));
+        audioEnvoyeMs += paquetMs;
       }
     } else if (m.event === "mark") {
       if (m.mark && m.mark.name === "hangup") { try { twilio.close(); } catch {} }
       else if (m.mark && m.mark.name === "transfert") lancerTransfert("fin de l'annonce");
-      else if (m.mark && /^agentdone(:|$)/.test(m.mark.name) && (m.mark.name === "agentdone" || Number(m.mark.name.split(":")[1]) === respSeq)) { agentSpeaking = false; lastCallerMs = Date.now(); console.log(`[turn] lecture finie ${m.mark.name} sid=${callSid}`); } // Dany a fini de parler (audio joue) : on rouvre l'ecoute + on relance le compte a rebours du silence. Le mark d'une reponse anterieure (outil suivi d'une relance) est ignore.
+      else if (m.mark && /^agentdone(:|$)/.test(m.mark.name) && (m.mark.name === "agentdone" || Number(m.mark.name.split(":")[1]) === respSeq)) { agentSpeaking = false; lastCallerMs = Date.now(); console.log(`[turn] lecture finie ${m.mark.name} ${t()} sid=${callSid}`); } // Dany a fini de parler (audio joue) : on rouvre l'ecoute + on relance le compte a rebours du silence. Le mark d'une reponse anterieure (outil suivi d'une relance) est ignore.
     } else if (m.event === "stop") {
       finalize();
     }
@@ -756,7 +801,7 @@ wss.on("connection", (twilio, requete) => {
         out = { ok: false, erreur: `outil inconnu ${c.name}` };
       }
       const sortie = typeof out === "string" ? out : JSON.stringify(out);
-      console.log(`[outil] ${c.name} ${JSON.stringify(args)} -> ${sortie.slice(0, 300)}`);
+      console.log(`[outil] ${c.name} ${JSON.stringify(args)} -> ${sortie.slice(0, 300)} ${t()}`);
       dialog.push({ who: "Outil", msg: `${c.name} ${JSON.stringify(args)} -> ${sortie}` });
       if (!(grok && grok.readyState === WebSocket.OPEN)) return;
       grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: c.callId, output: sortie } }));
@@ -837,7 +882,7 @@ wss.on("connection", (twilio, requete) => {
     console.log(`[call] stop sid=${callSid} lignes=${lignes.length}`);
     // Niveaux de la voix du client sur tout l'appel (paquets de 20 ms) : ce qui sert a regler SEUIL_SON_RMS
     // d'apres de vraies lignes (bruit de fond d'un portable, d'une rue, d'une cuisine).
-    console.log(`[son] rms <150:${sonHisto[0]} <300:${sonHisto[1]} <600:${sonHisto[2]} <1200:${sonHisto[3]} <2400:${sonHisto[4]} >=2400:${sonHisto[5]} seuil=${SEUIL_SON_RMS} sid=${callSid}`);
+    console.log(`[son] rms <150:${sonHisto[0]} <300:${sonHisto[1]} <600:${sonHisto[2]} <1200:${sonHisto[3]} <2400:${sonHisto[4]} >=2400:${sonHisto[5]} pendant_agent=${sonHistoAgent.join("/")} seuil=${SEUIL_SON_RMS} sid=${callSid}`);
     if (lignes.length) pushCall({ ts: new Date().toISOString(), from: fromNumber, sid: callSid, endReason, dialog: text });
     const hasClient = lignes.some((l) => l.who === "Client");
 
