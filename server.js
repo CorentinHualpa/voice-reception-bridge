@@ -51,7 +51,7 @@ const ADMIN_KEY = process.env.ADMIN_KEY || ""; // protege le tableau de bord /ad
 const CLOSING_RE = new RegExp(process.env.CLOSING_REGEX || "remercie pour votre appel", "i");
 const AGENT_SPEAKING_MAX_MS = Number(process.env.AGENT_SPEAKING_MAX_MS || 12000); // filet anti-surdite si le mark de fin de parole se perd ; un recapitulatif de commande depasse 12 s
 const MAX_RELANCES_OUTILS = 4;
-const BARGE_IN = process.env.BARGE_IN === "1"; // le client peut couper la parole a l'agent (voir le handler media)
+const BARGE_IN_DEFAUT = process.env.BARGE_IN === "1"; // repli quand l'agent ne vient pas de Dale Voz (voir le handler media)
 // Phrase de recapitulatif qui appelle un oui du client (sinon : une reponse qui cite des euros et pose une question).
 const RECAP_RE = /c'est bien ça|c'est correct|est-ce (bien )?(correct|ça)|je récapitule|récapitul|ça vous va|is that (right|correct)|does that sound|es correcto|está bien así|è corretto|va bene così/i; // relances apres outil par tour client : au-dela, l'agent s'enchaine tout seul
 
@@ -286,6 +286,7 @@ wss.on("connection", (twilio) => {
   let canalDV = null;     // { tenantId, agentSlug, locale... } quand le numero est rattache
   let sessionDV = null;   // instructions, voix et outils de la version publiee de l'agent
   let sessionIdDV = null; // fil Dale Voz, cree a l'ecriture de l'appel
+  let bargeIn = BARGE_IN_DEFAUT; // regle par l'agent Dale Voz (settings.telephone.couperLaParole) des que la session est chargee
   const debutAppelMs = Date.now();
   let grok = null;
   let grokReady = false;
@@ -361,7 +362,10 @@ wss.on("connection", (twilio) => {
           locale: canalDV.locale,
         });
         if (!sessionDV) console.error(`[dalevoz] config introuvable pour ${canalDV.agentSlug}, repli sur la config locale`);
-        else console.log(`[dalevoz] agent ${canalDV.agentSlug} (${sessionDV.tools?.length ?? 0} outils) pour ${toNumber}`);
+        else {
+          if (typeof sessionDV.telephone?.couperLaParole === "boolean") bargeIn = sessionDV.telephone.couperLaParole;
+          console.log(`[dalevoz] agent ${canalDV.agentSlug} (${sessionDV.tools?.length ?? 0} outils, coupure ${bargeIn ? "oui" : "non"}) pour ${toNumber}`);
+        }
       }
     }
     let token;
@@ -378,7 +382,11 @@ wss.on("connection", (twilio) => {
     }
     if (!token) { console.error("[grok] pas de token"); return; }
 
-    grok = new WebSocket(`wss://api.x.ai/v1/realtime?model=${GROK_MODEL}`, [`xai-client-secret.${token}`]);
+    // Le modele, la vitesse et le seuil VAD viennent de l'onglet Voix de l'agent Dale Voz quand il y en a un.
+    const modele = sessionDV?.model || GROK_MODEL;
+    const vitesse = Number(sessionDV?.speed) || GROK_SPEED;
+    const seuilVad = Number(sessionDV?.threshold) || GROK_VAD_THRESHOLD;
+    grok = new WebSocket(`wss://api.x.ai/v1/realtime?model=${modele}`, [`xai-client-secret.${token}`]);
 
     grok.on("open", () => {
       const callerFr = frPhone(fromNumber);
@@ -397,11 +405,11 @@ wss.on("connection", (twilio) => {
           ...(outils.length ? { tools: outils, tool_choice: "auto" } : {}),
           voice: sessionDV?.voice || GROK_VOICE,
           reasoning: { effort: GROK_REASONING },
-          turn_detection: { type: "server_vad", threshold: GROK_VAD_THRESHOLD, prefix_padding_ms: 300, silence_duration_ms: 600 },
+          turn_detection: { type: "server_vad", threshold: seuilVad, prefix_padding_ms: 300, silence_duration_ms: 600 },
           input_audio_transcription: { language: AGENT_LANG }, // ancien schema, ignore en silence par xAI : garde pour compatibilite
           audio: {
             input: { format: { type: "audio/pcm", rate: GROK_RATE }, transcription: { model: "grok-transcribe", language_hint: AGENT_LANG } },
-            output: { format: { type: "audio/pcm", rate: GROK_RATE }, speed: GROK_SPEED },
+            output: { format: { type: "audio/pcm", rate: GROK_RATE }, speed: vitesse },
           },
         },
       }));
@@ -472,7 +480,7 @@ wss.on("connection", (twilio) => {
           checkedIn = false; // le client reparle : on reinitialise la detection de silence
           console.log("[turn] client");
           if (streamSid) twilio.send(JSON.stringify({ event: "clear", streamSid })); // barge-in : vider la file Twilio
-          if (BARGE_IN && agentSpeaking) {
+          if (bargeIn && agentSpeaking) {
             // Couper la reponse en cours cote Grok, pas seulement l'audio deja en file chez
             // Twilio : sinon il continue de generer et la suite arrive apres la question du
             // client. « no active response » en retour est benin (la reponse etait finie).
@@ -509,7 +517,7 @@ wss.on("connection", (twilio) => {
       // l'arreter. L'echo qui avait motive le demi-duplex venait d'un haut-parleur ; un
       // combine n'en produit pas, et une fausse coupure coute moins qu'un agent qu'on ne
       // peut pas faire taire.
-      if (grok && grok.readyState === WebSocket.OPEN && grokReady && (BARGE_IN || !agentSpeaking)) {
+      if (grok && grok.readyState === WebSocket.OPEN && grokReady && (bargeIn || !agentSpeaking)) {
         const pcm = ulaw8kToPcm16(Buffer.from(m.media.payload, "base64"), GROK_RATE);
         grok.send(JSON.stringify({ type: "input_audio_buffer.append", audio: pcm.toString("base64") }));
       }
