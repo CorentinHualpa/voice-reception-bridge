@@ -61,8 +61,12 @@ const BARGE_IN_DEFAUT = process.env.BARGE_IN === "1"; // repli quand l'agent ne 
 // phrase si. La voix se compte sur une fenetre glissante et non depuis l'evenement de Grok : son speech_started
 // arrive jusqu'a 1,5 s apres le debut reel de la parole (appel de test enregistre), et un client qui parlait
 // deux secondes par-dessus l'agent n'etait credite que de 320 ms, donc jamais entendu. Voir verifierCoupure.
-// 700 ms : le « Mmm » de l'appel de test enregistre dure 620 ms de voix, une vraie interruption depasse la seconde.
-const PAROLE_COUPURE_MS = Number(process.env.PAROLE_COUPURE_MS || 700);
+// 400 ms (16/09/2026, appel de Coq) : a 700 ms, calibre sur le « Mmm » de synthese de l'appel de test (620 ms),
+// ses vraies interruptions pendant que l'agent parlait mesuraient 680 et 620 ms de voix, et Chiara ne
+// s'arretait jamais. Une interjection humaine (« attendez », « stop », « non non ») tient en 400 a 700 ms ;
+// un souffle ou un clic reste en dessous. Pendant l'accueil, il faut toujours PAROLE_ACCUEIL_MS pour faire un tour.
+const PAROLE_COUPURE_MS = Number(process.env.PAROLE_COUPURE_MS || 400);
+const PAROLE_ACCUEIL_MS = 700;
 const FENETRE_VOIX_MS = Number(process.env.FENETRE_VOIX_MS || 1500);
 const SEUIL_SON_RMS = Number(process.env.SEUIL_SON_RMS || 600); // PCM16 ; le journal [son] de fin d'appel sert a le regler
 // LE PONT DECIDE DE LA FIN DES TOURS (16/09/2026). Trois faits mesures sur l'API de Grok avant de le brancher :
@@ -506,7 +510,9 @@ wss.on("connection", (twilio, requete) => {
     // L'agent parle encore bien apres ce son : « mmm », « oui », un souffle. Sans coupure possible (demi-duplex),
     // tout ce qui est dit par-dessus l'agent est ignore, comme quand l'audio ne partait pas a Grok.
     const agentContinue = !fini.coupe && finLecture > fini.derniereVoix + 500;
-    if (fini.voixMs < 150 || (agentContinue && (fini.voixMs < PAROLE_COUPURE_MS || !bargeIn))) {
+    const pendantAccueil = respSeq <= 1 || fini.derniereVoix < finAccueil; // l'accueil ne se coupe pas
+    const voixMinimale = pendantAccueil ? PAROLE_ACCUEIL_MS : PAROLE_COUPURE_MS;
+    if (fini.voixMs < 150 || (agentContinue && (fini.voixMs < voixMinimale || !bargeIn))) {
       toursIgnores++;
       console.log(`[tour] son ignore : ${Math.round(fini.voixMs)} ms de voix${agentContinue ? " pendant que l'agent parle" : ""} ${t()}`);
       if (tourEnAttente) {
