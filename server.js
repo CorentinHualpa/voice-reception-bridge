@@ -55,6 +55,7 @@ const CLOSING_RE = new RegExp(process.env.CLOSING_REGEX || "remercie pour votre 
 const AGENT_SPEAKING_MAX_MS = Number(process.env.AGENT_SPEAKING_MAX_MS || 12000); // filet anti-surdite si le mark de fin de parole se perd ; un recapitulatif de commande depasse 12 s
 const MAX_RELANCES_OUTILS = 4;
 const BARGE_IN_DEFAUT = process.env.BARGE_IN === "1"; // repli quand l'agent ne vient pas de Dale Voz (voir le handler media)
+const DELAI_COUPURE_MS = Number(process.env.DELAI_COUPURE_MS || 450); // parole du client assez longue pour couper l'agent (un « mmm » ne coupe plus)
 // Phrase de recapitulatif qui appelle un oui du client (sinon : une reponse qui cite des euros et pose une question).
 const RECAP_RE = /c'est bien ça|c'est correct|est-ce (bien )?(correct|ça)|je récapitule|récapitul|ça vous va|is that (right|correct)|does that sound|es correcto|está bien así|è corretto|va bene così/i; // relances apres outil par tour client : au-dela, l'agent s'enchaine tout seul
 
@@ -354,6 +355,8 @@ wss.on("connection", (twilio, requete) => {
   let clotureVerifiee = false; // garde « commande annoncee sans enregistrement » : une seule consigne par appel
   let recapTs = 0, clientApresRecap = false; // garde « pas d'enregistrement sans recapitulatif suivi d'une reponse du client »
   let audioReponseOctets = 0, debutReponseMs = 0; // audio mu-law envoye a Twilio pour la reponse en cours (8000 octets = 1 s)
+  let premierSon = false, finParoleClientMs = 0; // mesure de la latence percue par l'appelant
+  let coupureEnAttente = null, reponseCoupee = 0; // coupure differee et reponse dont l'audio restant est jete
   let respSeq = 0;         // numero de la reponse en cours : le mark "agentdone" d'une reponse finie ne doit pas rouvrir l'ecoute pendant la suivante
   // FIN DE LECTURE ESTIMEE (16/09/2026) : chaque octet mu-law envoye a Twilio dure 1/8000 s. Le compte a rebours
   // du silence part de la fin REELLE de ce que Lea dit, pas du dernier mot du client : une reponse de 15 s
@@ -380,6 +383,18 @@ wss.on("connection", (twilio, requete) => {
     console.log(`[call] hangup (${reason}) sid=${callSid}`);
     if (streamSid) { try { twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "hangup" } })); } catch {} }
     setTimeout(() => { try { twilio.close(); } catch {} }, 7000); // filet si Twilio ne renvoie pas le mark
+  }
+
+  // Le client parle vraiment par-dessus l'agent : on vide la file Twilio et on jette la suite de la reponse
+  // en cours. Plus de response.cancel : la doc xAI le dit non supporte, il ne rendait qu'une erreur.
+  function couperAgent() {
+    if (finalized) return;
+    if (streamSid) { try { twilio.send(JSON.stringify({ event: "clear", streamSid })); } catch {} }
+    finLecture = Date.now();
+    reponseCoupee = respSeq;
+    pushAgent();
+    agentSpeaking = false;
+    console.log(`[turn] client coupe l'agent (reponse n°${respSeq}) sid=${callSid}`);
   }
 
   // Anti-doublons : la transcription Grok est cumulative et peut etre flushee plusieurs fois
@@ -470,13 +485,19 @@ wss.on("connection", (twilio, requete) => {
         ...(transfertPossible ? [outilTransfert(TRANSFERT_NOM)] : []),
         ...outilsDV,
       ];
+      // LA REFLEXION VIENT DE L'AGENT (16/09/2026). `grok-voice-latest` est un alias de think-fast-2.0,
+      // qui reflechit avant de parler, et la doc xAI met `reasoning.effort` a "high" par defaut. Le pont
+      // envoyait toujours GROK_REASONING (defaut "high") : un agent regle sur « Rapide » dans l'onglet
+      // Voix (Palazzo) reflechissait quand meme avant chaque reponse, d'ou la latence remontee par Jacky.
+      const effort = sessionDV?.reasoning === "none" || sessionDV?.reasoning === "high" ? sessionDV.reasoning : GROK_REASONING;
+      console.log(`[session] modele=${modele} reflexion=${effort} seuil=${seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} sid=${callSid}`);
       grok.send(JSON.stringify({
         type: "session.update",
         session: {
           instructions: sessionInstructions,
           ...(outils.length ? { tools: outils, tool_choice: "auto" } : {}),
           voice: sessionDV?.voice || GROK_VOICE,
-          reasoning: { effort: GROK_REASONING },
+          reasoning: { effort },
           turn_detection: { type: "server_vad", threshold: seuilVad, prefix_padding_ms: 300, silence_duration_ms: 600 },
           input_audio_transcription: { language: AGENT_LANG }, // ancien schema, ignore en silence par xAI : garde pour compatibilite
           audio: {
@@ -507,7 +528,7 @@ wss.on("connection", (twilio, requete) => {
           break;
         case "response.created":
           resteAudio = Buffer.alloc(0);
-          audioReponseOctets = 0; debutReponseMs = Date.now();
+          audioReponseOctets = 0; debutReponseMs = Date.now(); premierSon = false;
           pushUser(); // le tour du client est fini, l'agent repond
           respSeq++;
           agentSpeaking = true; agentSpeakingSince = Date.now(); // Dany commence a parler -> on coupe l'ecoute (anti-echo)
@@ -518,6 +539,9 @@ wss.on("connection", (twilio, requete) => {
           break;
         case "response.output_audio.delta": {
           if (!e.delta || !streamSid || twilio.readyState !== WebSocket.OPEN) break;
+          // Reponse coupee par le client : xAI ne sait pas annuler une reponse (response.cancel est
+          // « Unsupported » dans sa doc), donc la suite qu'il genere encore est jetee ici.
+          if (respSeq === reponseCoupee) break;
           const brut = Buffer.concat([resteAudio, Buffer.from(e.delta, "base64")]);
           const pair = brut.length - (brut.length % 2);
           resteAudio = Buffer.from(brut.subarray(pair)); // 0 ou 1 octet
@@ -528,6 +552,12 @@ wss.on("connection", (twilio, requete) => {
           twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: ulaw.toString("base64") } }));
           finLecture = Math.max(finLecture, Date.now()) + (ulaw.length / 8000) * 1000;
           audioReponseOctets += ulaw.length;
+          if (!premierSon) {
+            // LATENCE MESUREE : ce que l'appelant attend vraiment, depuis la fin de sa phrase.
+            premierSon = true;
+            console.log(`[latence] n°${respSeq} premier son ${Date.now() - debutReponseMs} ms apres la creation${finParoleClientMs ? `, ${Date.now() - finParoleClientMs} ms apres la fin de parole du client` : ""} sid=${callSid}`);
+            finParoleClientMs = 0;
+          }
           break;
         }
         case "response.output_audio_transcript.delta":
@@ -569,23 +599,30 @@ wss.on("connection", (twilio, requete) => {
         case "conversation.item.input_audio_transcription.delta":
           setUser(e.delta, true);
           break;
-        case "input_audio_buffer.speech_started":
+        case "input_audio_buffer.speech_started": {
           tourClient = { idx: null };
           if (recapTs) clientApresRecap = true;
           lastCallerMs = Date.now();
           relancesOutils = 0;
           checkedIn = false; // le client reparle : on reinitialise la detection de silence
+          finParoleClientMs = 0;
           console.log("[turn] client");
-          if (streamSid) twilio.send(JSON.stringify({ event: "clear", streamSid })); // barge-in : vider la file Twilio
-          finLecture = Date.now(); // la file est videe : plus rien ne joue
-          if (bargeIn && agentSpeaking) {
-            // Couper la reponse en cours cote Grok, pas seulement l'audio deja en file chez
-            // Twilio : sinon il continue de generer et la suite arrive apres la question du
-            // client. « no active response » en retour est benin (la reponse etait finie).
-            try { grok.send(JSON.stringify({ type: "response.cancel" })); } catch {}
-            pushAgent();
-            agentSpeaking = false;
-            console.log(`[turn] client coupe l'agent sid=${callSid}`);
+          // COUPURE DIFFEREE (16/09/2026). Jacky : « des fins de phrase coupees ». Chaque debut de parole
+          // detecte videait tout de suite la file Twilio, et un « mmm », un souffle ou un « oui » d'acquiescement
+          // coupait donc la fin de la phrase de l'agent. On attend DELAI_COUPURE_MS : si le client s'est deja tu
+          // (speech_stopped), c'etait un son bref et l'agent finit sa phrase ; sinon on coupe.
+          // Et jamais pendant l'accueil (reponse n°1) : c'est lui qui annonce l'IA, il doit etre entendu en entier.
+          clearTimeout(coupureEnAttente); coupureEnAttente = null;
+          const agentEnLecture = agentSpeaking || Date.now() < finLecture;
+          if (!bargeIn || !agentEnLecture || respSeq <= 1) break;
+          coupureEnAttente = setTimeout(() => { coupureEnAttente = null; couperAgent(); }, DELAI_COUPURE_MS);
+          break;
+        }
+        case "input_audio_buffer.speech_stopped":
+          finParoleClientMs = Date.now();
+          if (coupureEnAttente) {
+            clearTimeout(coupureEnAttente); coupureEnAttente = null;
+            console.log(`[turn] son bref ignore, l'agent finit sa phrase sid=${callSid}`);
           }
           break;
         case "error":
