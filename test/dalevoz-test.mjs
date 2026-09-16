@@ -13,6 +13,12 @@ const serveur = http.createServer((req, res) => {
     recus.push({ url: req.url, methode: req.method, entetes: req.headers, corps: corps ? JSON.parse(corps) : null });
     const chemin = req.url.split("?")[0];
     if (chemin === "/api/voice/telephone") {
+      // Un numéro que la plateforme ne connaît chez personne.
+      if (req.url.includes("%2B33000000000")) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "Numéro non rattaché à un agent" }));
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ tenantId: "t-1", agentSlug: "palazzo", locale: "fr", authToken: "12345" }));
     } else if (chemin === "/api/voice/session-config") {
@@ -44,11 +50,17 @@ await cas("le pont est actif quand l'adresse et le secret sont posés", () => {
 });
 
 await cas("le numéro appelé donne l'espace et l'agent, avec le secret en en-tête", async () => {
-  const canal = await resoudreNumero("+33939205867");
-  assert.equal(canal.agentSlug, "palazzo");
+  const r = await resoudreNumero("+33939205867");
+  assert.equal(r.canal.agentSlug, "palazzo");
   const appel = recus.at(-1);
   assert.match(appel.url, /numero=%2B33939205867/);
   assert.equal(appel.entetes["x-dalevoz-pont"], "secret-de-pont");
+});
+
+await cas("un numéro que la plateforme ne connaît chez personne est déclaré inconnu", async () => {
+  const absent = await resoudreNumero("+33000000000");
+  assert.equal(absent.inconnu, true);
+  assert.equal(absent.canal, undefined);
 });
 
 await cas("la config de session part avec l'espace visé", async () => {
@@ -88,4 +100,11 @@ await cas("signature Twilio : le vecteur de la doc passe, une signature modifié
 });
 
 serveur.close();
+
+await cas("plateforme muette : injoignable, et surtout pas « inconnu » (on ne refuse pas l'appel)", async () => {
+  const r = await resoudreNumero("+33939205867");
+  assert.equal(r.injoignable, true);
+  assert.equal(r.inconnu, undefined);
+});
+
 console.log(`\n${ok} cas passes`);

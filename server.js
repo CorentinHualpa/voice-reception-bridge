@@ -236,22 +236,28 @@ const server = http.createServer((req, res) => {
       // cette verification n'importe qui ferait parler l'agent d'un client.
       let tenantId = "";
       if (dalevozActif && to) {
-        const canal = await resoudreNumero(to);
-        if (!canal) {
+        const r = await resoudreNumero(to);
+        if (r.inconnu) {
           console.error(`[twiml] numero inconnu ${to}`);
           res.writeHead(404, { "Content-Type": "text/xml" });
           res.end(`<?xml version="1.0" encoding="UTF-8"?><Response><Say language="fr-FR">Ce numéro n'est pas configuré.</Say><Hangup/></Response>`);
           return;
         }
-        const urlComplete = `https://${host}${req.url}`;
-        const signature = req.headers["x-twilio-signature"] || "";
-        if (!signatureTwilioValide({ authToken: canal.authToken, url: urlComplete, params: post, signature })) {
-          console.error(`[twiml] signature Twilio refusee sid=${callSid} to=${to}`);
-          res.writeHead(403, { "Content-Type": "text/plain" });
-          res.end("signature invalide");
-          return;
+        // Plateforme injoignable : on decroche quand meme, sur la config locale.
+        // Une panne de la console ne doit pas faire taire les numeros branches.
+        if (r.canal) {
+          const urlComplete = `https://${host}${req.url}`;
+          const signature = req.headers["x-twilio-signature"] || "";
+          if (!signatureTwilioValide({ authToken: r.canal.authToken, url: urlComplete, params: post, signature })) {
+            console.error(`[twiml] signature Twilio refusee sid=${callSid} to=${to}`);
+            res.writeHead(403, { "Content-Type": "text/plain" });
+            res.end("signature invalide");
+            return;
+          }
+          tenantId = r.canal.tenantId;
+        } else {
+          console.error(`[twiml] plateforme injoignable, repli sur la config locale to=${to}`);
         }
-        tenantId = canal.tenantId;
       }
 
       const params = [
@@ -346,7 +352,7 @@ wss.on("connection", (twilio) => {
     // sinon le pont garde sa configuration locale (prompt en fichier), ce qui
     // fait tourner Motralec et Palazzo tant que leur numéro n'est pas branché.
     if (dalevozActif && toNumber) {
-      canalDV = await resoudreNumero(toNumber);
+      canalDV = (await resoudreNumero(toNumber)).canal ?? null;
       if (canalDV) {
         sessionDV = await chargerSession({
           tenantId: canalDV.tenantId,
