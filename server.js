@@ -87,6 +87,7 @@ const TOURS_PAR_LE_PONT = (process.env.TOURS || "pont").toLowerCase() !== "grok"
 const FIN_DE_TOUR_MS = Number(process.env.FIN_DE_TOUR_MS || 600);
 const PREROLL_PAQUETS = 15;   // 300 ms de son envoyes avant le debut detecte d'une prise de parole
 const TOUR_MAX_MS = 20000;    // filet : une ligne trop bruyante ne garde pas le tour ouvert indefiniment
+const RELANCE_SUITE_MS = Number(process.env.RELANCE_SUITE_MS || 2500); // silence du client apres une reponse sans question
 function rmsPcm16(buf) {
   const n = buf.length >> 1;
   if (!n) return 0;
@@ -418,6 +419,11 @@ wss.on("connection", (twilio, requete) => {
   const niveaux = new Float32Array(250);        // 5 s de niveaux : plancher de bruit de la ligne
   let niveauxIdx = 0, niveauxN = 0, seuilVoix = SEUIL_SON_RMS, seuilCalculeA = 0, seuilMax = SEUIL_SON_RMS;
   let toursValides = 0, toursIgnores = 0;
+  // RELANCE DE SUITE (16/09/2026, appel de Coq) : « Oui, vingt-deux heures est possible. » et plus rien. La reponse
+  // ne posait pas de question, le client attendait l'etape suivante, l'agent attendait le client : 5 s de blanc,
+  // puis 4,4 s de Grok sur « Très bien », et Coq a raccroche. Apres une reponse sans question, si le client se tait
+  // RELANCE_SUITE_MS une fois la lecture finie, l'agent enchaine. Une seule fois par tour du client.
+  let attenteSuite = null, relanceSuiteFaite = false;
   let respSeq = 0;         // numero de la reponse en cours : le mark "agentdone" d'une reponse finie ne doit pas rouvrir l'ecoute pendant la suivante
   // FIN DE LECTURE ESTIMEE (16/09/2026) : chaque octet mu-law envoye a Twilio dure 1/8000 s. Le compte a rebours
   // du silence part de la fin REELLE de ce que Lea dit, pas du dernier mot du client : une reponse de 15 s
@@ -505,6 +511,7 @@ wss.on("connection", (twilio, requete) => {
     tourClient = { idx: null };
     if (recapTs) clientApresRecap = true;
     relancesOutils = 0;
+    relanceSuiteFaite = false;
     checkedIn = false;
     toursValides++;
   }
@@ -624,6 +631,7 @@ wss.on("connection", (twilio, requete) => {
         pizzeria ? pizzeria.contexteAppel() : "",
         callerFr ? `Le client appelle depuis le numéro ${callerFr}. Quand tu lui relis ce numéro à voix, tu prononces EXACTEMENT ceci, mot pour mot, sans le recalculer ni changer un seul groupe : « ${callerSpoken} ». C'est son numéro de rappel par défaut, tu le connais déjà.` : "",
         carteAjoutee,
+        "Au téléphone, un silence de ta part laisse le client dans le vide. Ne termine jamais une réponse sur une simple confirmation (« Oui, vingt-deux heures est possible. ») : enchaîne dans la même réponse sur l'étape suivante, par une question. Seul l'au revoir final ne pose pas de question.",
       ].filter(Boolean).join("\n");
       const sessionInstructions = contexte ? `${instructionsBase}\n\n# Contexte de cet appel\n${contexte}` : instructionsBase;
       // Le transfert n'est offert que si l'appel peut vraiment basculer : un numero lisible et les
@@ -684,6 +692,7 @@ wss.on("connection", (twilio, requete) => {
           break;
         case "response.created":
           if (TOURS_PAR_LE_PONT) { marquerGeneration(); reponseActive = true; }
+          attenteSuite = null;
           resteAudio = Buffer.alloc(0);
           audioReponseOctets = 0; debutReponseMs = Date.now(); premierSon = false;
           pushUser(); // le tour du client est fini, l'agent repond
@@ -736,6 +745,8 @@ wss.on("connection", (twilio, requete) => {
           // (renvoye par Twilio quand la lecture est vraiment finie), pas maintenant, sinon on capte la fin de son propre audio.
           if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `agentdone:${respSeq}` } }));
           const calls = pendingCalls.splice(0);
+          const phrase = texteReponse.trim();
+          attenteSuite = TOURS_PAR_LE_PONT && respSeq > 1 && !calls.length && phrase && !/\?\s*$/.test(phrase) && !closingSaid && !closeTriggered && !relanceSuiteFaite ? { respSeq } : null;
           // La phrase d'annonce du transfert vient d'etre generee : on attend qu'elle soit jouee, puis on bascule.
           if (!calls.length && transfert && transfert.etat === "annonce") preparerTransfert();
           if (calls.length) runTools(calls).catch((err) => console.error("[outil] echec du cycle", err));
@@ -864,6 +875,9 @@ wss.on("connection", (twilio, requete) => {
           if (!tour) {
             tour = { debut: maintenant, voixMs: 0, derniereVoix: maintenant, coupe: false };
             lastCallerMs = maintenant;
+            attenteSuite = null;
+            // Les transcriptions en direct de cette prise de parole ne doivent pas reecrire la ligne du tour precedent.
+            if (tourClient && tourClient.idx != null) tourClient = null;
             envoyerAGrok(preroll.splice(0));
           }
           tour.voixMs += paquetMs;
@@ -876,6 +890,13 @@ wss.on("connection", (twilio, requete) => {
         } else {
           preroll.push(pcm);
           if (preroll.length > PREROLL_PAQUETS) preroll.shift();
+          if (attenteSuite && !generation && !outilsEnCours && !tourEnAttente && !endRequested && !transfert
+            && maintenant > Math.max(finLecture, lastCallerMs) + RELANCE_SUITE_MS) {
+            attenteSuite = null;
+            relanceSuiteFaite = true;
+            console.log(`[tour] le client attend la suite, l'agent enchaine ${t()}`);
+            promptGrok("(SYSTÈME : ta dernière phrase ne posait pas de question et le client attend. Enchaîne tout de suite sur l'étape suivante, en une phrase courte qui se termine par une question.)");
+          }
         }
       } else {
         verifierCoupure();
