@@ -310,6 +310,12 @@ wss.on("connection", (twilio) => {
   // du silence part de la fin REELLE de ce que Lea dit, pas du dernier mot du client : une reponse de 15 s
   // declenchait « Allo, vous etes toujours la ? » juste apres sa derniere phrase.
   let finLecture = 0;
+  // ERREUR TWILIO 31924 (16/09/2026) : trois appels de Jacky coupes net pendant que Lea parlait, « Stream -
+  // Websocket - Protocol Error ». Un delta audio de Grok peut arriver avec un nombre IMPAIR d'octets : le
+  // dernier octet etait perdu (echantillons decales ensuite) et un delta d'un octet donnait un media VIDE.
+  // On garde l'octet orphelin pour le delta suivant et on n'envoie jamais de charge vide.
+  let resteAudio = Buffer.alloc(0);
+  let mediasVides = 0;
   let agentSpeaking = false, agentSpeakingSince = 0; // half-duplex anti-echo : tant que Dany parle (jusqu'a la fin de lecture Twilio, signalee par le mark "agentdone"), on ne renvoie PAS l'audio a Grok, sinon son propre echo declenche un faux tour et il enchaine les questions
 
   // Raccroche proprement : on laisse jouer l'audio de cloture deja envoye a Twilio (mark),
@@ -438,6 +444,7 @@ wss.on("connection", (twilio) => {
           } // salut une fois
           break;
         case "response.created":
+          resteAudio = Buffer.alloc(0);
           pushUser(); // le tour du client est fini, l'agent repond
           respSeq++;
           agentSpeaking = true; agentSpeakingSince = Date.now(); // Dany commence a parler -> on coupe l'ecoute (anti-echo)
@@ -447,9 +454,14 @@ wss.on("connection", (twilio) => {
           pendingCalls.push({ name: e.name, callId: e.call_id, args: e.arguments });
           break;
         case "response.output_audio.delta": {
-          if (!e.delta || !streamSid) break;
-          const pcm = Buffer.from(e.delta, "base64");
+          if (!e.delta || !streamSid || twilio.readyState !== WebSocket.OPEN) break;
+          const brut = Buffer.concat([resteAudio, Buffer.from(e.delta, "base64")]);
+          const pair = brut.length - (brut.length % 2);
+          resteAudio = Buffer.from(brut.subarray(pair)); // 0 ou 1 octet
+          if (pair === 0) break;
+          const pcm = Buffer.from(brut.subarray(0, pair)); // copie : offset pair, sinon Int16Array leve
           const ulaw = pcm16ToUlaw8k(pcm, GROK_RATE);
+          if (ulaw.length === 0) { mediasVides++; break; }
           twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: ulaw.toString("base64") } }));
           finLecture = Math.max(finLecture, Date.now()) + (ulaw.length / 8000) * 1000;
           break;
@@ -544,7 +556,10 @@ wss.on("connection", (twilio) => {
       finalize();
     }
   });
-  twilio.on("close", finalize);
+  twilio.on("close", (code, raison) => {
+    console.log(`[twilio] flux ferme code=${code} ${String(raison || "").slice(0, 120)} medias_vides_evites=${mediasVides} sid=${callSid}`);
+    finalize();
+  });
   twilio.on("error", (err) => { console.error("[twilio] ws error", err.message); finalize(); });
 
   // Filet anti-credits : si le client se tait apres la cloture (8s) ou reste inactif longtemps (30s),
