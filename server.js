@@ -751,12 +751,27 @@ wss.on("connection", (twilio, requete) => {
           if (RECAP_RE.test(texteReponse) || (/euro/i.test(texteReponse) && /\?/.test(texteReponse))) { recapTs = Date.now(); clientApresRecap = false; }
           // Dany a fini de GENERER, mais Twilio joue encore l'audio en file. On rouvre l'ecoute seulement au mark "agentdone"
           // (renvoye par Twilio quand la lecture est vraiment finie), pas maintenant, sinon on capte la fin de son propre audio.
+          // QUEUE DE SILENCE (17/09/2026, appel de Coq) : « À quelle heure souhaitez-vous la retir… ». Ni coupure du
+          // pont ni parole du client : l'audio de Grok s'arrete sur la derniere syllabe, sans aucun silence apres
+          // (energie encore forte dans ses 150 dernieres ms, banc du 17/09), et la fin se perd sur le trajet
+          // telephonique. 300 ms de silence derriere chaque reponse laissent a la ligne le temps de la jouer.
+          if (streamSid && audioReponseOctets > 0 && respSeq !== reponseCoupee && twilio.readyState === WebSocket.OPEN) {
+            const silence = Buffer.alloc(2400, 0xff); // mu-law 0xFF = zero, 300 ms a 8 kHz
+            twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: silence.toString("base64") } }));
+            finLecture = Math.max(finLecture, Date.now()) + 300;
+          }
           if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `agentdone:${respSeq}` } }));
           const calls = pendingCalls.splice(0);
           const phrase = texteReponse.trim();
           // Seulement une reponse de relance apres outil : la transcription de Grok omet souvent le « ? » final
           // (« Que désirez-vous commander »), et la relance partait a tort sur une vraie question.
-          attenteSuite = TOURS_PAR_LE_PONT && reponseApresOutil && !calls.length && phrase && !/\?\s*$/.test(phrase) && !closingSaid && !closeTriggered && !relanceSuiteFaite ? { respSeq } : null;
+          // Question reconnue meme sans « ? » : « À quelle heure souhaitez-vous la retirer » faisait partir la relance,
+          // et l'agent enchainait sur une autre question (« Quelle pizza désirez-vous ? ») avant la reponse.
+          const derniere = (phrase.split(/(?<=[.!?…])\s+/).pop() || phrase).trim();
+          const estQuestion = /\?\s*$/.test(phrase)
+            || /-(vous|je|tu|il|elle|on|nous|ils|elles)\b/i.test(derniere)
+            || /^(quel|quelle|quels|quelles|combien|comment|où|quand|pourquoi|est-ce|qu'est-ce|à quel|a quel|pour quel|que (désirez|souhaitez|voulez|prenez))/i.test(derniere);
+          attenteSuite = TOURS_PAR_LE_PONT && reponseApresOutil && !calls.length && phrase && !estQuestion && !closingSaid && !closeTriggered && !relanceSuiteFaite ? { respSeq } : null;
           // La phrase d'annonce du transfert vient d'etre generee : on attend qu'elle soit jouee, puis on bascule.
           if (!calls.length && transfert && transfert.etat === "annonce") preparerTransfert();
           if (calls.length) runTools(calls).catch((err) => console.error("[outil] echec du cycle", err));
