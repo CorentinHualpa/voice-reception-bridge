@@ -25,7 +25,7 @@
 import http from "http";
 import fs from "fs";
 import { WebSocketServer, WebSocket } from "ws";
-import { ulaw8kToPcm16, pcm16ToUlaw8k } from "./lib/audio.js";
+import { ulaw8kToPcm16, pcm16ToUlaw8k, ulawDecodeSample, ulawEncodeSample } from "./lib/audio.js";
 import { OUTILS_DE_COMMANDE, consigneClotureCommande, createPizzeria } from "./lib/pizzeria.js";
 import {
   chargerSession,
@@ -113,6 +113,59 @@ const ANNULATION_VOIX_MS = 150; // voix du client apres le lancement qui annule 
 // la vraie question du client restait retenue. En mode manuel, response.created arrive 90 a 180 ms apres le commit
 // (51 tours mesures) : au-dela de REPONSE_IGNOREE_MS, la demande est perdue.
 const REPONSE_IGNOREE_MS = Number(process.env.REPONSE_IGNOREE_MS || 1000);
+// « MMM » D'ATTENTE (17/09/2026, choix de Coq). Une reponse sur cinq, Grok met 2,7 a 3,7 s a parler (cote xAI,
+// hors de portee du pont) : le client entend un blanc. Quand rien n'est encore joue MMM_APRES_MS apres la fin de sa
+// phrase et qu'une reponse est en route, l'agent fait « Mmm… » dans sa propre voix (Grok TTS, rendu en mu-law 8 kHz,
+// produit une fois par voix et garde en memoire). Avec l'anticipation, les reponses rapides partent entre 1,1 et 1,6 s
+// et les lentes apres 2,4 s : le seuil tombe entre les deux. Une fois par tour du client. MMM_APRES_MS=0 le coupe.
+const MMM_APRES_MS = Number(process.env.MMM_APRES_MS ?? 1800);
+const MMM_TEXTE = process.env.MMM_TEXTE || "Mmm…";
+const sonsDAttente = new Map(); // "voix|vitesse|texte" -> Promise<Buffer mu-law | null>
+function sonDAttente(voix, vitesse) {
+  const cle = `${voix}|${vitesse}|${MMM_TEXTE}`;
+  if (!sonsDAttente.has(cle)) {
+    sonsDAttente.set(cle, (async () => {
+      try {
+        const r = await fetch("https://api.x.ai/v1/tts", {
+          method: "POST",
+          headers: { authorization: `Bearer ${XAI_API_KEY}`, "content-type": "application/json" },
+          body: JSON.stringify({ text: MMM_TEXTE, voice_id: voix, language: AGENT_LANG, output_format: { codec: "mulaw", sample_rate: 8000 }, speed: vitesse }),
+        });
+        if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 160)}`);
+        const son = rognerSon(Buffer.from(await r.arrayBuffer()));
+        if (!son.length) throw new Error("son vide");
+        console.log(`[attente] « ${MMM_TEXTE} » pret pour la voix ${voix} (${(son.length / 8000).toFixed(2)} s)`);
+        return son;
+      } catch (err) {
+        console.error(`[attente] « ${MMM_TEXTE} » impossible pour la voix ${voix} : ${err.message}`);
+        sonsDAttente.delete(cle); // l'appel suivant reessaie
+        return null;
+      }
+    })());
+  }
+  return sonsDAttente.get(cle);
+}
+// Le son rendu par la synthese commence et finit par du silence : chaque milliseconde gardee retarde la vraie
+// reponse qui le suit en file. On garde 20 ms avant la voix et 60 ms apres, en fondu pour eviter un clic.
+function rognerSon(ulaw) {
+  const n = Math.floor(ulaw.length / 160);
+  let premier = -1, dernier = -1;
+  for (let k = 0; k < n; k++) {
+    let s = 0;
+    for (let i = 0; i < 160; i++) { const v = ulawDecodeSample(ulaw[k * 160 + i]); s += v * v; }
+    if (Math.sqrt(s / 160) >= SEUIL_SON_RMS) { if (premier < 0) premier = k; dernier = k; }
+  }
+  if (premier < 0) return Buffer.alloc(0);
+  const debut = Math.max(0, premier - 1) * 160, fin = Math.min(n, dernier + 4) * 160;
+  const son = Buffer.from(ulaw.subarray(debut, fin));
+  const fondu = Math.min(320, son.length >> 2);
+  for (let i = 0; i < fondu; i++) {
+    son[i] = ulawEncodeSample(Math.round(ulawDecodeSample(son[i]) * (i / fondu)));
+    const j = son.length - 1 - i;
+    son[j] = ulawEncodeSample(Math.round(ulawDecodeSample(son[j]) * (i / fondu)));
+  }
+  return son;
+}
 function rmsPcm16(buf) {
   const n = buf.length >> 1;
   if (!n) return 0;
@@ -454,6 +507,10 @@ wss.on("connection", (twilio, requete) => {
   let tourEnAttente = false;                    // prise de parole finie pendant une generation ou des outils
   let outilsEnCours = false;
   let attenteCreation = false, creationDemandeeA = 0; // response.create envoye apres un commit, response.created pas encore recu
+  // « Mmm » d'attente (voir MMM_APRES_MS) : fin de parole du client dont la reponse n'a encore rien fait entendre,
+  // fin de lecture du « Mmm » (pas de coupure de parole dessus), son pret pour la voix de cet appel.
+  let attenteDepuis = 0, mmmJusqua = 0, mmmAvantReponse = false;
+  let sonMmm = null;
   // Reponse anticipee (voir ANTICIPATION_MS) : { tour, etat "demandee" | "creee" | "finie", annulee, annuleeA, voixDepuis,
   // audio (mu-law retenu jusqu'a la fin du tour), pretA, fin (response.done differe), items (de la reponse), closingAvant, depuis }
   let anticipation = null;
@@ -514,6 +571,7 @@ wss.on("connection", (twilio, requete) => {
     if (!bargeIn || finalized || !(TOURS_PAR_LE_PONT ? tour : parleSelonGrok)) return;
     const maintenant = Date.now();
     if (maintenant >= finLecture || maintenant < accueilProtegeJusqua) return; // rien d'audible, ou l'annonce de l'IA
+    if (maintenant < mmmJusqua) return; // parler sur le « Mmm » d'attente ne jette pas la reponse qui arrive
     entenduSurAgent = true;
     if (voixRecenteMs > voixMaxTour) voixMaxTour = voixRecenteMs;
     if (voixRecenteMs >= PAROLE_COUPURE_MS && reponseCoupee !== respSeq) {
@@ -551,6 +609,7 @@ wss.on("connection", (twilio, requete) => {
   // Grok a ignore la demande (tour sans mot reconnu) : la voix retenue repart, rien n'attend plus.
   function reponseIgnoree() {
     attenteCreation = false;
+    attenteDepuis = 0; // aucune reponse ne vient : pas de « Mmm »
     if (reponseAnticipee === -1) reponseAnticipee = 0;
     console.log(`[tour] Grok n'a pas cree la reponse en ${Date.now() - creationDemandeeA} ms (aucun mot reconnu ?), la voix du client repart ${t()} sid=${callSid}`);
     if (anticipation) {
@@ -595,6 +654,7 @@ wss.on("connection", (twilio, requete) => {
     console.log(`[tour] client : ${Math.round(fini.voixMs)} ms de voix, dernier son a t+${((fini.derniereVoix - debutAppelMs) / 1000).toFixed(2)}, reponse anticipee ${a.etat === "demandee" ? "pas encore creee" : a.audio.length ? "prete" : "en cours"} ${t()}`);
     reponseAnticipee = a.etat === "demandee" ? -1 : respSeq; // -1 : numerotee a sa creation
     anticipeePreteA = a.pretA;
+    attenteDepuis = fini.derniereVoix;
     for (const u of a.audio) envoyerSonAgent(u);
     if (a.etat === "finie") terminerReponse(a.fin);
   }
@@ -669,6 +729,8 @@ wss.on("connection", (twilio, requete) => {
     attenteSuite = TOURS_PAR_LE_PONT && reponseApresOutil && !calls.length && phrase && !estQuestion && !closingSaid && !closeTriggered && !relanceSuiteFaite ? { respSeq } : null;
     // La phrase d'annonce du transfert vient d'etre generee : on attend qu'elle soit jouee, puis on bascule.
     if (!calls.length && transfert && transfert.etat === "annonce") preparerTransfert();
+    // Plus rien n'arrive pour ce tour (ni outil, ni reponse a un tour en attente) : pas de « Mmm » apres coup.
+    if (!calls.length && !(TOURS_PAR_LE_PONT && tourEnAttente && !tour)) attenteDepuis = 0;
     if (calls.length) runTools(calls).catch((err) => console.error("[outil] echec du cycle", err));
     else if (TOURS_PAR_LE_PONT && tourEnAttente && !tour) { validerTour(); demanderReponse(); } // le client a parle pendant la generation
     else if ((pizzeria || commandesParDaleVoz()) && !clotureVerifiee) {
@@ -684,8 +746,23 @@ wss.on("connection", (twilio, requete) => {
     }
     if (closeTriggered && !endRequested) requestHangup("cloture polie");
   }
+  // Le client attend et rien ne sort encore : « Mmm… » (voir MMM_APRES_MS). Joue une fois par tour du client,
+  // par paquets de 100 ms, et compte comme audible pour la fin de lecture.
+  function jouerMmm(maintenant) {
+    const depuis = maintenant - attenteDepuis;
+    attenteDepuis = 0;
+    if (!sonMmm || !streamSid || twilio.readyState !== WebSocket.OPEN) return;
+    for (let o = 0; o < sonMmm.length; o += 800) {
+      twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: sonMmm.subarray(o, o + 800).toString("base64") } }));
+    }
+    finLecture = Math.max(finLecture, maintenant) + (sonMmm.length / 8000) * 1000;
+    mmmJusqua = finLecture;
+    mmmAvantReponse = true;
+    console.log(`[attente] « ${MMM_TEXTE} » ${depuis} ms apres la fin de parole du client ${t()} sid=${callSid}`);
+  }
   // Son de l'agent vers Twilio, et mesure de la latence au premier son de chaque reponse.
   function envoyerSonAgent(ulaw) {
+    attenteDepuis = 0;
     twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: ulaw.toString("base64") } }));
     finLecture = Math.max(finLecture, Date.now()) + (ulaw.length / 8000) * 1000;
     audioReponseOctets += ulaw.length;
@@ -693,8 +770,9 @@ wss.on("connection", (twilio, requete) => {
       // LATENCE MESUREE : ce que l'appelant attend vraiment, depuis la fin de sa phrase.
       premierSon = true;
       if (accueilProtegeJusqua === Infinity) accueilProtegeJusqua = Date.now() + (respSeq === 1 ? ACCUEIL_PROTEGE_MS : 0);
-      console.log(`[latence] n°${respSeq} premier son ${Date.now() - debutReponseMs} ms apres la creation${finParoleClientMs ? `, ${Date.now() - finParoleClientMs} ms apres la fin de parole du client` : ""}${respSeq === reponseAnticipee ? ` (anticipee${anticipeePreteA ? `, prete ${anticipeePreteA - debutReponseMs} ms apres la creation` : ""})` : ""} ${t()} sid=${callSid}`);
+      console.log(`[latence] n°${respSeq} premier son ${Date.now() - debutReponseMs} ms apres la creation${finParoleClientMs ? `, ${Date.now() - finParoleClientMs} ms apres la fin de parole du client` : ""}${respSeq === reponseAnticipee ? ` (anticipee${anticipeePreteA ? `, prete ${anticipeePreteA - debutReponseMs} ms apres la creation` : ""})` : ""}${mmmAvantReponse ? " (apres « Mmm »)" : ""} ${t()} sid=${callSid}`);
       finParoleClientMs = 0;
+      mmmAvantReponse = false;
     }
   }
   // GROK AVALE LA FIN DES QUESTIONS (17/09/2026, mesure) : une reponse qui se termine sur une question finit
@@ -746,6 +824,7 @@ wss.on("connection", (twilio, requete) => {
       return;
     }
     finParoleClientMs = fini.derniereVoix;
+    attenteDepuis = fini.derniereVoix;
     const occupe = generation || outilsEnCours;
     console.log(`[tour] client : ${Math.round(fini.voixMs)} ms de voix, dernier son a t+${((fini.derniereVoix - debutAppelMs) / 1000).toFixed(2)}${occupe ? ", valide apres la reponse en cours" : ""} ${t()}`);
     if (occupe) { tourEnAttente = true; return; }
@@ -828,6 +907,7 @@ wss.on("connection", (twilio, requete) => {
     const vitesse = Number(sessionDV?.speed) || GROK_SPEED;
     const seuilVad = Number(sessionDV?.threshold) || GROK_VAD_THRESHOLD;
     if (Number(sessionDV?.silenceMs) > 0) finDeTourMs = Math.min(1500, Math.max(500, Number(sessionDV.silenceMs)));
+    if (TOURS_PAR_LE_PONT && MMM_APRES_MS > 0) sonDAttente(sessionDV?.voice || GROK_VOICE, vitesse).then((s) => { sonMmm = s; });
     grok = new WebSocket(`wss://api.x.ai/v1/realtime?model=${modele}`, [`xai-client-secret.${token}`]);
 
     grok.on("open", () => {
@@ -1085,6 +1165,8 @@ wss.on("connection", (twilio, requete) => {
       voixFenetreIdx = (voixFenetreIdx + 1) % voixFenetre.length;
       if (TOURS_PAR_LE_PONT) {
         if (attenteCreation && maintenant - creationDemandeeA > REPONSE_IGNOREE_MS) reponseIgnoree();
+        if (attenteDepuis && MMM_APRES_MS > 0 && !tour && !transfert && !endRequested && maintenant - attenteDepuis >= MMM_APRES_MS
+          && maintenant >= finLecture && (generation || outilsEnCours || tourEnAttente)) jouerMmm(maintenant);
         // Seules les prises de parole partent a Grok (300 ms avant, 600 ms de silence apres) : son tampon ne
         // contient que ce que le client a dit, et un son ignore s'efface sans rien laisser.
         if (voix) {

@@ -44,6 +44,7 @@ const pont = spawn(process.execPath, ["server.js"], {
     BARGE_IN: "1", GROK_VOICE: session.voice || "eve", GROK_REASONING: "none", GROK_SPEED: String(session.speed || 1), TOURS: MODE,
     // Comme Palazzo en production : 900 ms d'attente de fin de phrase (silenceMs de l'agent). ANTICIPATION_MS=0 pour comparer.
     FIN_DE_TOUR_MS: process.env.FIN_DE_TOUR_MS || String(session.silenceMs || 900), ANTICIPATION_MS: process.env.ANTICIPATION_MS ?? "400", JOURNAL_DIALOGUE: "1",
+    MMM_APRES_MS: process.env.MMM_APRES_MS ?? "1800", // un seuil bas (700) force le « Mmm » d'attente pour l'entendre
   },
 });
 const t0 = Date.now();
