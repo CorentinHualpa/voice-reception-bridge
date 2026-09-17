@@ -506,7 +506,17 @@ wss.on("connection", (twilio, requete) => {
   function demanderReponse() {
     if (!(grok && grok.readyState === WebSocket.OPEN)) return;
     marquerGeneration();
+    rappelerFinDeQuestion();
     grok.send(JSON.stringify({ type: "response.create" }));
+  }
+  // GROK AVALE LA FIN DES QUESTIONS (17/09/2026, mesure) : une reponse qui se termine sur une question finit
+  // abruptement, les dernieres syllabes manquent DANS SON AUDIO (« Allora, que désirez-vous commander ? » : 5 fins
+  // coupees sur 5, sur les 9 voix feminines ; une affirmation : 0 sur 5). La meme question suivie de « Je vous
+  // écoute ! » : 0 sur 5. La consigne de session ne suffit pas (le modele l'oublie deux fois sur cinq) ; rappelee
+  // juste avant chaque reponse, les questions ont fini proprement 4 fois sur 4.
+  function rappelerFinDeQuestion() {
+    if (!TOURS_PAR_LE_PONT || !(grok && grok.readyState === WebSocket.OPEN)) return;
+    grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "system", content: [{ type: "input_text", text: "Rappel pour ta prochaine réponse : si elle contient une question, ne termine pas sur la question. Ajoute après elle deux ou trois mots comme « Je vous écoute. » ou « Dites-moi. »" }] } }));
   }
   // La prise de parole devient un message du client dans la conversation de Grok.
   function validerTour() {
@@ -638,6 +648,7 @@ wss.on("connection", (twilio, requete) => {
         callerFr ? `Le client appelle depuis le numéro ${callerFr}. Quand tu lui relis ce numéro à voix, tu prononces EXACTEMENT ceci, mot pour mot, sans le recalculer ni changer un seul groupe : « ${callerSpoken} ». C'est son numéro de rappel par défaut, tu le connais déjà.` : "",
         carteAjoutee,
         "Au téléphone, un silence de ta part laisse le client dans le vide. Ne termine jamais une réponse sur une simple confirmation (« Oui, vingt-deux heures est possible. ») : enchaîne dans la même réponse sur l'étape suivante, par une question. Seul l'au revoir final ne pose pas de question.",
+        "Au téléphone, ta voix avale la fin d'une réponse qui se termine sur une question. Ne finis donc jamais sur le point d'interrogation : après ta question, ajoute toujours deux ou trois mots, variés d'une fois sur l'autre (« Je vous écoute. », « Dites-moi. », « Prenez votre temps. »).",
       ].filter(Boolean).join("\n");
       const sessionInstructions = contexte ? `${instructionsBase}\n\n# Contexte de cet appel\n${contexte}` : instructionsBase;
       // Le transfert n'est offert que si l'appel peut vraiment basculer : un numero lisible et les
@@ -692,7 +703,7 @@ wss.on("connection", (twilio, requete) => {
             const accueil = typeof sessionDV?.greeting === "string" ? sessionDV.greeting.trim() : "";
             if (TOURS_PAR_LE_PONT) marquerGeneration();
             grok.send(JSON.stringify(accueil
-              ? { type: "response.create", response: { instructions: `Dis exactement cette phrase, mot pour mot, sans rien ajouter avant ni apres, puis ecoute : « ${accueil} »` } }
+              ? { type: "response.create", response: { instructions: `Dis exactement cette phrase, mot pour mot, sans rien ajouter avant ni apres, avec le sourire et beaucoup d'entrain, comme une Italienne ravie d'accueillir, puis ecoute : « ${accueil} »` } }
               : { type: "response.create" }));
           } // salut une fois
           break;
@@ -767,10 +778,11 @@ wss.on("connection", (twilio, requete) => {
           // (« Que désirez-vous commander »), et la relance partait a tort sur une vraie question.
           // Question reconnue meme sans « ? » : « À quelle heure souhaitez-vous la retirer » faisait partir la relance,
           // et l'agent enchainait sur une autre question (« Quelle pizza désirez-vous ? ») avant la reponse.
-          const derniere = (phrase.split(/(?<=[.!?…])\s+/).pop() || phrase).trim();
-          const estQuestion = /\?\s*$/.test(phrase)
-            || /-(vous|je|tu|il|elle|on|nous|ils|elles)\b/i.test(derniere)
-            || /^(quel|quelle|quels|quelles|combien|comment|où|quand|pourquoi|est-ce|qu'est-ce|à quel|a quel|pour quel|que (désirez|souhaitez|voulez|prenez))/i.test(derniere);
+          // Les deux dernieres phrases : l'agent ajoute maintenant « Je vous écoute. » apres sa question.
+          const deuxDernieres = phrase.split(/(?<=[.!?…])\s+/).slice(-2).map((p) => p.trim());
+          const estQuestion = deuxDernieres.some((p) => /\?/.test(p)
+            || /-(vous|je|tu|il|elle|on|nous|ils|elles)\b/i.test(p)
+            || /^(quel|quelle|quels|quelles|combien|comment|où|quand|pourquoi|est-ce|qu'est-ce|à quel|a quel|pour quel|c'est pour quel|que (désirez|souhaitez|voulez|prenez)|dites-moi)/i.test(p));
           attenteSuite = TOURS_PAR_LE_PONT && reponseApresOutil && !calls.length && phrase && !estQuestion && !closingSaid && !closeTriggered && !relanceSuiteFaite ? { respSeq } : null;
           // La phrase d'annonce du transfert vient d'etre generee : on attend qu'elle soit jouee, puis on bascule.
           if (!calls.length && transfert && transfert.etat === "annonce") preparerTransfert();
@@ -920,7 +932,7 @@ wss.on("connection", (twilio, requete) => {
             attenteSuite = null;
             relanceSuiteFaite = true;
             console.log(`[tour] le client attend la suite, l'agent enchaine ${t()}`);
-            promptGrok("(SYSTÈME : ta dernière phrase ne posait pas de question et le client attend. Enchaîne tout de suite sur l'étape suivante, en une phrase courte qui se termine par une question.)");
+            promptGrok("(SYSTÈME : ta dernière phrase ne posait pas de question et le client attend. Enchaîne tout de suite sur l'étape suivante, en une phrase courte qui pose une question, suivie de deux ou trois mots comme « Je vous écoute. ».)");
           }
         }
       } else {
@@ -1018,6 +1030,7 @@ wss.on("connection", (twilio, requete) => {
       relancesOutils++;
       relanceOutilDemandee = true;
       if (TOURS_PAR_LE_PONT) marquerGeneration();
+      rappelerFinDeQuestion();
       grok.send(JSON.stringify({ type: "response.create" }));
     } else {
       console.log(`[outil] plafond de relances atteint sid=${callSid}`);
@@ -1086,7 +1099,7 @@ wss.on("connection", (twilio, requete) => {
       lastCallerMs = Date.now();
       if (!checkedIn) {
         checkedIn = true;
-        promptGrok("(SYSTEME : le client est silencieux. Demande-lui brievement s'il est toujours la, par exemple 'Allo, vous etes toujours la ?', et rien d'autre.)");
+        promptGrok("(SYSTEME : le client est silencieux. Demande-lui brievement s'il est toujours la, par exemple 'Allo, vous etes toujours la ? Je vous ecoute.', et rien d'autre. Ne termine pas sur le point d'interrogation.)");
       } else {
         closeTriggered = true;
         promptGrok("(SYSTEME : le client ne repond toujours pas. Dis une breve phrase de conge polie qui remercie pour l'appel et souhaite une bonne journee, et rien d'autre.)");
