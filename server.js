@@ -26,7 +26,7 @@ import http from "http";
 import fs from "fs";
 import { WebSocketServer, WebSocket } from "ws";
 import { ulaw8kToPcm16, pcm16ToUlaw8k } from "./lib/audio.js";
-import { createPizzeria } from "./lib/pizzeria.js";
+import { OUTILS_DE_COMMANDE, consigneClotureCommande, createPizzeria } from "./lib/pizzeria.js";
 import {
   chargerSession,
   dalevozActif,
@@ -403,6 +403,11 @@ wss.on("connection", (twilio, requete) => {
   let toNumber = null;    // numero APPELE : c'est lui qui designe l'agent Dale Voz
   let canalDV = null;     // { tenantId, agentSlug, locale... } quand le numero est rattache
   let sessionDV = null;   // instructions, voix et outils de la version publiee de l'agent
+  // LA PRISE DE COMMANDE PAR DALE VOZ (17/09/2026) : quand la console l'a confiee a la plateforme, la
+  // session publiee porte les outils de commande ET le contexte du restaurant (heure, pause, ruptures,
+  // carte). Le profil local `pizzeria` s'efface alors : ni ses outils, ni sa carte, ni son contexte.
+  const commandesParDaleVoz = () => Boolean(sessionDV?.tools?.some((t) => t.name === "enregistrer_commande"));
+  let commandeEnregistreeDV = false; // pour la garde de cloture, une commande par appel
   let sessionIdDV = null; // fil Dale Voz, cree a l'ecriture de l'appel
   let bargeIn = BARGE_IN_DEFAUT; // regle par l'agent Dale Voz (settings.telephone.couperLaParole) des que la session est chargee
   const debutAppelMs = Date.now();
@@ -666,8 +671,10 @@ wss.on("connection", (twilio, requete) => {
     if (!calls.length && transfert && transfert.etat === "annonce") preparerTransfert();
     if (calls.length) runTools(calls).catch((err) => console.error("[outil] echec du cycle", err));
     else if (TOURS_PAR_LE_PONT && tourEnAttente && !tour) { validerTour(); demanderReponse(); } // le client a parle pendant la generation
-    else if (pizzeria && !clotureVerifiee) {
-      const consigne = pizzeria.consigneCloture(texteReponse, { callSid, outils: calls.map((c) => c.name) });
+    else if ((pizzeria || commandesParDaleVoz()) && !clotureVerifiee) {
+      const consigne = commandesParDaleVoz()
+        ? consigneClotureCommande(texteReponse, { outils: calls.map((c) => c.name), dejaEnregistree: commandeEnregistreeDV })
+        : pizzeria.consigneCloture(texteReponse, { callSid, outils: calls.map((c) => c.name) });
       if (consigne) {
         clotureVerifiee = true; closingSaid = false;
         console.log(`[garde] commande annoncee sans enregistrement sid=${callSid}`);
@@ -795,7 +802,7 @@ wss.on("connection", (twilio, requete) => {
         }
         // Ce que la tablette du restaurant a regle (pause, ruptures...) doit etre dans le contexte
         // de CET appel, qui part juste apres. Plafonne : un Dale Voz lent ne retarde pas le decroche.
-        if (pizzeria) {
+        if (pizzeria && !commandesParDaleVoz()) {
           const t0 = Date.now();
           await Promise.race([pizzeria.rafraichir({ tenantId: canalDV.tenantId, agentSlug: canalDV.agentSlug }, { forcer: true }), new Promise((r) => setTimeout(r, 1500))]);
           console.log(`[restaurant] etat relu en ${Date.now() - t0} ms`);
@@ -831,13 +838,15 @@ wss.on("connection", (twilio, requete) => {
       // pizzas dans la base de connaissance : « Je vais vérifier ça pour vous », un outil, puis une seconde
       // reponse, soit deux a trois secondes de plus au telephone (et une fois 11 s de silence). La carte qui
       // chiffre les commandes est deja dans le pont : on la donne, sauf si le prompt la contient deja.
-      const carte = pizzeria ? pizzeria.carteTexte() : "";
+      // Commandes par Dale Voz : la carte et l'etat du restaurant sont deja dans les instructions publiees.
+      const profilLocal = Boolean(pizzeria) && !commandesParDaleVoz();
+      const carte = profilLocal ? pizzeria.carteTexte() : "";
       const premiereLigneCarte = carte.split("\n").find((l) => l.startsWith("- ")) || "";
       const carteAjoutee = carte && !(premiereLigneCarte && instructionsBase.includes(premiereLigneCarte))
         ? `La carte complète et à jour, avec les prix, est ci-dessous. Pour une question sur les pizzas, les formules, les desserts, les boissons, leurs ingrédients ou leurs prix, réponds directement à partir d'elle, sans outil de recherche et sans annoncer que tu vérifies.\n\n${carte}`
         : "";
       const contexte = [
-        pizzeria ? pizzeria.contexteAppel() : "",
+        profilLocal ? pizzeria.contexteAppel() : "",
         callerFr ? `Le client appelle depuis le numéro ${callerFr}. Quand tu lui relis ce numéro à voix, tu prononces EXACTEMENT ceci, mot pour mot, sans le recalculer ni changer un seul groupe : « ${callerSpoken} ». C'est son numéro de rappel par défaut, tu le connais déjà.` : "",
         carteAjoutee,
         "Au téléphone, un silence de ta part laisse le client dans le vide. Ne termine jamais une réponse sur une simple confirmation (« Oui, vingt-deux heures est possible. ») : enchaîne dans la même réponse sur l'étape suivante, par une question. Seul l'au revoir final ne pose pas de question.",
@@ -850,7 +859,7 @@ wss.on("connection", (twilio, requete) => {
       const transfertPossible = Boolean(TRANSFERT_NUMERO && canalDV?.accountSid && canalDV?.authToken);
       const outilsDV = (sessionDV?.tools ?? []).filter((t) => !(transfertPossible && t.name === "request_handoff"));
       const outils = [
-        ...(pizzeria ? pizzeria.tools : []),
+        ...(profilLocal ? pizzeria.tools : []),
         ...(transfertPossible ? [outilTransfert(TRANSFERT_NOM)] : []),
         ...outilsDV,
       ];
@@ -1143,7 +1152,7 @@ wss.on("connection", (twilio, requete) => {
 
   // Outils : un appel d'outil termine la reponse du modele. On renvoie le resultat PUIS on relance,
   // sinon il reste muet. Plafond de relances par tour client, sinon il s'enchaine tout seul.
-  const outilLocal = (nom) => Boolean(pizzeria) && pizzeria.tools.some((t) => t.name === nom);
+  const outilLocal = (nom) => Boolean(pizzeria) && !commandesParDaleVoz() && pizzeria.tools.some((t) => t.name === nom);
 
   // Pendant les outils, une prise de parole qui se termine attend la relance au lieu de demander sa propre
   // reponse : deux response.create se croiseraient.
@@ -1156,6 +1165,8 @@ wss.on("connection", (twilio, requete) => {
     for (const c of calls) {
       let args = {};
       try { args = JSON.parse(c.args || "{}"); } catch {}
+      // Commande modifiee : un nouveau recapitulatif est exige, quel que soit l'executant de l'outil.
+      if (c.name === "chiffrer_commande") { recapTs = 0; clientApresRecap = false; }
       let out;
       if (c.name === "end_call") {
         // Outil de Dale Voz : cote web la surface raccroche, ici c'est Twilio.
@@ -1174,7 +1185,6 @@ wss.on("connection", (twilio, requete) => {
           out = { ok: true, consigne: `Le transfert vers ${qui} est lancé. Si tu n'as pas déjà prévenu le client, dis seulement : « Je vous passe ${qui}, ne quittez pas. » Sinon, ne dis rien. Ensuite, plus un mot.` };
         }
       } else if (outilLocal(c.name)) {
-        if (c.name === "chiffrer_commande") { recapTs = 0; clientApresRecap = false; } // commande modifiee : nouveau recapitulatif exige
         try {
           out = await pizzeria.runAsync(c.name, args, {
             callSid,
@@ -1185,6 +1195,7 @@ wss.on("connection", (twilio, requete) => {
         }
         catch (err) { out = { ok: false, erreur: err.message }; console.error(`[outil] ${c.name} KO`, err); }
       } else if (canalDV) {
+        const commande = OUTILS_DE_COMMANDE.has(c.name);
         const reponse = await executerOutil({
           tenantId: canalDV.tenantId,
           agentSlug: canalDV.agentSlug,
@@ -1192,9 +1203,11 @@ wss.on("connection", (twilio, requete) => {
           args,
           sessionId: sessionIdDV,
           locale: canalDV.locale,
+          ...(commande ? { appel: { id: callSid, telephone: frPhone(fromNumber), recapConfirme: recapTs > 0 && clientApresRecap } } : {}),
         });
         // La plateforme renvoie { output } deja serialise ; null = elle n'a pas repondu.
         out = reponse?.output ?? { ok: false, erreur: "outil indisponible" };
+        if (c.name === "enregistrer_commande" && typeof out === "string" && /"ok":\s*true/.test(out)) commandeEnregistreeDV = true;
       } else {
         out = { ok: false, erreur: `outil inconnu ${c.name}` };
       }
