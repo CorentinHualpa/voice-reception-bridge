@@ -116,9 +116,11 @@ const REPONSE_IGNOREE_MS = Number(process.env.REPONSE_IGNOREE_MS || 1000);
 // « MMM » D'ATTENTE (17/09/2026, choix de Coq). Une reponse sur cinq, Grok met 2,7 a 3,7 s a parler (cote xAI,
 // hors de portee du pont) : le client entend un blanc. Quand rien n'est encore joue MMM_APRES_MS apres la fin de sa
 // phrase et qu'une reponse est en route, l'agent fait « Mmm… » dans sa propre voix (Grok TTS, rendu en mu-law 8 kHz,
-// produit une fois par voix et garde en memoire). Avec l'anticipation, les reponses rapides partent entre 1,1 et 1,6 s
-// et les lentes apres 2,4 s : le seuil tombe entre les deux. Une fois par tour du client. MMM_APRES_MS=0 le coupe.
-const MMM_APRES_MS = Number(process.env.MMM_APRES_MS ?? 1800);
+// produit une fois par voix et garde en memoire). Une fois par tour du client. MMM_APRES_MS=0 le coupe.
+// Seuil a 2,4 s (repetition de demo du 17/09, choix de Coq) : a 1,8 s il partait sur 4 tours sur 6, dont 3 juste avant
+// une reponse d'apres outil, qu'il retardait d'environ 0,5 s. Mesures avec l'anticipation : reponses rapides 1,1 a
+// 1,6 s, reponses d'apres outil 1,9 a 2,35 s, pics de Grok au-dela de 2,7 s. Le seuil ne garde que les pics.
+const MMM_APRES_MS = Number(process.env.MMM_APRES_MS ?? 2400);
 const MMM_TEXTE = process.env.MMM_TEXTE || "Mmm…";
 const sonsDAttente = new Map(); // "voix|vitesse|texte" -> Promise<Buffer mu-law | null>
 function sonDAttente(voix, vitesse) {
