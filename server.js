@@ -514,7 +514,10 @@ wss.on("connection", (twilio, requete) => {
   // coupees sur 5, sur les 9 voix feminines ; une affirmation : 0 sur 5). La meme question suivie de « Je vous
   // écoute ! » : 0 sur 5. La consigne de session ne suffit pas (le modele l'oublie deux fois sur cinq) ; rappelee
   // juste avant chaque reponse, les questions ont fini proprement 4 fois sur 4.
+  // ⚠ RETIRE le 17/09 a 08:36 : en appel reel, ce message systeme avant chaque reponse a fait repeter l'accueil
+  // puis repondre « Je vous écoute. » a tout. Le banc a quatre tours ne l'avait pas montre. Garde a zero.
   function rappelerFinDeQuestion() {
+    if (process.env.RAPPEL_FIN_QUESTION !== "1") return;
     if (!TOURS_PAR_LE_PONT || !(grok && grok.readyState === WebSocket.OPEN)) return;
     grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "system", content: [{ type: "input_text", text: "Rappel pour ta prochaine réponse : si elle contient une question, ne termine pas sur la question. Ajoute après elle deux ou trois mots comme « Je vous écoute. » ou « Dites-moi. »" }] } }));
   }
