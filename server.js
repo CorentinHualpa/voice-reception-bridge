@@ -27,6 +27,8 @@
 //   AMBIANCE_APRES_MS  fond de salle tres bas pendant les blancs, apres N ms (0 = coupe, valeur de travail 1800)
 //   AMBIANCE_FICHIER   WAV PCM 16 bits mono a jouer en fond ; a defaut, bruit de confort synthetise
 //   AMBIANCE_GAIN      volume du fond, 0,06 par defaut (assez bas pour ne pas passer le seuil de detection)
+//   REDITE_ATTENTE_MS  battement laisse a la transcription avant de jeter une reponse qui n'a rien de neuf a
+//                      dire (600 par defaut, 0 desactive la garde)
 
 import http from "http";
 import fs from "fs";
@@ -169,6 +171,9 @@ const ambianceBoucle = AMBIANCE_APRES_MS > 0 ? chargerAmbiance({ source: AMBIANC
 // (la primaire garde son avance et gagne la course), il coute seulement des generations jetees ; un seuil plus
 // haut retarde d'autant la parade. Sur un blocage a 3,7 s, la doublure parle vers 1,9 s au lieu de 3,7 s.
 const HEDGE_APRES_MS = Number(process.env.HEDGE_APRES_MS ?? 0);
+// Battement laisse a la transcription du client avant de conclure qu'un tour ne portait aucun mot (voir
+// `entreeNouvelle`). REDITE_ATTENTE_MS=0 desactive la garde anti-redite sans toucher au code.
+const REDITE_ATTENTE_MS = Number(process.env.REDITE_ATTENTE_MS ?? 600);
 // BANC SEULEMENT : retarde artificiellement le son de la primaire pour que la doublure gagne a coup sur. Sans
 // lui, reproduire un blocage de Grok demande d'attendre un vrai pic (une reponse sur cinq). Ne jamais poser en
 // production : la primaire est alors muette pendant ce delai meme quand elle repond vite.
@@ -587,6 +592,23 @@ wss.on("connection", (twilio, requete) => {
   let doublureGagnante = false; // la reponse en cours est jouee par la doublure, pas par la primaire
   let resteAudioDoublure = Buffer.alloc(0); // octet impair en attente, comme pour la primaire
   let primaireJetee = 0;                    // n° de la reponse de la primaire dont le son ne doit plus partir
+  // GROK REDIT SA DERNIERE REPONSE quand on lui demande une reponse SANS nouvelle entree (banc
+  // `banc-parades-pics.mjs avide` : premiere demande a vide ignoree en silence, seconde repetee mot pour mot).
+  // Le pont valide un tour des que le client a fait assez de bruit, or un « mmm » ou un souffle ne cree AUCUN
+  // message chez Grok (cf. REPONSE_IGNOREE_MS) : la reponse qui suit est alors la precedente, redite.
+  // `entreeNouvelle` dit qu'il y a bien de quoi repondre : une transcription du client non vide, un resultat
+  // d'outil, ou une consigne poussee par le pont. Faux au moment ou un tour est valide, vrai des que la
+  // transcription arrive (~400 ms apres le commit, soit avant le premier son, qui vient a 0,6-1,4 s).
+  let entreeNouvelle = true;                // l'accueil n'a pas d'entree et ne doit pas etre bloque
+  // ⚠ Un « mmm » dit juste apres une phrase s'AJOUTE au meme message chez Grok (meme `item_id`, cf. le piege du
+  // commit qui ne ferme pas le message) : son texte a l'air neuf alors que le message a deja servi. La garde
+  // suit donc l'IDENTIFIANT du message du client, pas son contenu.
+  let dernierItemClient = "", itemClientConsomme = "";
+  let texteReponsePrecedente = "";          // la derniere reponse REELLEMENT dite, pour reconnaitre sa redite
+  let rediteVerifiee = false;               // comparaison de contenu faite pour la reponse en cours
+  let retenueRedite = [];                   // son garde le temps de savoir si cette reponse est une redite
+  let retenueDepuis = 0;                    // debut de cette retenue
+  let rediteTranchee = false;               // une fois par reponse
   let sonMmm = null;
   // Reponse anticipee (voir ANTICIPATION_MS) : { tour, etat "demandee" | "creee" | "finie", annulee, annuleeA, voixDepuis,
   // audio (mu-law retenu jusqu'a la fin du tour), pretA, fin (response.done differe), items (de la reponse), closingAvant, depuis }
@@ -771,6 +793,13 @@ wss.on("connection", (twilio, requete) => {
   }
   // Fin d'une reponse de Grok : journal, queue de silence, outils, relances. Differee pour une reponse anticipee.
   function terminerReponse(e) {
+    // Reponse trop courte pour avoir ete tranchee : on la laisse passer plutot que de la perdre.
+    if (!rediteTranchee && retenueRedite.length) { rediteTranchee = true; const g = retenueRedite; retenueRedite = []; for (const u of g) envoyerSonAgent(u); }
+    rediteTranchee = true;
+    // Ce qui vient d'etre dit est consomme : la prochaine reponse aura besoin d'une entree a elle. ⚠ Ne PAS
+    // remettre ce drapeau a chaque validation de tour : une anticipation annulee revalide le meme tour, dont la
+    // transcription est deja arrivee et ne reviendra pas, et on jetterait une reponse parfaitement legitime.
+    if (agentBuf.trim() && respSeq !== reponseCoupee) { consommerEntreeClient(); texteReponsePrecedente = agentBuf; }
     const texteReponse = agentBuf;
     // Surveillance des fins avalees : une transcription de Grok qui finit sans ponctuation a perdu son dernier signe,
     // et sa derniere syllabe avec (voir TYPO_COLLEE). Hors reponse coupee par le client, qui s'arrete forcement net.
@@ -959,6 +988,8 @@ wss.on("connection", (twilio, requete) => {
             if (reponseCoupee !== tourDoublure.marque) {
               repliqueEnCours = `${repliqueEnCours} ${texte}`.trim().slice(-4000);
               if (CLOSING_RE.test(texte)) closingSaid = true;
+              consommerEntreeClient(); // la doublure a repondu : l'entree du tour est consommee
+              texteReponsePrecedente = texte; // c'est CELA que la primaire pourrait redire au tour suivant
             }
           }
           console.log(`[doublure] reponse n°${tourDoublure.marque} finie (${statut}), ${texte.length} car${reponseCoupee === tourDoublure.marque ? ", coupee par le client" : ""}${texte ? ` : « ${texte.slice(0, 120)} »` : ""} ${t()} sid=${callSid}`);
@@ -973,8 +1004,58 @@ wss.on("connection", (twilio, requete) => {
     });
     doublure.ouvrir().then((ok) => { if (!ok) doublure = null; });
   }
+  // REDITE (voir `entreeNouvelle`). Une reponse dont le tour n'a apporte AUCUN message nouveau ne peut etre que
+  // la precedente redite : son son n'est pas joue et la reponse est annulee. Tant que le doute subsiste, le son
+  // attend, et cette attente ne concerne QUE les tours sans entree connue (un « mmm », un souffle, un bruit de
+  // ligne) : un tour normal, dont la transcription est arrivee, n'est pas retarde d'une milliseconde.
+  // Second filet, sur le CONTENU. Grok ouvre parfois un vrai message pour un « mmm » (le tour a donc bien une
+  // entree nouvelle) et redit quand meme sa reponse precedente : aucune garde sur l'entree ne peut le voir. Ici
+  // on compare le debut de ce qu'il dit a ce qui vient d'etre dit. Le texte arrive en meme temps que le son,
+  // donc quelques dixiemes de seconde sont deja partis : on purge la file Twilio, comme pour une coupure. Mieux
+  // vaut un debut de phrase tronque qu'une reponse entiere redite.
+  function verifierRedite() {
+    if (rediteVerifiee || !REDITE_ATTENTE_MS) return;
+    const debut = agentBuf.trim();
+    if (debut.length < 40) return;
+    rediteVerifiee = true;
+    const precedent = normLine(texteReponsePrecedente);
+    if (!precedent || !precedent.startsWith(normLine(debut))) return;
+    retenueRedite = [];
+    reponseCoupee = respSeq;
+    agentBuf = "";
+    if (streamSid) { try { twilio.send(JSON.stringify({ event: "clear", streamSid })); } catch {} }
+    finLecture = Date.now();
+    try { grok.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+    console.log(`[redite] reponse n°${respSeq} jetee : elle redisait « ${debut.slice(0, 60)}… » ${t()} sid=${callSid}`);
+  }
+  function trancherRedite() {
+    if (rediteTranchee) return true;
+    if (entreeNouvelle || !REDITE_ATTENTE_MS) { rediteTranchee = true; return true; }
+    // La transcription arrive ~400 ms apres le commit et le premier son a 0,6-1,4 s : elle est donc presque
+    // toujours deja la. On laisse quand meme REDITE_ATTENTE_MS de battement avant de conclure, pour ne pas
+    // jeter une vraie reponse le jour ou la transcription tarde ou manque.
+    if (!retenueDepuis) retenueDepuis = Date.now();
+    if (Date.now() - retenueDepuis < REDITE_ATTENTE_MS) return false; // le son attend
+    rediteTranchee = true;
+    retenueRedite = [];
+    reponseCoupee = respSeq; // la suite du son est jetee, comme pour une reponse coupee
+    const debut = agentBuf.trim();
+    agentBuf = "";
+    try { grok.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+    console.log(`[redite] reponse n°${respSeq} jetee : le tour ne portait aucun mot, elle disait « ${debut.slice(0, 70)}… » ${t()} sid=${callSid}`);
+    return false;
+  }
   // Son de l'agent vers Twilio, et mesure de la latence au premier son de chaque reponse.
   function envoyerSonAgent(ulaw) {
+    // Rien ne part tant qu'on ne sait pas si cette reponse est une redite (voir trancherRedite).
+    if (!rediteTranchee) {
+      retenueRedite.push(ulaw);
+      if (!trancherRedite()) return;
+      const gardes = retenueRedite;
+      retenueRedite = [];
+      for (const u of gardes) envoyerSonAgent(u);
+      return;
+    }
     attenteDepuis = 0;
     arreterAmbiance(Date.now());
     // La primaire a parle la premiere : la doublure n'a plus lieu d'etre, et son son ne doit surtout pas
@@ -1072,6 +1153,16 @@ wss.on("connection", (twilio, requete) => {
     tourClient.idx = dialog.length;
     dialog.push({ who: "Client", msg: userBuf.trim() });
     userBuf = "";
+  }
+  // Une transcription du client : y a-t-il de quoi repondre, c'est-a-dire un message que l'agent n'a pas
+  // deja utilise ? Un message vide (bruit sans mot) ne compte pas, un message deja servi non plus.
+  function noterEntreeClient(itemId, texte) {
+    if (itemId) dernierItemClient = itemId;
+    if (String(texte || "").trim() && dernierItemClient && dernierItemClient !== itemClientConsomme) entreeNouvelle = true;
+  }
+  function consommerEntreeClient() {
+    itemClientConsomme = dernierItemClient;
+    entreeNouvelle = false;
   }
   function setUser(texte, cumule) {
     if (typeof texte !== "string") return;
@@ -1223,6 +1314,7 @@ wss.on("connection", (twilio, requete) => {
           relanceOutilDemandee = false;
           resteAudio = Buffer.alloc(0);
           audioReponseOctets = 0; debutReponseMs = Date.now(); premierSon = false;
+          rediteTranchee = false; retenueRedite = []; retenueDepuis = 0; rediteVerifiee = false;
           // Nouvelle reponse : la doublure repart de zero, et ce qu'elle produisait encore n'a plus d'objet.
           doublureGagnante = false; resteAudioDoublure = Buffer.alloc(0);
           if (doublure?.occupee) doublure.abandonner("nouvelle reponse de la primaire");
@@ -1257,7 +1349,7 @@ wss.on("connection", (twilio, requete) => {
           break;
         }
         case "response.output_audio_transcript.delta":
-          if (e.delta) { agentBuf += e.delta; if (CLOSING_RE.test(agentBuf)) closingSaid = true; }
+          if (e.delta) { agentBuf += e.delta; if (CLOSING_RE.test(agentBuf)) closingSaid = true; verifierRedite(); }
           break;
         case "response.done": {
           if (anticipation) {
@@ -1278,9 +1370,11 @@ wss.on("connection", (twilio, requete) => {
         case "conversation.item.input_audio_transcription.updated":
         case "conversation.item.input_audio_transcription.completed":
           if (process.env.JOURNAL_DIALOGUE === "1") console.log(`[transcription] ${e.type.split(".").pop()} item=${e.item_id} ligne=${tourClient ? tourClient.idx : "aucune"} « ${e.transcript} » ${t()}`);
+          noterEntreeClient(e.item_id, e.transcript);
           setUser(e.transcript, false); // cumulatif ou final : remplace
           break;
         case "conversation.item.input_audio_transcription.delta":
+          noterEntreeClient(e.item_id, e.delta);
           setUser(e.delta, true);
           break;
         case "conversation.item.added":
@@ -1480,6 +1574,7 @@ wss.on("connection", (twilio, requete) => {
   function promptGrok(text) {
     try {
       grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text: collerPonctuation(text) }] } }));
+      entreeNouvelle = true; // la consigne EST l'entree a laquelle repondre
       if (TOURS_PAR_LE_PONT) marquerGeneration();
       grok.send(JSON.stringify({ type: "response.create" }));
     } catch {}
@@ -1564,6 +1659,7 @@ wss.on("connection", (twilio, requete) => {
       if (!(grok && grok.readyState === WebSocket.OPEN)) return;
       // Le recapitulatif et les consignes rendus par les outils sont repris tels quels par le modele : meme typographie.
       grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: c.callId, output: collerPonctuation(sortie) } }));
+      entreeNouvelle = true; // le resultat de l'outil EST l'entree a laquelle la relance repond
     }
     // Ce que le client a dit pendant la reponse ou les outils entre dans la conversation avant la relance.
     const tourPendant = TOURS_PAR_LE_PONT && tourEnAttente && !tour;

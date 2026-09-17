@@ -184,6 +184,66 @@ async function epreuveInjection() {
   s.ws.close();
 }
 
+// ---- reprise : apres une reponse ANNULEE puis remplacee par celle de la doublure, la primaire repete-t-elle ? ----
+// C'est le defaut vu sur deux appels reels : la doublure repond, son texte est injecte dans la primaire, et au
+// tour suivant la primaire redit la meme chose. Hypothese : la reponse annulee laisse un item assistant partiel,
+// que le modele voit comme « commence, jamais fini », et qu'il reprend. On compare deux facons de faire.
+async function epreuveReprise() {
+  console.log("\n=== reprise : la primaire repete-t-elle la reponse de la doublure ? ===");
+  const TEXTE_DOUBLURE = "Non, nous ne faisons pas de pizzas sans gluten. Il faudrait un poste de preparation separe pour eviter la contamination, et nous n'en avons pas. Vous desirez autre chose ?";
+  for (const effacer of [false, true]) {
+    const s = await ouvrir({ longue: false });
+    // Tour 1 : le client demande, la primaire commence a repondre, on l'annule en cours de generation.
+    s.ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text: "Est-ce que vous faites des pizzas sans gluten ?" }] } }));
+    const avant = s.evts.length;
+    s.ws.send(JSON.stringify({ type: "response.create" }));
+    for (let i = 0; i < 40 && !s.evts.slice(avant).some((e) => e.type === "response.output_audio.delta"); i++) await attendre(50);
+    s.ws.send(JSON.stringify({ type: "response.cancel" }));
+    for (let i = 0; i < 60 && !s.evts.slice(avant).some((e) => e.type === "response.done"); i++) await attendre(50);
+    // Les elements que cette reponse annulee a laisses dans la conversation.
+    const items = s.evts.slice(avant).filter((e) => e.type === "conversation.item.added" && e.item?.role !== "user").map((e) => e.item?.id).filter(Boolean);
+    if (effacer) for (const id of items) s.ws.send(JSON.stringify({ type: "conversation.item.delete", item_id: id }));
+    await attendre(400);
+    // Ce que la doublure a reellement dit au client.
+    s.ws.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "assistant", content: [{ type: "output_text", text: TEXTE_DOUBLURE }] } }));
+    await attendre(400);
+    // Tour 2 : le client passe a autre chose. La primaire doit repondre a CA, pas redire le gluten.
+    const r = await tour(s, "D'accord. Et vous avez des desserts ?");
+    const texte = s.evts.filter((e) => e.type === "response.output_audio_transcript.done").map((e) => e.transcript).join(" | ");
+    const dernier = texte.split(" | ").pop() || "";
+    const repete = /gluten|contamination|poste de pr/i.test(dernier);
+    console.log(`  ${effacer ? "items annules EFFACES " : "items annules GARDES  "} : ${items.length} item(s), premier son ${r.son} ms`);
+    console.log(`    reponse : « ${dernier.slice(0, 180)} »`);
+    console.log(`    ${repete ? "REPETE la reponse de la doublure" : "enchaine correctement"}`);
+    s.ws.close();
+  }
+}
+
+// ---- avide : que fait Grok quand on lui demande une reponse SANS nouvelle entree du client ? ----
+// Le pont valide un tour des que le client a fait assez de bruit, meme si ce bruit ne porte aucun mot (« mmm »,
+// un souffle) : un tel commit ne cree AUCUN message (point 5 du § 7 bis), et le `response.create` part quand meme.
+async function epreuveAvide() {
+  console.log("\n=== avide : une reponse demandee sans nouvelle entree du client ===");
+  const s = await ouvrir({ longue: false });
+  const r1 = await tour(s, "Est-ce que vous faites des pizzas sans gluten ?");
+  const t1 = (s.evts.filter((e) => e.type === "response.output_audio_transcript.done").pop() || {}).transcript || "";
+  console.log(`  1er tour (${r1.son} ms) : « ${t1.slice(0, 140)} »`);
+  for (const essai of [1, 2]) {
+    const avant = s.evts.length;
+    const d = Date.now();
+    s.ws.send(JSON.stringify({ type: "response.create" })); // aucun message user ajoute
+    let fin = null;
+    for (let k = 0; k < 400 && !fin; k++) { await attendre(25); fin = s.evts.slice(avant).find((e) => e.type === "response.done"); }
+    const son = s.evts.slice(avant).find((e) => e.type === "response.output_audio.delta");
+    const txt = (s.evts.slice(avant).filter((e) => e.type === "response.output_audio_transcript.done").pop() || {}).transcript || "";
+    console.log(`  demande a vide n°${essai} (${son ? son._a - d + " ms" : "aucun son"}) : « ${txt.slice(0, 140) || "(rien)"} »`);
+  }
+  console.log("  si elle redit le 1er tour, c'est la cause de la repetition : ne jamais demander de reponse sans entree nouvelle.");
+  s.ws.close();
+}
+
+if (EPREUVE === "avide" || EPREUVE === "tout") await epreuveAvide();
+if (EPREUVE === "reprise" || EPREUVE === "tout") await epreuveReprise();
 if (EPREUVE === "injection" || EPREUVE === "tout") await epreuveInjection();
 if (EPREUVE === "rang" || EPREUVE === "tout") await epreuveRang();
 if (EPREUVE === "effort" || EPREUVE === "tout") await epreuveEffort();
