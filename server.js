@@ -604,8 +604,6 @@ wss.on("connection", (twilio, requete) => {
   // commit qui ne ferme pas le message) : son texte a l'air neuf alors que le message a deja servi. La garde
   // suit donc l'IDENTIFIANT du message du client, pas son contenu.
   let dernierItemClient = "", itemClientConsomme = "";
-  let texteReponsePrecedente = "";          // la derniere reponse REELLEMENT dite, pour reconnaitre sa redite
-  let rediteVerifiee = false;               // comparaison de contenu faite pour la reponse en cours
   let retenueRedite = [];                   // son garde le temps de savoir si cette reponse est une redite
   let retenueDepuis = 0;                    // debut de cette retenue
   let rediteTranchee = false;               // une fois par reponse
@@ -799,7 +797,7 @@ wss.on("connection", (twilio, requete) => {
     // Ce qui vient d'etre dit est consomme : la prochaine reponse aura besoin d'une entree a elle. ⚠ Ne PAS
     // remettre ce drapeau a chaque validation de tour : une anticipation annulee revalide le meme tour, dont la
     // transcription est deja arrivee et ne reviendra pas, et on jetterait une reponse parfaitement legitime.
-    if (agentBuf.trim() && respSeq !== reponseCoupee) { consommerEntreeClient(); texteReponsePrecedente = agentBuf; }
+    if (agentBuf.trim() && respSeq !== reponseCoupee) consommerEntreeClient();
     const texteReponse = agentBuf;
     // Surveillance des fins avalees : une transcription de Grok qui finit sans ponctuation a perdu son dernier signe,
     // et sa derniere syllabe avec (voir TYPO_COLLEE). Hors reponse coupee par le client, qui s'arrete forcement net.
@@ -989,7 +987,6 @@ wss.on("connection", (twilio, requete) => {
               repliqueEnCours = `${repliqueEnCours} ${texte}`.trim().slice(-4000);
               if (CLOSING_RE.test(texte)) closingSaid = true;
               consommerEntreeClient(); // la doublure a repondu : l'entree du tour est consommee
-              texteReponsePrecedente = texte; // c'est CELA que la primaire pourrait redire au tour suivant
             }
           }
           console.log(`[doublure] reponse n°${tourDoublure.marque} finie (${statut}), ${texte.length} car${reponseCoupee === tourDoublure.marque ? ", coupee par le client" : ""}${texte ? ` : « ${texte.slice(0, 120)} »` : ""} ${t()} sid=${callSid}`);
@@ -1008,26 +1005,6 @@ wss.on("connection", (twilio, requete) => {
   // la precedente redite : son son n'est pas joue et la reponse est annulee. Tant que le doute subsiste, le son
   // attend, et cette attente ne concerne QUE les tours sans entree connue (un « mmm », un souffle, un bruit de
   // ligne) : un tour normal, dont la transcription est arrivee, n'est pas retarde d'une milliseconde.
-  // Second filet, sur le CONTENU. Grok ouvre parfois un vrai message pour un « mmm » (le tour a donc bien une
-  // entree nouvelle) et redit quand meme sa reponse precedente : aucune garde sur l'entree ne peut le voir. Ici
-  // on compare le debut de ce qu'il dit a ce qui vient d'etre dit. Le texte arrive en meme temps que le son,
-  // donc quelques dixiemes de seconde sont deja partis : on purge la file Twilio, comme pour une coupure. Mieux
-  // vaut un debut de phrase tronque qu'une reponse entiere redite.
-  function verifierRedite() {
-    if (rediteVerifiee || !REDITE_ATTENTE_MS) return;
-    const debut = agentBuf.trim();
-    if (debut.length < 40) return;
-    rediteVerifiee = true;
-    const precedent = normLine(texteReponsePrecedente);
-    if (!precedent || !precedent.startsWith(normLine(debut))) return;
-    retenueRedite = [];
-    reponseCoupee = respSeq;
-    agentBuf = "";
-    if (streamSid) { try { twilio.send(JSON.stringify({ event: "clear", streamSid })); } catch {} }
-    finLecture = Date.now();
-    try { grok.send(JSON.stringify({ type: "response.cancel" })); } catch {}
-    console.log(`[redite] reponse n°${respSeq} jetee : elle redisait « ${debut.slice(0, 60)}… » ${t()} sid=${callSid}`);
-  }
   function trancherRedite() {
     if (rediteTranchee) return true;
     if (entreeNouvelle || !REDITE_ATTENTE_MS) { rediteTranchee = true; return true; }
@@ -1314,7 +1291,7 @@ wss.on("connection", (twilio, requete) => {
           relanceOutilDemandee = false;
           resteAudio = Buffer.alloc(0);
           audioReponseOctets = 0; debutReponseMs = Date.now(); premierSon = false;
-          rediteTranchee = false; retenueRedite = []; retenueDepuis = 0; rediteVerifiee = false;
+          rediteTranchee = false; retenueRedite = []; retenueDepuis = 0;
           // Nouvelle reponse : la doublure repart de zero, et ce qu'elle produisait encore n'a plus d'objet.
           doublureGagnante = false; resteAudioDoublure = Buffer.alloc(0);
           if (doublure?.occupee) doublure.abandonner("nouvelle reponse de la primaire");
@@ -1349,7 +1326,7 @@ wss.on("connection", (twilio, requete) => {
           break;
         }
         case "response.output_audio_transcript.delta":
-          if (e.delta) { agentBuf += e.delta; if (CLOSING_RE.test(agentBuf)) closingSaid = true; verifierRedite(); }
+          if (e.delta) { agentBuf += e.delta; if (CLOSING_RE.test(agentBuf)) closingSaid = true; }
           break;
         case "response.done": {
           if (anticipation) {

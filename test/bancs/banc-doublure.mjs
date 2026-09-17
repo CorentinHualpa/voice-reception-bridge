@@ -20,6 +20,9 @@ const d = creerDoublure({
   etiquette: "banc",
   config: {
     instructions: session.instructions,
+    // Comme le pont : la consigne complete et les outils. Un contenu plus lourd a fait repondre
+    // `internal_error` a xAI sur chaque `response.create` de la doublure (appel du 17/09 19:28).
+    ...(process.env.BANC_OUTILS === "0" ? {} : { tools: session.tools || [], tool_choice: "auto" }),
     voice: session.voice || "eve",
     reasoning: { effort: "none" },
     audio: { input: { format: { type: "audio/pcm", rate: 8000 }, turn_detection: null }, output: { format: { type: "audio/pcm", rate: 8000 }, speed: session.speed || 1.1 } },
