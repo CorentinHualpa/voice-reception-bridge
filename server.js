@@ -582,6 +582,7 @@ wss.on("connection", (twilio, requete) => {
   let doublure = null, doublureSyncIdx = 0, doublureTour = 0, doublureGagnees = 0, doublureDemandees = 0;
   let doublureGagnante = false; // la reponse en cours est jouee par la doublure, pas par la primaire
   let resteAudioDoublure = Buffer.alloc(0); // octet impair en attente, comme pour la primaire
+  let primaireJetee = 0;                    // n° de la reponse de la primaire dont le son ne doit plus partir
   let sonMmm = null;
   // Reponse anticipee (voir ANTICIPATION_MS) : { tour, etat "demandee" | "creee" | "finie", annulee, annuleeA, voixDepuis,
   // audio (mu-law retenu jusqu'a la fin du tour), pretA, fin (response.done differe), items (de la reponse), closingAvant, depuis }
@@ -892,7 +893,11 @@ wss.on("connection", (twilio, requete) => {
     if (premierSon || audioReponseOctets > 0) return false; // la primaire a parle la premiere
     doublureGagnante = true;
     doublureGagnees++;
-    reponseCoupee = respSeq;                 // les deltas de la primaire sont jetes a partir d'ici
+    // Les deltas de la primaire sont jetes a partir d'ici. ⚠ NE PAS se servir de `reponseCoupee` pour ca : il
+    // sert aussi de garde a la coupure de parole (`reponseCoupee !== respSeq`), et le client ne pouvait alors
+    // plus couper une reponse doublee. Appel de controle du 17/09 : « Très bien, je vous rappellerai » n'a rien
+    // arrete, la file Twilio n'a pas ete purgee, et la fin de la doublure s'est melee a la reponse suivante.
+    primaireJetee = respSeq;
     try { grok.send(JSON.stringify({ type: "response.cancel" })); } catch {}
     agentBuf = "";                            // son texte n'a pas ete dit
     // La primaire ne sait pas encore ce que la doublure est en train de dire : elle ne le saura qu'a la fin,
@@ -922,6 +927,7 @@ wss.on("connection", (twilio, requete) => {
         son: (pcm, tourDoublure) => {
           // Le tour a change (le client a repris, la primaire a fini) : ce son n'a plus lieu d'etre.
           if (tourDoublure.marque !== respSeq || tourDoublure.outil) return;
+          if (reponseCoupee === respSeq) return; // le client a coupe : la suite ne part plus, comme pour la primaire
           if (!doublurePrendLaMain()) return;
           const brut = Buffer.concat([resteAudioDoublure, pcm]);
           const pair = brut.length - (brut.length % 2);
@@ -944,8 +950,12 @@ wss.on("connection", (twilio, requete) => {
           if (texte) {
             try { grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "assistant", content: [{ type: "output_text", text: texte }] } })); } catch {}
             pushLine("Agent", texte);
-            repliqueEnCours = `${repliqueEnCours} ${texte}`.trim().slice(-4000);
-            if (CLOSING_RE.test(texte)) closingSaid = true;
+            // Coupee par le client : le tour n'a pas ete entendu en entier, il ne compte pas comme dit (meme
+            // regle que pour la primaire, cf. terminerReponse).
+            if (reponseCoupee !== tourDoublure.marque) {
+              repliqueEnCours = `${repliqueEnCours} ${texte}`.trim().slice(-4000);
+              if (CLOSING_RE.test(texte)) closingSaid = true;
+            }
           }
           console.log(`[doublure] reponse n°${tourDoublure.marque} finie (${statut}), ${texte.length} car ${t()} sid=${callSid}`);
           // Fin du tour, maintenant que la primaire sait ce qui a ete dit : elle peut de nouveau entendre le
@@ -1226,6 +1236,7 @@ wss.on("connection", (twilio, requete) => {
           // Reponse coupee par le client : xAI ne sait pas annuler une reponse (response.cancel est
           // « Unsupported » dans sa doc), donc la suite qu'il genere encore est jetee ici.
           if (respSeq === reponseCoupee) break;
+          if (respSeq === primaireJetee) break; // la doublure joue ce tour a sa place
           const brut = Buffer.concat([resteAudio, Buffer.from(e.delta, "base64")]);
           const pair = brut.length - (brut.length % 2);
           resteAudio = Buffer.from(brut.subarray(pair)); // 0 ou 1 octet
