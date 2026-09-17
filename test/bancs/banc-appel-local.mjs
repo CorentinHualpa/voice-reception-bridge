@@ -60,6 +60,7 @@ const pont = spawn(process.execPath, ["server.js"], {
     // Parades aux pics de Grok (17/09). HEDGE_APRES_MS=300 fait doubler CHAQUE tour, pour voir la doublure a
     // l'oeuvre sans attendre un vrai blocage ; AMBIANCE_APRES_MS=600 remplit tous les blancs, pour l'entendre.
     ...(process.env.HEDGE_APRES_MS ? { HEDGE_APRES_MS: process.env.HEDGE_APRES_MS } : {}),
+    ...(process.env.DOUBLURE_TEST_MS ? { DOUBLURE_TEST_MS: process.env.DOUBLURE_TEST_MS } : {}),
     ...(process.env.AMBIANCE_APRES_MS ? { AMBIANCE_APRES_MS: process.env.AMBIANCE_APRES_MS } : {}),
     ...(process.env.AMBIANCE_GAIN ? { AMBIANCE_GAIN: process.env.AMBIANCE_GAIN } : {}),
     ...(process.env.AMBIANCE_FICHIER ? { AMBIANCE_FICHIER: process.env.AMBIANCE_FICHIER } : {}),

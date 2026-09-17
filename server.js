@@ -169,6 +169,10 @@ const ambianceBoucle = AMBIANCE_APRES_MS > 0 ? chargerAmbiance({ source: AMBIANC
 // (la primaire garde son avance et gagne la course), il coute seulement des generations jetees ; un seuil plus
 // haut retarde d'autant la parade. Sur un blocage a 3,7 s, la doublure parle vers 1,9 s au lieu de 3,7 s.
 const HEDGE_APRES_MS = Number(process.env.HEDGE_APRES_MS ?? 0);
+// BANC SEULEMENT : retarde artificiellement le son de la primaire pour que la doublure gagne a coup sur. Sans
+// lui, reproduire un blocage de Grok demande d'attendre un vrai pic (une reponse sur cinq). Ne jamais poser en
+// production : la primaire est alors muette pendant ce delai meme quand elle repond vite.
+const DOUBLURE_TEST_MS = Number(process.env.DOUBLURE_TEST_MS || 0);
 // FINS DE PHRASE AVALEES (diagnostic du 17/09/2026, bancs test/bancs/banc-fin-coupee*.mjs). Grok lache le dernier
 // signe d'une reponse, et avec lui la fin de la derniere syllabe, quand ce signe est un « ? » PRECEDE D'UNE ESPACE,
 // comme le veut la typographie francaise : « Très bien. C'est pour quel prénom ? » s'entend « …pour quel prix ? »
@@ -957,7 +961,7 @@ wss.on("connection", (twilio, requete) => {
               if (CLOSING_RE.test(texte)) closingSaid = true;
             }
           }
-          console.log(`[doublure] reponse n°${tourDoublure.marque} finie (${statut}), ${texte.length} car ${t()} sid=${callSid}`);
+          console.log(`[doublure] reponse n°${tourDoublure.marque} finie (${statut}), ${texte.length} car${reponseCoupee === tourDoublure.marque ? ", coupee par le client" : ""}${texte ? ` : « ${texte.slice(0, 120)} »` : ""} ${t()} sid=${callSid}`);
           // Fin du tour, maintenant que la primaire sait ce qui a ete dit : elle peut de nouveau entendre le
           // client, et repondre a ce qu'il a dit pendant que la doublure parlait.
           doublureGagnante = false;
@@ -1237,6 +1241,7 @@ wss.on("connection", (twilio, requete) => {
           // « Unsupported » dans sa doc), donc la suite qu'il genere encore est jetee ici.
           if (respSeq === reponseCoupee) break;
           if (respSeq === primaireJetee) break; // la doublure joue ce tour a sa place
+          if (DOUBLURE_TEST_MS && doublure && Date.now() - debutReponseMs < DOUBLURE_TEST_MS) break; // banc
           const brut = Buffer.concat([resteAudio, Buffer.from(e.delta, "base64")]);
           const pair = brut.length - (brut.length % 2);
           resteAudio = Buffer.from(brut.subarray(pair)); // 0 ou 1 octet
