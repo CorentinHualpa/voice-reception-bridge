@@ -491,6 +491,10 @@ wss.on("connection", (twilio, requete) => {
   let relanceOutilDemandee = false, reponseApresOutil = false; // la relance de suite ne vaut qu'apres un outil
   let clotureVerifiee = false; // garde « commande annoncee sans enregistrement » : une seule consigne par appel
   let messageTransmisSansReponse = false; // garde « pas de raccrochage juste apres transmettre_message »
+  // CE QUE L'AGENT A DIT (17/09/2026, demande de la plateforme) : Dale Voz verifie que le recapitulatif DIT couvre la
+  // commande avant de l'enregistrer. repliqueEnCours = ce que l'agent a dit en entier depuis la derniere parole du
+  // client ; repliqueAvantClient = ce qu'il avait dit juste avant elle, envoye en appel.replique aux outils de commande.
+  let repliqueEnCours = "", repliqueAvantClient = "";
   let recapTs = 0, clientApresRecap = false; // garde « pas d'enregistrement sans recapitulatif suivi d'une reponse du client »
   let audioReponseOctets = 0, debutReponseMs = 0; // audio mu-law envoye a Twilio pour la reponse en cours (8000 octets = 1 s)
   let premierSon = false, finParoleClientMs = 0; // mesure de la latence percue par l'appelant
@@ -710,6 +714,8 @@ wss.on("connection", (twilio, requete) => {
     const r = e.response || {};
     console.log(`[reponse] n°${respSeq} statut=${r.status || "?"}${r.status_details ? " " + JSON.stringify(r.status_details).slice(0, 200) : ""} audio=${(audioReponseOctets / 8000).toFixed(1)}s generee_en=${((Date.now() - debutReponseMs) / 1000).toFixed(1)}s texte=${texteReponse.length}car${pendingCalls.length ? " outils=" + pendingCalls.map((c) => c.name).join(",") : ""}${r.usage ? " usage=" + JSON.stringify(r.usage).slice(0, 200) : ""} ${t()} sid=${callSid}`);
     if (TOURS_PAR_LE_PONT) { reponseActive = false; generation = false; lacherRetenue(); } // Grok peut de nouveau entendre le client
+    // Une reponse coupee par le client n'a pas ete entendue en entier : elle ne compte pas comme dite.
+    if (texteReponse.trim() && respSeq !== reponseCoupee) repliqueEnCours = `${repliqueEnCours} ${texteReponse.trim()}`.trim().slice(-4000);
     pushAgent();
     if (RECAP_RE.test(texteReponse) || (/euro/i.test(texteReponse) && /\?/.test(texteReponse))) { recapTs = Date.now(); clientApresRecap = false; }
     // Dany a fini de GENERER, mais Twilio joue encore l'audio en file. On rouvre l'ecoute seulement au mark "agentdone"
@@ -800,6 +806,8 @@ wss.on("connection", (twilio, requete) => {
   function validerTour() {
     tourEnAttente = false;
     messageTransmisSansReponse = false; // le client a repondu apres le message transmis : raccrocher redevient possible
+    // La parole du client clot ce que l'agent venait de dire (une anticipation annulee revalide sans rien effacer).
+    if (repliqueEnCours) { repliqueAvantClient = repliqueEnCours; repliqueEnCours = ""; }
     if (!(grok && grok.readyState === WebSocket.OPEN)) return;
     grok.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
     tourClient = { idx: null };
@@ -1300,6 +1308,7 @@ wss.on("connection", (twilio, requete) => {
         catch (err) { out = { ok: false, erreur: err.message }; console.error(`[outil] ${c.name} KO`, err); }
       } else if (canalDV) {
         const commande = OUTILS_DE_COMMANDE.has(c.name);
+        if (commande && c.name === "enregistrer_commande") console.log(`[outil] enregistrer_commande : replique envoyee ${repliqueAvantClient ? `(${repliqueAvantClient.length} car) « …${repliqueAvantClient.slice(-160)} »` : "aucune"} ${t()}`);
         const reponse = await executerOutil({
           tenantId: canalDV.tenantId,
           agentSlug: canalDV.agentSlug,
@@ -1307,7 +1316,7 @@ wss.on("connection", (twilio, requete) => {
           args,
           sessionId: sessionIdDV,
           locale: canalDV.locale,
-          ...(commande ? { appel: { id: callSid, telephone: frPhone(fromNumber), recapConfirme: recapTs > 0 && clientApresRecap } } : {}),
+          ...(commande ? { appel: { id: callSid, telephone: frPhone(fromNumber), recapConfirme: recapTs > 0 && clientApresRecap, ...(repliqueAvantClient ? { replique: repliqueAvantClient.slice(-2000) } : {}) } } : {}),
         });
         // La plateforme renvoie { output } deja serialise ; null = elle n'a pas repondu.
         out = reponse?.output ?? { ok: false, erreur: "outil indisponible" };
