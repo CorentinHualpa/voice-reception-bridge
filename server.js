@@ -121,6 +121,12 @@ const REPONSE_IGNOREE_MS = Number(process.env.REPONSE_IGNOREE_MS || 1000);
 // une reponse d'apres outil, qu'il retardait d'environ 0,5 s. Mesures avec l'anticipation : reponses rapides 1,1 a
 // 1,6 s, reponses d'apres outil 1,9 a 2,35 s, pics de Grok au-dela de 2,7 s. Le seuil ne garde que les pics.
 const MMM_APRES_MS = Number(process.env.MMM_APRES_MS ?? 2400);
+// Appel de controle du 17/09 (15:34 UTC) : sur les tours avec outils plateforme, la relance est creee vers 1,7 s et son
+// premier son arrive vers 2,4 s, pile sur le seuil : le « Mmm » partait 40 ms avant la reponse et la retardait de ~0,8 s.
+// Un blocage de Grok, lui, se voit a une reponse CREEE depuis plus de 1,3 s sans aucun son (normal : 0,6 a 1,4 s).
+// Donc pas de « Mmm » tant que la reponse en cours a ete creee il y a moins de MMM_CREEE_DEPUIS_MS : il attend, et ne
+// part que si le son ne vient toujours pas.
+const MMM_CREEE_DEPUIS_MS = Number(process.env.MMM_CREEE_DEPUIS_MS || 1300);
 const MMM_TEXTE = process.env.MMM_TEXTE || "Mmm…";
 const sonsDAttente = new Map(); // "voix|vitesse|texte" -> Promise<Buffer mu-law | null>
 function sonDAttente(voix, vitesse) {
@@ -1170,7 +1176,9 @@ wss.on("connection", (twilio, requete) => {
       if (TOURS_PAR_LE_PONT) {
         if (attenteCreation && maintenant - creationDemandeeA > REPONSE_IGNOREE_MS) reponseIgnoree();
         if (attenteDepuis && MMM_APRES_MS > 0 && !tour && !transfert && !endRequested && maintenant - attenteDepuis >= MMM_APRES_MS
-          && maintenant >= finLecture && (generation || outilsEnCours || tourEnAttente)) jouerMmm(maintenant);
+          && maintenant >= finLecture && (generation || outilsEnCours || tourEnAttente)
+          && !(reponseActive && maintenant - debutReponseMs < MMM_CREEE_DEPUIS_MS) // son imminent : pas de « Mmm » devant
+          && !(generation && !reponseActive && maintenant - generationDemandeeA < 400)) jouerMmm(maintenant); // relance tout juste demandee
         // Seules les prises de parole partent a Grok (300 ms avant, 600 ms de silence apres) : son tampon ne
         // contient que ce que le client a dit, et un son ignore s'efface sans rien laisser.
         if (voix) {
