@@ -32,6 +32,8 @@ const pont = spawn(process.execPath, ["server.js"], {
     RECEPTION_PROMPT: AGENT.instructions, AGENT_NAME: "Dany", BUSINESS_NAME: "Motralec", AGENT_LANG: "fr",
     GROK_VOICE: AGENT.voice, GROK_REASONING: AGENT.reasoning, GROK_SPEED: String(AGENT.speed), GROK_VAD_THRESHOLD: "0.55", GROK_RATE: "8000",
     TOURS: MODE, ...(process.env.BARGE_IN ? { BARGE_IN: process.env.BARGE_IN } : {}), ...(process.env.FIN_DE_TOUR_MS ? { FIN_DE_TOUR_MS: process.env.FIN_DE_TOUR_MS } : {}),
+    // Réponse anticipée et « Mmm » d'attente (portés de palazzo-v1) : ANTICIPATION_MS=0 MMM_APRES_MS=0 pour l'ancien pont.
+    ...(process.env.ANTICIPATION_MS ? { ANTICIPATION_MS: process.env.ANTICIPATION_MS } : {}), ...(process.env.MMM_APRES_MS ? { MMM_APRES_MS: process.env.MMM_APRES_MS } : {}),
   },
 });
 const t0 = Date.now();

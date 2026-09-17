@@ -24,7 +24,7 @@
 import http from "http";
 import fs from "fs";
 import { WebSocketServer, WebSocket } from "ws";
-import { ulaw8kToPcm16, pcm16ToUlaw8k } from "./lib/audio.js";
+import { ulaw8kToPcm16, pcm16ToUlaw8k, ulawDecodeSample, ulawEncodeSample } from "./lib/audio.js";
 
 const PORT = process.env.PORT || 8080;
 const XAI_API_KEY = process.env.XAI_API_KEY;
@@ -78,6 +78,76 @@ const TOUR_MAX_MS = 20000;    // filet : une ligne trop bruyante ne garde pas le
 // GROK AVALE LA FIN DES QUESTIONS avec certaines voix (Palazzo, voix eve et autres voix feminines : 27 fins coupees
 // sur 27). Mesure le 17/09/2026 avec la voix leo de Dany : 0 sur 16. Consigne donc optionnelle.
 const EVITER_FIN_SUR_QUESTION = process.env.EVITER_FIN_SUR_QUESTION === "1";
+// LATENCE, portee de palazzo-v1 le 17/09/2026 (chantier Palazzo, appels reels et bancs, doctrine : skill agent-voice,
+// references/telephony-reception.md § 7 bis points 4 a 7).
+// REPONSE ANTICIPEE : un tour coutait l'attente de fin de phrase (FIN_DE_TOUR_MS) PUIS ~0,7 s de Grok. Des
+// ANTICIPATION_MS de silence, le pont valide deja la phrase et Grok genere ; le son n'est lache qu'a la fin du tour,
+// donc la fin de phrase n'est pas plus courte (un nom epele garde sa tolerance). Si le client reprend avant, la reponse
+// est annulee (response.cancel) et effacee (conversation.item.delete), et la suite de la phrase part a Grok : son
+// message du client reste ouvert apres un commit et la suite s'y ajoute. L'effacer puis renvoyer toute la phrase la
+// doublait chez le modele. ANTICIPATION_MS=0 remet l'ancien fonctionnement sans toucher au code.
+const ANTICIPATION_MS = Number(process.env.ANTICIPATION_MS ?? 400);
+const ANNULATION_VOIX_MS = 150; // voix du client apres le lancement qui annule l'anticipation (le seuil d'un son ignore)
+// REPONSE JAMAIS CREEE : un tour valide sans mot reconnaissable (« euh », « mmm ») ne cree aucun message chez Grok, qui
+// ignore alors response.create EN SILENCE (ni response.created ni erreur). Le filet attendait 8 s. En mode manuel,
+// response.created arrive 90 a 180 ms apres le commit : au-dela de REPONSE_IGNOREE_MS, la demande est perdue.
+const REPONSE_IGNOREE_MS = Number(process.env.REPONSE_IGNOREE_MS || 1000);
+// « MMM » D'ATTENTE : une reponse sur cinq, Grok met 2,7 a 3,7 s a parler (cote xAI). Quand rien n'est encore joue
+// MMM_APRES_MS apres la fin de phrase du client, qu'une reponse est en route et qu'elle est muette depuis
+// MMM_CREEE_DEPUIS_MS apres sa creation (signe d'un blocage, pas d'un son imminent), l'agent fait « Mmm… » dans sa
+// propre voix (Grok TTS, mu-law 8 kHz, produit une fois par voix). Une fois par tour. MMM_APRES_MS=0 le coupe.
+// ⚠ COUPE PAR DEFAUT pour Dany (0) : en demi-duplex, l'agent n'ecoute pas pendant son « Mmm », et au banc du 17/09
+// (4 blocages de Grok dans l'appel) l'appelant qui parlait juste apres le « Mmm », dans le blanc qui suit, a fait deux
+// tours parasites (« Hm. » → « Pardon, je n'ai pas bien saisi »). Sans lui, meme appel propre. MMM_APRES_MS=2400 l'active.
+const MMM_APRES_MS = Number(process.env.MMM_APRES_MS ?? 0);
+const MMM_CREEE_DEPUIS_MS = Number(process.env.MMM_CREEE_DEPUIS_MS || 1300);
+const MMM_TEXTE = process.env.MMM_TEXTE || "Mmm…";
+const sonsDAttente = new Map(); // "voix|vitesse|texte" -> Promise<Buffer mu-law | null>
+function sonDAttente(voix, vitesse) {
+  const cle = `${voix}|${vitesse}|${MMM_TEXTE}`;
+  if (!sonsDAttente.has(cle)) {
+    sonsDAttente.set(cle, (async () => {
+      try {
+        const r = await fetch("https://api.x.ai/v1/tts", {
+          method: "POST",
+          headers: { authorization: `Bearer ${XAI_API_KEY}`, "content-type": "application/json" },
+          body: JSON.stringify({ text: MMM_TEXTE, voice_id: voix, language: AGENT_LANG, output_format: { codec: "mulaw", sample_rate: 8000 }, speed: vitesse }),
+        });
+        if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 160)}`);
+        const son = rognerSon(Buffer.from(await r.arrayBuffer()));
+        if (!son.length) throw new Error("son vide");
+        console.log(`[attente] « ${MMM_TEXTE} » pret pour la voix ${voix} (${(son.length / 8000).toFixed(2)} s)`);
+        return son;
+      } catch (err) {
+        console.error(`[attente] « ${MMM_TEXTE} » impossible pour la voix ${voix} : ${err.message}`);
+        sonsDAttente.delete(cle); // l'appel suivant reessaie
+        return null;
+      }
+    })());
+  }
+  return sonsDAttente.get(cle);
+}
+// Le son rendu par la synthese commence et finit par du silence : chaque milliseconde gardee retarde la vraie
+// reponse qui le suit en file. On garde 20 ms avant la voix et 60 ms apres, en fondu pour eviter un clic.
+function rognerSon(ulaw) {
+  const n = Math.floor(ulaw.length / 160);
+  let premier = -1, dernier = -1;
+  for (let k = 0; k < n; k++) {
+    let s = 0;
+    for (let i = 0; i < 160; i++) { const v = ulawDecodeSample(ulaw[k * 160 + i]); s += v * v; }
+    if (Math.sqrt(s / 160) >= SEUIL_SON_RMS) { if (premier < 0) premier = k; dernier = k; }
+  }
+  if (premier < 0) return Buffer.alloc(0);
+  const debut = Math.max(0, premier - 1) * 160, fin = Math.min(n, dernier + 4) * 160;
+  const son = Buffer.from(ulaw.subarray(debut, fin));
+  const fondu = Math.min(320, son.length >> 2);
+  for (let i = 0; i < fondu; i++) {
+    son[i] = ulawEncodeSample(Math.round(ulawDecodeSample(son[i]) * (i / fondu)));
+    const j = son.length - 1 - i;
+    son[j] = ulawEncodeSample(Math.round(ulawDecodeSample(son[j]) * (i / fondu)));
+  }
+  return son;
+}
 function rmsPcm16(buf) {
   const n = buf.length >> 1;
   if (!n) return 0;
@@ -287,6 +357,17 @@ wss.on("connection", (twilio) => {
   let resteAudio = Buffer.alloc(0);
   let mediasVides = 0;
   let agentSpeaking = false, agentSpeakingSince = 0; // half-duplex anti-echo : tant que Dany parle (jusqu'a la fin de lecture Twilio, signalee par le mark "agentdone"), on ne renvoie PAS l'audio a Grok, sinon son propre echo declenche un faux tour et il enchaine les questions
+  let attenteCreation = false, creationDemandeeA = 0; // response.create envoye apres un commit, response.created pas encore recu
+  // Reponse anticipee (voir ANTICIPATION_MS) : { tour, etat "demandee" | "creee" | "finie", annulee, annuleeA, voixDepuis,
+  // audio (mu-law retenu jusqu'a la fin du tour), pretA, fin (response.done differe), items (de la reponse), closingAvant, depuis }
+  let anticipation = null;
+  const itemsAjoutes = new Set(); // elements reellement crees chez Grok : on n'efface que ceux-la
+  let suppressionsEnCours = 0;
+  let reponseAnticipee = 0, anticipeePreteA = 0; // pour le journal de latence de la reponse confirmee
+  // « Mmm » d'attente (voir MMM_APRES_MS) : fin de parole du client dont la reponse n'a encore rien fait entendre,
+  // indicateur pour le journal de latence, son pret pour la voix de cet appel.
+  let attenteDepuis = 0, mmmJusqua = 0, mmmAvantReponse = false;
+  let sonMmm = null;
 
   // Raccroche proprement : on laisse jouer l'audio de cloture deja envoye a Twilio (mark),
   // puis on ferme le flux Twilio -> Twilio termine l'appel -> twilio.on("close") -> finalize() -> recap.
@@ -316,6 +397,7 @@ wss.on("connection", (twilio) => {
     if (!BARGE_IN || finalized || !(TOURS_PAR_LE_PONT ? tour : parleSelonGrok)) return;
     const maintenant = Date.now();
     if (maintenant >= finLecture || maintenant < accueilProtegeJusqua) return; // rien d'audible, ou le debut de l'accueil
+    if (maintenant < mmmJusqua) return; // parler sur le « Mmm » d'attente ne jette pas la reponse qui arrive
     entenduSurAgent = true;
     if (voixRecenteMs > voixMaxTour) voixMaxTour = voixRecenteMs;
     if (voixRecenteMs >= PAROLE_COUPURE_MS && reponseCoupee !== respSeq) {
@@ -345,7 +427,142 @@ wss.on("connection", (twilio) => {
   function demanderReponse() {
     if (!(grok && grok.readyState === WebSocket.OPEN)) return;
     marquerGeneration();
+    attenteCreation = true; creationDemandeeA = Date.now();
     grok.send(JSON.stringify({ type: "response.create" }));
+  }
+  // Grok a ignore la demande (tour sans mot reconnu) : la voix retenue repart, rien n'attend plus.
+  function reponseIgnoree() {
+    attenteCreation = false;
+    attenteDepuis = 0; // aucune reponse ne vient : pas de « Mmm »
+    if (reponseAnticipee === -1) reponseAnticipee = 0;
+    console.log(`[tour] Grok n'a pas cree la reponse en ${Date.now() - creationDemandeeA} ms (aucun mot reconnu ?), la voix du client repart ${t()} sid=${callSid}`);
+    if (anticipation) {
+      const a = anticipation;
+      if (a.annulee) { finirAnnulation(null); return; }
+      // Rien n'a ete cree, donc rien a effacer. Le tour n'avait pas de mot : a sa fin, il sera ignore,
+      // sauf si de la vraie voix suit (sansMot garde la voix mesuree a ce moment-la).
+      anticipation = null;
+      a.tour.sansMot = a.tour.voixMs;
+      toursValides--;
+    }
+    generation = false; reponseActive = false;
+    lacherRetenue();
+    if (tourEnAttente && !tour) { validerTour(); demanderReponse(); }
+  }
+
+  // ---- Reponse anticipee (voir ANTICIPATION_MS) ----
+  const sansMot = (tr) => tr.sansMot !== undefined && tr.voixMs - tr.sansMot < ANNULATION_VOIX_MS;
+  const agentAudibleA = (maintenant) => maintenant < finLecture || (agentSpeaking && audioReponseOctets > 0);
+  // Seul un tour que finDuTour validerait est anticipe, et jamais pendant que l'agent est audible.
+  function peutAnticiper(maintenant) {
+    if (!ANTICIPATION_MS || FIN_DE_TOUR_MS - ANTICIPATION_MS < 200) return false;
+    if (!tour || sansMot(tour) || anticipation || generation || tourEnAttente || endRequested) return false;
+    if (!(grok && grok.readyState === WebSocket.OPEN && grokReady)) return false;
+    if (maintenant - tour.derniereVoix < ANTICIPATION_MS || agentAudibleA(maintenant)) return false;
+    const agentContinue = !tour.coupe && finLecture > tour.derniereVoix + 500;
+    const voixMinimale = tour.derniereVoix < accueilProtegeJusqua ? PAROLE_ACCUEIL_MS : PAROLE_COUPURE_MS;
+    return !(tour.voixMs < 150 || (agentContinue && tour.voixMs < voixMinimale));
+  }
+  function lancerAnticipation() {
+    anticipation = { tour, etat: "demandee", annulee: false, annuleeA: 0, voixDepuis: 0, audio: [], pretA: 0, fin: null, items: [], closingAvant: closingSaid, depuis: Date.now() };
+    console.log(`[tour] anticipe : ${Math.round(tour.voixMs)} ms de voix, dernier son a t+${((tour.derniereVoix - debutAppelMs) / 1000).toFixed(2)}, reponse lancee ${t()}`);
+    validerTour();
+    demanderReponse();
+  }
+  // Fin du tour confirmee : le son deja pret part, et ce qui attendait la fin de la reponse suit.
+  function confirmerAnticipation(fini) {
+    const a = anticipation;
+    anticipation = null;
+    retenue = []; // la fin du tour : du silence ou des sons trop brefs pour compter, comme un son ignore
+    finParoleClientMs = fini.derniereVoix;
+    console.log(`[tour] client : ${Math.round(fini.voixMs)} ms de voix, dernier son a t+${((fini.derniereVoix - debutAppelMs) / 1000).toFixed(2)}, reponse anticipee ${a.etat === "demandee" ? "pas encore creee" : a.audio.length ? "prete" : "en cours"} ${t()}`);
+    reponseAnticipee = a.etat === "demandee" ? -1 : respSeq; // -1 : numerotee a sa creation
+    anticipeePreteA = a.pretA;
+    attenteDepuis = fini.derniereVoix;
+    for (const u of a.audio) envoyerSonAgent(u);
+    if (a.etat === "finie") terminerReponse(a.fin);
+  }
+  // Le client reprend : la reponse lancee trop tot est annulee, puis effacee (finirAnnulation).
+  function annulerAnticipation(pourquoi) {
+    const a = anticipation;
+    if (!a || a.annulee) return;
+    a.annulee = true;
+    a.annuleeA = Date.now();
+    toursValides--;
+    console.log(`[tour] anticipation annulee : ${pourquoi} ${t()}`);
+    if (a.etat === "finie") { finirAnnulation(null); return; }
+    // Envoye avant response.created, l'annulation s'applique a la reponse des sa creation.
+    if (grok && grok.readyState === WebSocket.OPEN) grok.send(JSON.stringify({ type: "response.cancel" }));
+  }
+  function finirAnnulation(e) {
+    const a = anticipation;
+    anticipation = null;
+    if (e) console.log(`[reponse] n°${respSeq} statut=${e.response?.status || "?"} (anticipation annulee) texte=${agentBuf.length}car ${t()} sid=${callSid}`);
+    // Grok ne doit garder aucune trace de la reponse lancee trop tot. Le message du client, lui, reste : la suite s'y ajoute.
+    const aEffacer = a.items.filter((id) => itemsAjoutes.has(id));
+    if (grok && grok.readyState === WebSocket.OPEN) {
+      for (const id of aEffacer) { suppressionsEnCours++; grok.send(JSON.stringify({ type: "conversation.item.delete", item_id: id })); }
+    }
+    agentBuf = ""; closingSaid = a.closingAvant;
+    reponseCoupee = respSeq; agentSpeaking = false;
+    // La ligne du client reservee avec la phrase partielle : la transcription de la phrase entiere la remplacera.
+    if (tourClient && tourClient.idx != null && tourClient.idx === dialog.length - 1 && dialog[tourClient.idx].who === "Client") dialog.pop();
+    tourClient = null; userBuf = "";
+    reponseActive = false; generation = false; attenteCreation = false;
+    const suite = retenue.length;
+    lacherRetenue();
+    console.log(`[tour] anticipation effacee (${aEffacer.length} element${aEffacer.length > 1 ? "s" : ""}), la suite de la phrase repart (${(suite * 0.02).toFixed(1)} s) ${t()}`);
+    if (tourEnAttente && !tour) { validerTour(); demanderReponse(); }
+  }
+  // Le client attend et rien ne sort encore : « Mmm… » (voir MMM_APRES_MS), une fois par tour du client.
+  function jouerMmm(maintenant) {
+    const depuis = maintenant - attenteDepuis;
+    attenteDepuis = 0;
+    if (!sonMmm || !streamSid || twilio.readyState !== WebSocket.OPEN) return;
+    for (let o = 0; o < sonMmm.length; o += 800) {
+      twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: sonMmm.subarray(o, o + 800).toString("base64") } }));
+    }
+    finLecture = Math.max(finLecture, maintenant) + (sonMmm.length / 8000) * 1000;
+    mmmJusqua = finLecture;
+    mmmAvantReponse = true;
+    console.log(`[attente] « ${MMM_TEXTE} » ${depuis} ms apres la fin de parole du client ${t()} sid=${callSid}`);
+  }
+  // Son de l'agent vers Twilio, et mesure de la latence au premier son de chaque reponse.
+  function envoyerSonAgent(ulaw) {
+    attenteDepuis = 0;
+    twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: ulaw.toString("base64") } }));
+    finLecture = Math.max(finLecture, Date.now()) + (ulaw.length / 8000) * 1000;
+    audioReponseOctets += ulaw.length;
+    if (!premierSon) {
+      // LATENCE MESUREE : ce que l'appelant attend vraiment, depuis la fin de sa phrase.
+      premierSon = true;
+      if (accueilProtegeJusqua === Infinity) accueilProtegeJusqua = Date.now() + (respSeq === 1 ? ACCUEIL_PROTEGE_MS : 0);
+      console.log(`[latence] n°${respSeq} premier son ${Date.now() - debutReponseMs} ms apres la creation${finParoleClientMs ? `, ${Date.now() - finParoleClientMs} ms apres la fin de parole du client` : ""}${respSeq === reponseAnticipee ? ` (anticipee${anticipeePreteA ? `, prete ${anticipeePreteA - debutReponseMs} ms apres la creation` : ""})` : ""}${mmmAvantReponse ? " (apres « Mmm »)" : ""} ${t()} sid=${callSid}`);
+      finParoleClientMs = 0;
+      mmmAvantReponse = false;
+    }
+  }
+  // Fin d'une reponse de Grok : journal, queue de silence, mark de fin de lecture. Differee pour une reponse anticipee.
+  function terminerReponse(e) {
+    // JOURNAL PAR REPONSE : statut de Grok, secondes d'audio reellement envoyees a Twilio et duree de generation.
+    // Un texte trop long pour sa duree d'audio (~17 car/s) trahit une reponse arretee net par Grok.
+    const r = e.response || {};
+    console.log(`[reponse] n°${respSeq} statut=${r.status || "?"}${r.status_details ? " " + JSON.stringify(r.status_details).slice(0, 200) : ""} audio=${(audioReponseOctets / 8000).toFixed(1)}s generee_en=${((Date.now() - debutReponseMs) / 1000).toFixed(1)}s texte=${agentBuf.length}car ${t()} sid=${callSid}`);
+    if (TOURS_PAR_LE_PONT) { reponseActive = false; generation = false; lacherRetenue(); } // Grok peut de nouveau entendre le client
+    pushAgent();
+    // QUEUE DE SILENCE (Palazzo, 17/09/2026) : l'audio de Grok s'arrete sur la derniere syllabe, sans silence
+    // apres, et la fin se perd sur le trajet telephonique. 300 ms de silence laissent a la ligne le temps de la jouer.
+    if (streamSid && audioReponseOctets > 0 && respSeq !== reponseCoupee && twilio.readyState === WebSocket.OPEN) {
+      const silence = Buffer.alloc(2400, 0xff); // mu-law 0xFF = zero, 300 ms a 8 kHz
+      twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: silence.toString("base64") } }));
+      finLecture = Math.max(finLecture, Date.now()) + 300;
+    }
+    // Dany a fini de GENERER, mais Twilio joue encore l'audio en file. On rouvre l'ecoute seulement au mark "agentdone"
+    // (renvoye par Twilio quand la lecture est vraiment finie), pas maintenant, sinon on capte la fin de son propre audio.
+    if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `agentdone:${respSeq}` } }));
+    if (TOURS_PAR_LE_PONT && tourEnAttente && !tour) { validerTour(); demanderReponse(); } // le client a parle pendant la generation
+    else attenteDepuis = 0; // plus rien n'arrive pour ce tour : pas de « Mmm » apres coup
+    if (closeTriggered && !endRequested) requestHangup("cloture polie");
   }
   // La prise de parole devient un message du client dans la conversation de Grok.
   function validerTour() {
@@ -359,15 +576,17 @@ wss.on("connection", (twilio) => {
   function finDuTour() {
     const fini = tour;
     tour = null;
+    if (anticipation && anticipation.tour === fini && !anticipation.annulee) { confirmerAnticipation(fini); return; }
     // L'agent parle encore bien apres ce son : « mmm », « oui », un souffle. Sans BARGE_IN, ce qui est dit pendant
     // que l'agent est audible n'est meme pas compte (voir le handler media) : il ne reste ici que la voix d'avant son
     // premier son, par exemple la fin d'une phrase reprise juste apres une pause.
     const agentContinue = !fini.coupe && finLecture > fini.derniereVoix + 500;
     const pendantAccueil = fini.derniereVoix < accueilProtegeJusqua;
     const voixMinimale = pendantAccueil ? PAROLE_ACCUEIL_MS : PAROLE_COUPURE_MS;
-    if (fini.voixMs < 150 || (agentContinue && fini.voixMs < voixMinimale)) {
+    // sansMot : l'anticipation de ce tour a montre que Grok n'y reconnaissait aucun mot, et rien n'a suivi.
+    if (sansMot(fini) || fini.voixMs < 150 || (agentContinue && fini.voixMs < voixMinimale)) {
       toursIgnores++;
-      console.log(`[tour] son ignore : ${Math.round(fini.voixMs)} ms de voix${agentContinue ? " pendant que l'agent parle" : ""} ${t()}`);
+      console.log(`[tour] son ignore : ${Math.round(fini.voixMs)} ms de voix${sansMot(fini) ? " sans mot reconnu" : ""}${agentContinue ? " pendant que l'agent parle" : ""} ${t()}`);
       if (tourEnAttente) {
         // Une vraie prise de parole attend d'etre validee et son audio est dans le meme tampon : on garde le
         // tout (le son bref ne gene pas la transcription) plutot que d'effacer la question avec.
@@ -380,6 +599,7 @@ wss.on("connection", (twilio) => {
       return;
     }
     finParoleClientMs = fini.derniereVoix;
+    attenteDepuis = fini.derniereVoix;
     console.log(`[tour] client : ${Math.round(fini.voixMs)} ms de voix, dernier son a t+${((fini.derniereVoix - debutAppelMs) / 1000).toFixed(2)}${generation ? ", valide apres la reponse en cours" : ""} ${t()}`);
     if (generation) { tourEnAttente = true; return; }
     validerTour();
@@ -432,6 +652,7 @@ wss.on("connection", (twilio) => {
     if (!token) { console.error("[grok] pas de token"); return; }
 
     grok = new WebSocket(`wss://api.x.ai/v1/realtime?model=${GROK_MODEL}`, [`xai-client-secret.${token}`]);
+    if (TOURS_PAR_LE_PONT && MMM_APRES_MS > 0) sonDAttente(GROK_VOICE, GROK_SPEED).then((s) => { sonMmm = s; });
 
     grok.on("open", () => {
       const callerFr = frPhone(fromNumber);
@@ -479,12 +700,15 @@ wss.on("connection", (twilio) => {
           break;
         case "response.created":
           if (TOURS_PAR_LE_PONT) { marquerGeneration(); reponseActive = true; }
+          attenteCreation = false;
+          if (anticipation) anticipation.etat = "creee";
           resteAudio = Buffer.alloc(0);
           audioReponseOctets = 0; debutReponseMs = Date.now(); premierSon = false;
           pushUser(); // le tour du client est fini, l'agent repond
           respSeq++;
           agentSpeaking = true; agentSpeakingSince = Date.now(); // Dany commence a parler -> on coupe l'ecoute (anti-echo)
-          console.log(`[turn] ${AGENT_NAME} n°${respSeq} ${t()}`);
+          if (reponseAnticipee === -1) reponseAnticipee = respSeq;
+          console.log(`[turn] ${AGENT_NAME} n°${respSeq}${anticipation || reponseAnticipee === respSeq ? " (anticipee)" : ""} ${t()}`);
           break;
         case "response.output_audio.delta": {
           if (!e.delta || !streamSid || twilio.readyState !== WebSocket.OPEN) break;
@@ -497,42 +721,42 @@ wss.on("connection", (twilio) => {
           const pcm = Buffer.from(brut.subarray(0, pair)); // copie : offset pair, sinon Int16Array leve
           const ulaw = pcm16ToUlaw8k(pcm, GROK_RATE);
           if (ulaw.length === 0) { mediasVides++; break; }
-          twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: ulaw.toString("base64") } }));
-          finLecture = Math.max(finLecture, Date.now()) + (ulaw.length / 8000) * 1000;
-          audioReponseOctets += ulaw.length;
-          if (!premierSon) {
-            // LATENCE MESUREE : ce que l'appelant attend vraiment, depuis la fin de sa phrase.
-            premierSon = true;
-            if (accueilProtegeJusqua === Infinity) accueilProtegeJusqua = Date.now() + (respSeq === 1 ? ACCUEIL_PROTEGE_MS : 0);
-            console.log(`[latence] n°${respSeq} premier son ${Date.now() - debutReponseMs} ms apres la creation${finParoleClientMs ? `, ${Date.now() - finParoleClientMs} ms apres la fin de parole du client` : ""} ${t()} sid=${callSid}`);
-            finParoleClientMs = 0;
+          if (anticipation) { // la fin du tour n'est pas confirmee : le son attend
+            if (!anticipation.annulee) { if (!anticipation.pretA) anticipation.pretA = Date.now(); anticipation.audio.push(ulaw); }
+            break;
           }
+          envoyerSonAgent(ulaw);
           break;
         }
         case "response.output_audio_transcript.delta":
           if (e.delta) { agentBuf += e.delta; if (/remercie pour votre appel/i.test(agentBuf)) closingSaid = true; }
           break;
         case "response.done": {
-          // JOURNAL PAR REPONSE : statut de Grok, secondes d'audio reellement envoyees a Twilio et duree de generation.
-          // Un texte trop long pour sa duree d'audio (~17 car/s) trahit une reponse arretee net par Grok.
-          const r = e.response || {};
-          console.log(`[reponse] n°${respSeq} statut=${r.status || "?"}${r.status_details ? " " + JSON.stringify(r.status_details).slice(0, 200) : ""} audio=${(audioReponseOctets / 8000).toFixed(1)}s generee_en=${((Date.now() - debutReponseMs) / 1000).toFixed(1)}s texte=${agentBuf.length}car ${t()} sid=${callSid}`);
-          if (TOURS_PAR_LE_PONT) { reponseActive = false; generation = false; lacherRetenue(); } // Grok peut de nouveau entendre le client
-          pushAgent();
-          // QUEUE DE SILENCE (Palazzo, 17/09/2026) : l'audio de Grok s'arrete sur la derniere syllabe, sans silence
-          // apres, et la fin se perd sur le trajet telephonique. 300 ms de silence laissent a la ligne le temps de la jouer.
-          if (streamSid && audioReponseOctets > 0 && respSeq !== reponseCoupee && twilio.readyState === WebSocket.OPEN) {
-            const silence = Buffer.alloc(2400, 0xff); // mu-law 0xFF = zero, 300 ms a 8 kHz
-            twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: silence.toString("base64") } }));
-            finLecture = Math.max(finLecture, Date.now()) + 300;
+          if (anticipation) {
+            // Reponse anticipee : annulee, elle s'efface ; finie avant la fin du tour, tout attend la confirmation.
+            if (anticipation.annulee) finirAnnulation(e);
+            else { anticipation.etat = "finie"; anticipation.fin = e; reponseActive = false; }
+            break;
           }
-          // Dany a fini de GENERER, mais Twilio joue encore l'audio en file. On rouvre l'ecoute seulement au mark "agentdone"
-          // (renvoye par Twilio quand la lecture est vraiment finie), pas maintenant, sinon on capte la fin de son propre audio.
-          if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `agentdone:${respSeq}` } }));
-          if (TOURS_PAR_LE_PONT && tourEnAttente && !tour) { validerTour(); demanderReponse(); } // le client a parle pendant la generation
-          if (closeTriggered && !endRequested) requestHangup("cloture polie");
+          if (e.response?.status === "cancelled") { // le pont n'annule qu'une anticipation : reliquat d'une annulation deja soldee
+            console.log(`[reponse] n°${respSeq} statut=cancelled (reliquat) ${t()} sid=${callSid}`);
+            reponseActive = false; generation = false; agentBuf = "";
+            lacherRetenue();
+            break;
+          }
+          terminerReponse(e);
           break;
         }
+        case "conversation.item.added":
+          if (e.item?.id) itemsAjoutes.add(e.item.id);
+          // Ce que la reponse anticipee ajoute s'effacera avec elle si elle est annulee.
+          if (anticipation && anticipation.etat !== "demandee" && e.item?.id && e.item.role !== "user") anticipation.items.push(e.item.id);
+          if (!typesVus.has(e.type)) { typesVus.add(e.type); console.log(`[grok] ${e.type}${e.item?.type ? " " + e.item.type : ""} ${t()}`); }
+          break;
+        case "conversation.item.deleted":
+          suppressionsEnCours = Math.max(0, suppressionsEnCours - 1);
+          console.log(`[grok] ${e.type} ${t()}`);
+          break;
         case "conversation.item.input_audio_transcription.updated":
         case "conversation.item.input_audio_transcription.completed": // 15/09/2026 : xAI n'emet plus que .completed avec l'ancien schema ; sans lui, aucune ligne client et aucun recap
           setUser(e.transcript, false); // cumulatif ou final : remplace
@@ -560,8 +784,10 @@ wss.on("connection", (twilio) => {
         case "error":
           // Une erreur de Grok ne laissait aucune trace.
           console.error(`[grok] erreur ${JSON.stringify(e.error || e).slice(0, 300)} ${t()} sid=${callSid}`);
+          // Un effacement refuse (anticipation annulee) n'est pas un refus de reponse : rien a relacher.
+          if (suppressionsEnCours > 0 && /item/i.test(JSON.stringify(e.error || e))) { suppressionsEnCours--; break; }
           // Une demande de reponse refusee ne doit pas laisser la voix du client retenue pour toujours.
-          if (TOURS_PAR_LE_PONT && generation && !reponseActive) { generation = false; lacherRetenue(); }
+          if (TOURS_PAR_LE_PONT && generation && !reponseActive && !anticipation) { generation = false; attenteCreation = false; lacherRetenue(); }
           break;
         default:
           // Tout le reste une fois par appel, sauf ce qui peut expliquer une reponse perdue (annulation,
@@ -626,6 +852,11 @@ wss.on("connection", (twilio) => {
       if (TOURS_PAR_LE_PONT) {
         // Seules les prises de parole partent a Grok (300 ms avant, FIN_DE_TOUR_MS de silence apres) : son tampon ne
         // contient que ce que le client a dit, et un son ignore s'efface sans rien laisser.
+        if (attenteCreation && maintenant - creationDemandeeA > REPONSE_IGNOREE_MS) reponseIgnoree();
+        if (attenteDepuis && MMM_APRES_MS > 0 && !tour && !endRequested && maintenant - attenteDepuis >= MMM_APRES_MS
+          && !agentAudibleA(maintenant) && (generation || tourEnAttente)
+          && !(reponseActive && maintenant - debutReponseMs < MMM_CREEE_DEPUIS_MS) // son imminent : pas de « Mmm » devant
+          && !(generation && !reponseActive && maintenant - generationDemandeeA < 400)) jouerMmm(maintenant); // relance tout juste demandee
         if (voix) {
           if (!tour) {
             tour = { debut: maintenant, voixMs: 0, derniereVoix: maintenant, coupe: false };
@@ -636,10 +867,14 @@ wss.on("connection", (twilio) => {
           }
           tour.voixMs += paquetMs;
           tour.derniereVoix = maintenant;
+          if (anticipation && anticipation.tour === tour && !anticipation.annulee && (anticipation.voixDepuis += paquetMs) >= ANNULATION_VOIX_MS) {
+            annulerAnticipation(`le client reprend (${Math.round(anticipation.voixDepuis)} ms de voix)`);
+          }
         }
         if (tour) {
           if (!sourd) envoyerAGrok([pcm]);
           verifierCoupure();
+          if (tour && !voix && peutAnticiper(maintenant)) lancerAnticipation();
           if (tour && ((!voix && maintenant - tour.derniereVoix >= FIN_DE_TOUR_MS) || maintenant - tour.debut > TOUR_MAX_MS)) finDuTour();
         } else if (sourd) {
           preroll.length = 0; // l'echo de l'agent ne doit pas preceder la prochaine prise de parole
@@ -681,14 +916,19 @@ wss.on("connection", (twilio) => {
   const inactivityTimer = setInterval(() => {
     // Filet : une reponse demandee qui ne vient jamais (8 s) ou qui ne se termine jamais (30 s) ne doit pas
     // garder la voix du client retenue ; Grok a deja abandonne des reponses sans response.done.
-    if (TOURS_PAR_LE_PONT && generation && !finalized) {
+    if (TOURS_PAR_LE_PONT && generation && !finalized && !anticipation) {
       const depuis = Date.now() - generationDemandeeA;
       if ((!reponseActive && depuis > 8000) || depuis > 30000) {
         console.log(`[tour] reponse jamais terminee (${Math.round(depuis / 1000)} s), la voix du client repart ${t()} sid=${callSid}`);
-        generation = false; reponseActive = false;
+        generation = false; reponseActive = false; attenteCreation = false;
         lacherRetenue();
         if (tourEnAttente && !tour) { validerTour(); demanderReponse(); }
       }
+    }
+    // Filets de l'anticipation : un tour tenu ouvert par des bruits, ou une annulation jamais soldee par Grok.
+    if (anticipation && !finalized) {
+      if (!anticipation.annulee && Date.now() - anticipation.depuis > 10000) annulerAnticipation("plus de 10 s sans fin de tour");
+      else if (anticipation.annulee && Date.now() - anticipation.annuleeA > 5000) finirAnnulation(null);
     }
     if (finalized || endRequested) return;
     if (!(grok && grok.readyState === WebSocket.OPEN && grokReady)) return;
