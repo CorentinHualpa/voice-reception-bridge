@@ -120,7 +120,9 @@ const REPONSE_IGNOREE_MS = Number(process.env.REPONSE_IGNOREE_MS || 1000);
 // Seuil a 2,4 s (repetition de demo du 17/09, choix de Coq) : a 1,8 s il partait sur 4 tours sur 6, dont 3 juste avant
 // une reponse d'apres outil, qu'il retardait d'environ 0,5 s. Mesures avec l'anticipation : reponses rapides 1,1 a
 // 1,6 s, reponses d'apres outil 1,9 a 2,35 s, pics de Grok au-dela de 2,7 s. Le seuil ne garde que les pics.
-const MMM_APRES_MS = Number(process.env.MMM_APRES_MS ?? 2400);
+// ⛔ COUPE PAR DEFAUT (17/09/2026, Coq apres ecoute : « pas du tout naturel »). Le mecanisme reste en place pour un
+// autre son ou une autre parade, mais aucun « Mmm » ne part tant que MMM_APRES_MS n'est pas pose sur le service.
+const MMM_APRES_MS = Number(process.env.MMM_APRES_MS ?? 0);
 // Appel de controle du 17/09 (15:34 UTC) : sur les tours avec outils plateforme, la relance est creee vers 1,7 s et son
 // premier son arrive vers 2,4 s, pile sur le seuil : le « Mmm » partait 40 ms avant la reponse et la retardait de ~0,8 s.
 // Un blocage de Grok, lui, se voit a une reponse CREEE depuis plus de 1,3 s sans aucun son (normal : 0,6 a 1,4 s).
