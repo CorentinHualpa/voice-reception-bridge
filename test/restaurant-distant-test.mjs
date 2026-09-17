@@ -83,6 +83,7 @@ await cas("un ingrédient épuisé retire la pizza du chiffrage et bloque l'enre
   const e = await p.runAsync("enregistrer_commande", { prenom: "Ana", heure_retrait: "20:00", articles: [{ produit: "Salmon Joe", quantite: 1 }] }, { dv: DV, callSid: "S" });
   assert.equal(e.ok, false);
   assert.match(p.contexteAppel(), /Plus disponible aujourd'hui : Salmon Joe \(plus de saumon fumé\)/);
+  assert.match(p.contexteAppel(), /sans jamais chercher dans la base de connaissance/);
 });
 
 await cas("un stock limité plafonne, se décrémente après l'écriture, puis bloque", async () => {
