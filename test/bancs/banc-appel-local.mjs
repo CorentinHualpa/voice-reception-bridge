@@ -57,6 +57,12 @@ const pont = spawn(process.execPath, ["server.js"], {
     // Comme Palazzo en production : 900 ms d'attente de fin de phrase (silenceMs de l'agent). ANTICIPATION_MS=0 pour comparer.
     FIN_DE_TOUR_MS: process.env.FIN_DE_TOUR_MS || String(session.silenceMs || 900), ANTICIPATION_MS: process.env.ANTICIPATION_MS ?? "400", JOURNAL_DIALOGUE: "1",
     MMM_APRES_MS: process.env.MMM_APRES_MS ?? "2400", // un seuil bas (700) force le « Mmm » d'attente pour l'entendre
+    // Parades aux pics de Grok (17/09). HEDGE_APRES_MS=300 fait doubler CHAQUE tour, pour voir la doublure a
+    // l'oeuvre sans attendre un vrai blocage ; AMBIANCE_APRES_MS=600 remplit tous les blancs, pour l'entendre.
+    ...(process.env.HEDGE_APRES_MS ? { HEDGE_APRES_MS: process.env.HEDGE_APRES_MS } : {}),
+    ...(process.env.AMBIANCE_APRES_MS ? { AMBIANCE_APRES_MS: process.env.AMBIANCE_APRES_MS } : {}),
+    ...(process.env.AMBIANCE_GAIN ? { AMBIANCE_GAIN: process.env.AMBIANCE_GAIN } : {}),
+    ...(process.env.AMBIANCE_FICHIER ? { AMBIANCE_FICHIER: process.env.AMBIANCE_FICHIER } : {}),
   },
 });
 const t0 = Date.now();
@@ -214,5 +220,5 @@ h.writeUInt16LE(1, 20); h.writeUInt16LE(2, 22); h.writeUInt32LE(8000, 24); h.wri
 h.write("data", 36); h.writeUInt32LE(data.length, 40);
 fs.writeFileSync(`${S}/${NOM}.wav`, Buffer.concat([h, data]));
 fs.writeFileSync(`${S}/${NOM}.log`, journal.join("\n"));
-console.log(journal.filter((l) => /\[banc\]|\[tour\]|\[latence\]|\[reponse\]|coupe|erreur|\[session\]|\[son\]|jamais/.test(l)).map((l) => l.replace(/ sid=CA\w+/, "").slice(0, 230)).join("\n"));
+console.log(journal.filter((l) => /\[banc\]|\[tour\]|\[latence\]|\[reponse\]|coupe|erreur|\[session\]|\[son\]|\[doublure\]|\[ambiance\]|jamais/.test(l)).map((l) => l.replace(/ sid=CA\w+/, "").slice(0, 230)).join("\n"));
 process.exit(0);
