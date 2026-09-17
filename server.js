@@ -128,6 +128,17 @@ const MMM_APRES_MS = Number(process.env.MMM_APRES_MS ?? 2400);
 // part que si le son ne vient toujours pas.
 const MMM_CREEE_DEPUIS_MS = Number(process.env.MMM_CREEE_DEPUIS_MS || 1300);
 const MMM_TEXTE = process.env.MMM_TEXTE || "Mmm…";
+// FINS DE PHRASE AVALEES (diagnostic du 17/09/2026, bancs test/bancs/banc-fin-coupee*.mjs). Grok lache le dernier
+// signe d'une reponse, et avec lui la fin de la derniere syllabe, quand ce signe est un « ? » PRECEDE D'UNE ESPACE,
+// comme le veut la typographie francaise : « Très bien. C'est pour quel prénom ? » s'entend « …pour quel prix ? »
+// 3 fois sur 3, « …prénom? » 0 fois sur 3 ; « Vous la prenez ? » 2 sur 3, « prenez? » 0 sur 3. Ni le format audio
+// (8, 16, 24 kHz, mu-law), ni la vitesse (1,0 a 1,2), ni la ligne n'y sont pour rien : aucun son n'arrive apres
+// response.done, la transcription de Grok perd elle aussi son « ? ». Le modele imite la typographie de sa consigne :
+// on retire ces espaces de TOUT ce qui lui est envoye, et on lui demande de coller le « ? » (banc en conversation :
+// plus aucune espace ecrite, aucune fin avalee). TYPO_COLLEE=0 remet le texte tel quel.
+const TYPO_COLLEE = process.env.TYPO_COLLEE !== "0";
+const collerPonctuation = (s) => (TYPO_COLLEE && typeof s === "string" ? s.replace(/[   ]+([?!;:])/g, "$1") : s);
+const CONSIGNE_PONCTUATION = "Écriture de tes réponses : le point d'interrogation et le point d'exclamation se collent au mot qui précède, sans espace avant (« C'est pour quel prénom? », « Parfait! »). Jamais « prénom ? » : au téléphone, cette espace fait avaler la fin de ta phrase.";
 const sonsDAttente = new Map(); // "voix|vitesse|texte" -> Promise<Buffer mu-law | null>
 function sonDAttente(voix, vitesse) {
   const cle = `${voix}|${vitesse}|${MMM_TEXTE}`;
@@ -707,6 +718,11 @@ wss.on("connection", (twilio, requete) => {
   // Fin d'une reponse de Grok : journal, queue de silence, outils, relances. Differee pour une reponse anticipee.
   function terminerReponse(e) {
     const texteReponse = agentBuf;
+    // Surveillance des fins avalees : une transcription de Grok qui finit sans ponctuation a perdu son dernier signe,
+    // et sa derniere syllabe avec (voir TYPO_COLLEE). Hors reponse coupee par le client, qui s'arrete forcement net.
+    if (texteReponse.trim() && respSeq !== reponseCoupee && !/[.?!…»"')\]]\s*$/.test(texteReponse.trim())) {
+      console.log(`[coupure] fin avalee probable n°${respSeq} : « …${texteReponse.trim().slice(-70)} » ${t()} sid=${callSid}`);
+    }
     // JOURNAL PAR REPONSE (16/09/2026) : une phrase d'accueil de 17 s s'est arretee au milieu chez le client
     // alors que la transcription etait complete, et rien dans le journal ne permettait de dire si Grok avait
     // tronque l'audio ou si la ligne l'avait perdu. Le statut de Grok, ses details, les secondes d'audio
@@ -949,8 +965,9 @@ wss.on("connection", (twilio, requete) => {
         carteAjoutee,
         "Au téléphone, un silence de ta part laisse le client dans le vide. Ne termine jamais une réponse sur une simple confirmation (« Oui, vingt-deux heures est possible. ») : enchaîne dans la même réponse sur l'étape suivante, par une question. Seul l'au revoir final ne pose pas de question.",
         "Au téléphone, ta voix avale la fin d'une réponse qui se termine sur une question. Ne finis donc jamais sur le point d'interrogation : après ta question, ajoute toujours deux ou trois mots, variés d'une fois sur l'autre (« Je vous écoute. », « Dites-moi. », « Prenez votre temps. »).",
+        TYPO_COLLEE ? CONSIGNE_PONCTUATION : "",
       ].filter(Boolean).join("\n");
-      const sessionInstructions = contexte ? `${instructionsBase}\n\n# Contexte de cet appel\n${contexte}` : instructionsBase;
+      const sessionInstructions = collerPonctuation(contexte ? `${instructionsBase}\n\n# Contexte de cet appel\n${contexte}` : instructionsBase);
       // Le transfert n'est offert que si l'appel peut vraiment basculer : un numero lisible et les
       // identifiants Twilio du numero appele. Il remplace alors request_handoff de Dale Voz, qui ne
       // fait qu'ouvrir une demande dans la messagerie : au telephone, le client attendrait pour rien.
@@ -1003,7 +1020,7 @@ wss.on("connection", (twilio, requete) => {
             const accueil = typeof sessionDV?.greeting === "string" ? sessionDV.greeting.trim() : "";
             if (TOURS_PAR_LE_PONT) marquerGeneration();
             grok.send(JSON.stringify(accueil
-              ? { type: "response.create", response: { instructions: `Dis exactement cette phrase, mot pour mot, sans rien ajouter avant ni apres, avec le sourire et beaucoup d'entrain, comme une Italienne ravie d'accueillir, puis ecoute : « ${accueil} »` } }
+              ? { type: "response.create", response: { instructions: `Dis exactement cette phrase, mot pour mot, sans rien ajouter avant ni apres, avec le sourire et beaucoup d'entrain, comme une Italienne ravie d'accueillir, puis ecoute : « ${collerPonctuation(accueil)} »` } }
               : { type: "response.create" }));
           } // salut une fois
           break;
@@ -1246,7 +1263,7 @@ wss.on("connection", (twilio, requete) => {
   // Fait parler Dany via une instruction systeme injectee (check-in ou conge).
   function promptGrok(text) {
     try {
-      grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text }] } }));
+      grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text: collerPonctuation(text) }] } }));
       if (TOURS_PAR_LE_PONT) marquerGeneration();
       grok.send(JSON.stringify({ type: "response.create" }));
     } catch {}
@@ -1329,7 +1346,8 @@ wss.on("connection", (twilio, requete) => {
       console.log(`[outil] ${c.name} ${JSON.stringify(args)} -> ${sortie.slice(0, 300)} ${t()}`);
       dialog.push({ who: "Outil", msg: `${c.name} ${JSON.stringify(args)} -> ${sortie}` });
       if (!(grok && grok.readyState === WebSocket.OPEN)) return;
-      grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: c.callId, output: sortie } }));
+      // Le recapitulatif et les consignes rendus par les outils sont repris tels quels par le modele : meme typographie.
+      grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: c.callId, output: collerPonctuation(sortie) } }));
     }
     // Ce que le client a dit pendant la reponse ou les outils entre dans la conversation avant la relance.
     const tourPendant = TOURS_PAR_LE_PONT && tourEnAttente && !tour;
