@@ -484,6 +484,7 @@ wss.on("connection", (twilio, requete) => {
   let finDeTourMs = FIN_DE_TOUR_MS;                 // remplace par le reglage de l'agent Dale Voz a l'ouverture
   let relanceOutilDemandee = false, reponseApresOutil = false; // la relance de suite ne vaut qu'apres un outil
   let clotureVerifiee = false; // garde « commande annoncee sans enregistrement » : une seule consigne par appel
+  let messageTransmisSansReponse = false; // garde « pas de raccrochage juste apres transmettre_message »
   let recapTs = 0, clientApresRecap = false; // garde « pas d'enregistrement sans recapitulatif suivi d'une reponse du client »
   let audioReponseOctets = 0, debutReponseMs = 0; // audio mu-law envoye a Twilio pour la reponse en cours (8000 octets = 1 s)
   let premierSon = false, finParoleClientMs = 0; // mesure de la latence percue par l'appelant
@@ -792,6 +793,7 @@ wss.on("connection", (twilio, requete) => {
   // La prise de parole devient un message du client dans la conversation de Grok.
   function validerTour() {
     tourEnAttente = false;
+    messageTransmisSansReponse = false; // le client a repondu apres le message transmis : raccrocher redevient possible
     if (!(grok && grok.readyState === WebSocket.OPEN)) return;
     grok.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
     tourClient = { idx: null };
@@ -1246,15 +1248,25 @@ wss.on("connection", (twilio, requete) => {
   }
   async function executerOutils(calls) {
     if (!(grok && grok.readyState === WebSocket.OPEN)) return;
+    const audioDeLaReponse = audioReponseOctets; // ce que la reponse qui appelle ces outils a deja dit
+    let raccroche = false;
     for (const c of calls) {
       let args = {};
       try { args = JSON.parse(c.args || "{}"); } catch {}
       // Commande modifiee : un nouveau recapitulatif est exige, quel que soit l'executant de l'outil.
       if (c.name === "chiffrer_commande") { recapTs = 0; clientApresRecap = false; }
       let out;
-      if (c.name === "end_call") {
+      if (c.name === "end_call" && messageTransmisSansReponse) {
+        // GARDE (17/09/2026, repetition de demo) : « Lorenzo vous rappellera… », end_call dans la meme reponse, et le
+        // client raccroche au nez sans avoir pu donner son prenom. Apres un message transmis, on ne raccroche pas tant
+        // que le client n'a pas repondu. Refuse une fois : si l'agent insiste, le second essai passe.
+        messageTransmisSansReponse = false;
+        out = { ok: false, erreur: "raccrochage refusé", consigne: "Ne raccroche pas maintenant : tu viens de transmettre un message et le client n'a pas encore répondu. Demande-lui en une phrase courte s'il y a autre chose pour lui, puis attends sa réponse." };
+        console.log(`[garde] raccrochage refuse juste apres un message transmis ${t()} sid=${callSid}`);
+      } else if (c.name === "end_call") {
         // Outil de Dale Voz : cote web la surface raccroche, ici c'est Twilio.
         out = { ok: true };
+        raccroche = true;
         setTimeout(() => requestHangup("end_call"), 1500);
       } else if (c.name === "transferer_appel") {
         const qui = TRANSFERT_NOM || "quelqu'un de l'équipe";
@@ -1295,6 +1307,7 @@ wss.on("connection", (twilio, requete) => {
       } else {
         out = { ok: false, erreur: `outil inconnu ${c.name}` };
       }
+      if (c.name === "transmettre_message") messageTransmisSansReponse = true;
       const sortie = typeof out === "string" ? out : JSON.stringify(out);
       console.log(`[outil] ${c.name} ${JSON.stringify(args)} -> ${sortie.slice(0, 300)} ${t()}`);
       dialog.push({ who: "Outil", msg: `${c.name} ${JSON.stringify(args)} -> ${sortie}` });
@@ -1304,6 +1317,12 @@ wss.on("connection", (twilio, requete) => {
     // Ce que le client a dit pendant la reponse ou les outils entre dans la conversation avant la relance.
     const tourPendant = TOURS_PAR_LE_PONT && tourEnAttente && !tour;
     if (tourPendant) validerTour();
+    // L'au revoir est deja dit dans la reponse qui raccroche : la relancer faisait partir un second « À tout à
+    // l'heure ! » pendant le raccrochage (repetition de demo du 17/09). Sans au revoir dit, la relance le fait dire.
+    if (raccroche && audioDeLaReponse > 0 && calls.every((c) => c.name === "end_call")) {
+      console.log(`[outil] end_call : pas de relance, l'au revoir est deja dit ${t()} sid=${callSid}`);
+      return;
+    }
     if (relancesOutils < MAX_RELANCES_OUTILS || tourPendant) {
       relancesOutils++;
       relanceOutilDemandee = true;

@@ -34,6 +34,18 @@ const MORCEAUX = {
 // SCENARIO=anticipation : « Attendez, en fait… (pause de 460 ms) …est-ce que vous faites des pizzas sans gluten ? »
 // dit quand l'agent se tait (l'anticipation part dans la pause puis s'annule), un bruit sans mot, puis la question.
 const SCENARIO = process.env.SCENARIO || "complet";
+// SCENARIO=lorenzo : « je voudrais parler à Lorenzo », « Marc », puis « non merci, au revoir » (voix rex de Grok TTS,
+// produite au lancement). Sert aux gardes de fin d'appel : pas de raccrochage juste après transmettre_message, pas de
+// relance après un end_call dont l'au revoir est déjà dit.
+if (SCENARIO === "lorenzo") {
+  const dire = async (texte) => {
+    const r = await fetch("https://api.x.ai/v1/tts", { method: "POST", headers: { authorization: `Bearer ${CLE}`, "content-type": "application/json" }, body: JSON.stringify({ text: texte, voice_id: "rex", language: "fr", output_format: { codec: "mulaw", sample_rate: 8000 } }) });
+    return Buffer.from(await r.arrayBuffer());
+  };
+  MORCEAUX.lorenzo = await dire("Bonjour, je voudrais parler à Lorenzo, c'est pour une commande de groupe samedi.");
+  MORCEAUX.marc = await dire("Marc.");
+  MORCEAUX.aurevoir = await dire("Non merci, ce sera tout. Au revoir.");
+}
 
 const journal = [];
 const pont = spawn(process.execPath, ["server.js"], {
@@ -129,6 +141,24 @@ const silenceAgent = (ms) => () => sonsAgent > 0 && !agentParle() && Date.now() 
 
 // Scénario
 await jusqua(silenceAgent(1000), 30000);                 // accueil fini
+if (SCENARIO === "lorenzo") {
+  for (const nom of ["lorenzo", "marc", "aurevoir"]) {
+    await jouer(nom);
+    const n = sonsAgent;
+    await jusqua(() => sonsAgent > n, 15000);
+    await jusqua(silenceAgent(1500), 40000);
+  }
+  await attendre(4000);
+  fini = true;
+  envoyer({ event: "stop", streamSid: "MZbanc" });
+  await attendre(1500);
+  ws.close();
+  pont.kill();
+  fs.writeFileSync(`${S}/${NOM}.log`, journal.join("\n"));
+  const iDialogue = journal.findIndex((l) => /\[dialogue\]/.test(l));
+  console.log(journal.filter((l, i) => /\[banc\]|\[tour\] client|\[latence\]|\[outil\]|\[garde\]|hangup|erreur/.test(l) || (iDialogue >= 0 && i > iDialogue)).map((l) => l.replace(/ sid=CA\w+/, "").slice(0, 230)).join("\n"));
+  process.exit(0);
+}
 if (SCENARIO === "anticipation") {
   await jouer("attendez");
   let n = sonsAgent;
