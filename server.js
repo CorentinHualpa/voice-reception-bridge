@@ -797,7 +797,10 @@ wss.on("connection", (twilio, requete) => {
     // Ce qui vient d'etre dit est consomme : la prochaine reponse aura besoin d'une entree a elle. ⚠ Ne PAS
     // remettre ce drapeau a chaque validation de tour : une anticipation annulee revalide le meme tour, dont la
     // transcription est deja arrivee et ne reviendra pas, et on jetterait une reponse parfaitement legitime.
-    if (agentBuf.trim() && respSeq !== reponseCoupee) consommerEntreeClient();
+    // Consommee meme si le client a coupe : il a coupe pour dire autre chose, la prochaine reponse repondra
+    // a CETTE nouvelle parole. Sans cela, une reponse coupee laissait son entree disponible et la suivante
+    // pouvait la redire (banc : la reponse sur le gluten dite deux fois).
+    if (agentBuf.trim()) consommerEntreeClient();
     const texteReponse = agentBuf;
     // Surveillance des fins avalees : une transcription de Grok qui finit sans ponctuation a perdu son dernier signe,
     // et sa derniere syllabe avec (voir TYPO_COLLEE). Hors reponse coupee par le client, qui s'arrete forcement net.
@@ -981,12 +984,12 @@ wss.on("connection", (twilio, requete) => {
           if (texte) {
             try { grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "assistant", content: [{ type: "output_text", text: texte }] } })); } catch {}
             pushLine("Agent", texte);
+            consommerEntreeClient(); // la doublure a repondu : l'entree du tour est consommee, coupee ou non
             // Coupee par le client : le tour n'a pas ete entendu en entier, il ne compte pas comme dit (meme
             // regle que pour la primaire, cf. terminerReponse).
             if (reponseCoupee !== tourDoublure.marque) {
               repliqueEnCours = `${repliqueEnCours} ${texte}`.trim().slice(-4000);
               if (CLOSING_RE.test(texte)) closingSaid = true;
-              consommerEntreeClient(); // la doublure a repondu : l'entree du tour est consommee
             }
           }
           console.log(`[doublure] reponse n°${tourDoublure.marque} finie (${statut}), ${texte.length} car${reponseCoupee === tourDoublure.marque ? ", coupee par le client" : ""}${texte ? ` : « ${texte.slice(0, 120)} »` : ""} ${t()} sid=${callSid}`);
