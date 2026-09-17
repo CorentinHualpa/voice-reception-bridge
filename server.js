@@ -30,8 +30,12 @@ import { createPizzeria } from "./lib/pizzeria.js";
 import {
   chargerSession,
   dalevozActif,
+  ecrireCommandeRestaurant,
+  ecrireRappelRestaurant,
   enregistrerAppel,
   executerOutil,
+  lireRestaurant,
+  pousserCarteRestaurant,
   resoudreNumero,
   signatureTwilioValide,
 } from "./lib/dalevoz.js";
@@ -120,6 +124,11 @@ const pizzeria = process.env.AGENT_TOOLS === "pizzeria"
       maxPizzas: Number(process.env.MAX_PIZZAS || 20),
       services: process.env.SERVICES || "11:30-14:30,18:30-22:30",
       timeZone: process.env.TIME_ZONE || "Europe/Paris",
+      // Le tableau du restaurant dans Dale Voz (17/09/2026) : commandes et rappels y sont ecrits,
+      // pause, delai, ruptures et quarts fermes y sont relus. Sans Dale Voz, tout reste local.
+      distant: dalevozActif
+        ? { lireEtat: lireRestaurant, ecrireCommande: ecrireCommandeRestaurant, ecrireRappel: ecrireRappelRestaurant, pousserCarte: pousserCarteRestaurant }
+        : null,
     })
   : null;
 
@@ -354,7 +363,7 @@ const server = http.createServer((req, res) => {
       console.log(`[transfert] fin statut=${statut} duree=${post.DialCallDuration || 0}s sid=${post.CallSid}`);
       if (statut !== "completed" && statut !== "answered" && pizzeria) {
         // Personne n'a decroche : l'equipe doit rappeler, comme pour un message transmis.
-        pizzeria.run("transmettre_message", {
+        pizzeria.runAsync("transmettre_message", {
           motif: `Voulait parler à ${TRANSFERT_NOM || "un humain"}, transfert sans réponse (${statut || "inconnu"})`,
         }, { callSid: post.CallSid || null, from: frPhone(post.From) });
       }
@@ -609,6 +618,13 @@ wss.on("connection", (twilio, requete) => {
         else {
           if (typeof sessionDV.telephone?.couperLaParole === "boolean") bargeIn = sessionDV.telephone.couperLaParole;
           console.log(`[dalevoz] agent ${canalDV.agentSlug} (${sessionDV.tools?.length ?? 0} outils, coupure ${bargeIn ? "oui" : "non"}) pour ${toNumber}`);
+        }
+        // Ce que la tablette du restaurant a regle (pause, ruptures...) doit etre dans le contexte
+        // de CET appel, qui part juste apres. Plafonne : un Dale Voz lent ne retarde pas le decroche.
+        if (pizzeria) {
+          const t0 = Date.now();
+          await Promise.race([pizzeria.rafraichir({ tenantId: canalDV.tenantId, agentSlug: canalDV.agentSlug }, { forcer: true }), new Promise((r) => setTimeout(r, 1500))]);
+          console.log(`[restaurant] etat relu en ${Date.now() - t0} ms`);
         }
       }
     }
@@ -1004,7 +1020,14 @@ wss.on("connection", (twilio, requete) => {
         }
       } else if (outilLocal(c.name)) {
         if (c.name === "chiffrer_commande") { recapTs = 0; clientApresRecap = false; } // commande modifiee : nouveau recapitulatif exige
-        try { out = pizzeria.run(c.name, args, { callSid, from: frPhone(fromNumber), recapConfirme: recapTs > 0 && clientApresRecap }); }
+        try {
+          out = await pizzeria.runAsync(c.name, args, {
+            callSid,
+            from: frPhone(fromNumber),
+            recapConfirme: recapTs > 0 && clientApresRecap,
+            dv: canalDV ? { tenantId: canalDV.tenantId, agentSlug: canalDV.agentSlug } : null,
+          });
+        }
         catch (err) { out = { ok: false, erreur: err.message }; console.error(`[outil] ${c.name} KO`, err); }
       } else if (canalDV) {
         const reponse = await executerOutil({
