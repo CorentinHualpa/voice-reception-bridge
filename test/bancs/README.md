@@ -20,3 +20,30 @@ La session jouée est `fixtures/session-palazzo.json` (ce que Dale Voz servait a
 | `banc-doublure.mjs` | Le module `lib/doublure.js` seul, sans Twilio ni pont : elle s'ouvre, reçoit un historique en texte, répond, et ne redit pas ce qu'on lui a fait dire. | `node test/bancs/banc-doublure.mjs` | prête en ~1,4 s ; répond en 0,9 s ; après une réponse injectée qu'elle n'a pas produite, elle enchaîne dessus (« Parfait, Julien. Pour quelle heure… ») sans la répéter |
 
 Pour un appel RÉEL enregistré (Twilio `Record=true`, deux voies), la transcription horodatée se fait avec `node C:\Users\msi\.claude\scripts\timeline-appel.mjs <appel.wav>`. La doctrine qui découle de ces mesures est dans le skill `agent-voice`, `references/telephony-reception.md` § 7 bis.
+
+## Fin de tour : remplacer le seuil de silence par un modèle
+
+Chantier `feat/fin-de-tour`. Le pont attend aujourd'hui un silence sec (900 ms chez Palazzo) avant de répondre : c'est le plus gros poste de latence qui reste, et il coupe la parole à qui hésite. Un modèle de fin de tour regarde la forme d'onde et décide beaucoup plus tôt.
+
+⚠ **Ne jamais juger un modèle de fin de tour sur de la SYNTHÈSE.** Une voix de synthèse à qui on donne un fragment le prononce avec une intonation descendante, donc comme une phrase finie : le modèle répond « terminé » à « Mon numéro c'est zéro six » (0,989) et il a acoustiquement raison, le même début coupé dans l'enregistrement de la phrase ENTIÈRE tombant à 0,006. Les fixtures de `fabriquer-pauses.mjs` ne mesurent donc que le seuil de silence (qui, lui, ne regarde que les blancs), jamais un modèle de prosodie.
+
+| Banc | Ce qu'il tranche | Commande | Résultat du 18/09 |
+|---|---|---|---|
+| `fabriquer-pauses.mjs` | Fabrique 16 fixtures de synthèse (fins de phrase, hésitations, épellations, interjections). | `node test/bancs/fabriquer-pauses.mjs` | 16 WAV 8 kHz + `pauses.json`. Valables pour le seuil de silence UNIQUEMENT |
+| `banc-fin-de-tour.mjs` | La courbe de référence du pont : pour un délai donné, combien de coupures et combien d'attente, avec le détecteur d'énergie réel. | `node test/bancs/banc-fin-de-tour.mjs` | la courbe du seuil, celle qu'un modèle doit battre |
+| `banc-smart-turn.mjs` | Le portage Node de Smart Turn v3 répond-il comme le modèle d'origine ? | `node test/bancs/banc-smart-turn.mjs` | mel Whisper en Node pur + ONNX int8 : le portage tient |
+| `banc-smart-turn-bande.mjs` | Le 8 kHz téléphonique casse-t-il le modèle, entraîné en 16 kHz large bande ? | `node test/bancs/banc-smart-turn-bande.mjs` | **non** : écart moyen de probabilité +0,074 entre large bande et téléphone, sous 0,03 sur 9 cas sur 10 |
+| `eot-corpus.py` | Récupère le corpus **réel** : `livekit/eot-bench-data`, part française, CC-BY-4.0. 400 tours humains face à un agent, 71 min, 654 hésitations en cours de phrase et 400 vraies fins de tour étiquetées. Non versionné (~140 Mo). | `python test/bancs/eot-corpus.py` | `fixtures/eot-livekit/` : 400 WAV 16 kHz + `manifeste.json` |
+| `banc-eot-scores.mjs` | Interroge Smart Turn CAUSALEMENT à chaque silence du corpus, à 13 délais d'action, avec l'audio qu'il aurait vraiment eu à cet instant. Se shardé (`--part=i/n`) ; `--bande=telephone` fait passer l'audio par la ligne (passe-bas 3,4 kHz, décimation, aller-retour mu-law, remontée à 16 kHz). | `for i in $(seq 0 11); do node test/bancs/banc-eot-scores.mjs --bande=telephone --part=$i/12 & done` | ~8 000 inférences par bande, 4 min sur 12 processus. Coût d'une inférence, seule sur la machine : **médiane 103 ms** (dont **68 ms d'ONNX**, le reste étant le mel en JS pur) |
+| `banc-eot-politique.mjs` | L'arbitrage complet, sans refaire une inférence : balaye seuil × délai × filet, sort le front de Pareto, et compare **au détecteur du pont rejoué sur les mêmes tours réels**. | `node test/bancs/banc-eot-politique.mjs` | voir ci-dessous |
+
+**Ce que ça donne, bande téléphonique, sur les 400 tours réels.** Le pont d'aujourd'hui à 900 ms de filet : **17,6 % des hésitations coupées**, 685 ms d'attente moyenne sur une vraie fin de tour. Avec Smart Turn :
+
+| coupures max | pont (filet → attente moyenne) | Smart Turn (attente moyenne, part qui retombe sur le filet) | gain |
+|---|---|---|---|
+| 2 % | 1500 ms → 1285 ms | 1173 ms (33 %) seuil 0,97 délai 1000 filet 1500 | 112 ms |
+| 5 % | 1500 ms → 1285 ms | 876 ms (40 %) seuil 0,98 délai 600 filet 1200 | 410 ms |
+| 10 % | 1200 ms → 985 ms | 697 ms (43 %) seuil 0,98 délai 500 filet 900 | 289 ms |
+| 18 % | 900 ms → 685 ms | 499 ms (41 %) seuil 0,98 délai 150 filet 800 | 186 ms |
+
+Deux lectures, et la seconde vaut mieux que la première : à latence égale (~690 ms), on passe de **17,6 % à 10 % d'hésitations coupées**, soit 40 % d'interruptions en moins ; à taux de coupure égal, on gagne 190 à 410 ms d'attente MOYENNE (la médiane gagne 200 à 600 ms, mais 30 à 43 % des vraies fins de tour ne sont pas reconnues par le modèle et retombent sur le filet, ce qui mange une partie du gain). La large bande fait mieux d'environ 80 ms d'attente moyenne et de 10 points de retombée sur le filet : **la ligne téléphonique coûte quelque chose, mais peu**, et elle ne remet pas le chantier en cause.

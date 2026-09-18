@@ -4,3 +4,5 @@ node_modules/
 *.log
 .DS_Store
 test/results/
+test/bancs/fixtures/eot-livekit/
+.sorties/
