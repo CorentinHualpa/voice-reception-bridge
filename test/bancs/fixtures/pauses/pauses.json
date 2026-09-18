@@ -1,0 +1,320 @@
+{
+  "voix": "nova",
+  "rate": 8000,
+  "cas": [
+    {
+      "id": "fini-horaires",
+      "fichier": "fini-horaires.wav",
+      "dureeMs": 4240,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 3240,
+          "suite": false
+        }
+      ],
+      "famille": "fini"
+    },
+    {
+      "id": "fini-adresse",
+      "fichier": "fini-adresse.wav",
+      "dureeMs": 2900,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 1900,
+          "suite": false
+        }
+      ],
+      "famille": "fini"
+    },
+    {
+      "id": "fini-commande",
+      "fichier": "fini-commande.wav",
+      "dureeMs": 3580,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 2580,
+          "suite": false
+        }
+      ],
+      "famille": "fini"
+    },
+    {
+      "id": "fini-court",
+      "fichier": "fini-court.wav",
+      "dureeMs": 2040,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 1040,
+          "suite": false
+        }
+      ],
+      "famille": "fini"
+    },
+    {
+      "id": "fini-tres-court",
+      "fichier": "fini-tres-court.wav",
+      "dureeMs": 1460,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 460,
+          "suite": false
+        }
+      ],
+      "famille": "fini"
+    },
+    {
+      "id": "fini-prenom",
+      "fichier": "fini-prenom.wav",
+      "dureeMs": 2400,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 1400,
+          "suite": false
+        }
+      ],
+      "famille": "fini"
+    },
+    {
+      "id": "pause-euh-400",
+      "fichier": "pause-euh-400.wav",
+      "dureeMs": 3440,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 1240,
+          "suite": true
+        },
+        {
+          "debutParoleMs": 1640,
+          "finParoleMs": 2440,
+          "suite": false
+        }
+      ],
+      "famille": "pause"
+    },
+    {
+      "id": "pause-euh-700",
+      "fichier": "pause-euh-700.wav",
+      "dureeMs": 4480,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 1820,
+          "suite": true
+        },
+        {
+          "debutParoleMs": 2520,
+          "finParoleMs": 3480,
+          "suite": false
+        }
+      ],
+      "famille": "pause"
+    },
+    {
+      "id": "pause-reflexion-1000",
+      "fichier": "pause-reflexion-1000.wav",
+      "dureeMs": 6540,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 1880,
+          "suite": true
+        },
+        {
+          "debutParoleMs": 2880,
+          "finParoleMs": 5540,
+          "suite": false
+        }
+      ],
+      "famille": "pause"
+    },
+    {
+      "id": "pause-longue-1400",
+      "fichier": "pause-longue-1400.wav",
+      "dureeMs": 6500,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 1200,
+          "suite": true
+        },
+        {
+          "debutParoleMs": 2600,
+          "finParoleMs": 5500,
+          "suite": false
+        }
+      ],
+      "famille": "pause"
+    },
+    {
+      "id": "pause-milieu-600",
+      "fichier": "pause-milieu-600.wav",
+      "dureeMs": 7380,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 1260,
+          "suite": true
+        },
+        {
+          "debutParoleMs": 1860,
+          "finParoleMs": 6380,
+          "suite": false
+        }
+      ],
+      "famille": "pause"
+    },
+    {
+      "id": "epelle-prenom",
+      "fichier": "epelle-prenom.wav",
+      "dureeMs": 7160,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 2120,
+          "suite": true
+        },
+        {
+          "debutParoleMs": 2620,
+          "finParoleMs": 2960,
+          "suite": true
+        },
+        {
+          "debutParoleMs": 3460,
+          "finParoleMs": 3800,
+          "suite": true
+        },
+        {
+          "debutParoleMs": 4300,
+          "finParoleMs": 4660,
+          "suite": true
+        },
+        {
+          "debutParoleMs": 5110,
+          "finParoleMs": 5350,
+          "suite": true
+        },
+        {
+          "debutParoleMs": 5800,
+          "finParoleMs": 6160,
+          "suite": false
+        }
+      ],
+      "famille": "epelle"
+    },
+    {
+      "id": "epelle-telephone",
+      "fichier": "epelle-telephone.wav",
+      "dureeMs": 8660,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 2120,
+          "suite": true
+        },
+        {
+          "debutParoleMs": 2720,
+          "finParoleMs": 3120,
+          "suite": true
+        },
+        {
+          "debutParoleMs": 3670,
+          "finParoleMs": 4330,
+          "suite": true
+        },
+        {
+          "debutParoleMs": 4880,
+          "finParoleMs": 6020,
+          "suite": true
+        },
+        {
+          "debutParoleMs": 6520,
+          "finParoleMs": 7660,
+          "suite": false
+        }
+      ],
+      "famille": "epelle"
+    },
+    {
+      "id": "epelle-mail",
+      "fichier": "epelle-mail.wav",
+      "dureeMs": 6120,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 2440,
+          "suite": true
+        },
+        {
+          "debutParoleMs": 3140,
+          "finParoleMs": 5120,
+          "suite": false
+        }
+      ],
+      "famille": "epelle"
+    },
+    {
+      "id": "reprise-changement",
+      "fichier": "reprise-changement.wav",
+      "dureeMs": 4780,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 2260,
+          "suite": true
+        },
+        {
+          "debutParoleMs": 2760,
+          "finParoleMs": 3780,
+          "suite": false
+        }
+      ],
+      "famille": "reprise"
+    },
+    {
+      "id": "backchannel-mmm",
+      "fichier": "backchannel-mmm.wav",
+      "dureeMs": 1300,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 300,
+          "suite": false
+        }
+      ],
+      "famille": "backchannel"
+    },
+    {
+      "id": "backchannel-oui",
+      "fichier": "backchannel-oui.wav",
+      "dureeMs": 1240,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 240,
+          "suite": false
+        }
+      ],
+      "famille": "backchannel"
+    },
+    {
+      "id": "backchannel-daccord",
+      "fichier": "backchannel-daccord.wav",
+      "dureeMs": 1960,
+      "reperes": [
+        {
+          "debutParoleMs": 0,
+          "finParoleMs": 960,
+          "suite": false
+        }
+      ],
+      "famille": "backchannel"
+    }
+  ]
+}
