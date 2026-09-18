@@ -998,6 +998,16 @@ wss.on("connection", (twilio, requete) => {
           doublureGagnante = false;
           generation = false;
           lacherRetenue();
+          // ⚠⚠ La queue de silence ET le mark de fin de lecture sont d'ordinaire poses par terminerReponse,
+          // que la doublure court-circuite. Sans la queue, la derniere syllabe de sa reponse se perd sur la
+          // ligne ; sans le mark, un pont en DEMI-DUPLEX reste sourd jusqu'a son filet (12 s de blanc mesurees
+          // sur un vrai appel de Dany). Il faut donc les refaire ici, a l'identique.
+          if (streamSid && audioReponseOctets > 0 && reponseCoupee !== tourDoublure.marque && twilio.readyState === WebSocket.OPEN) {
+            const silence = Buffer.alloc(2400, 0xff); // mu-law 0xFF = zero, 300 ms a 8 kHz
+            twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: silence.toString("base64") } }));
+            finLecture = Math.max(finLecture, Date.now()) + 300;
+          }
+          if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `agentdone:${tourDoublure.marque}` } }));
           if (tourEnAttente && !tour) { validerTour(); demanderReponse(); }
         },
       },
