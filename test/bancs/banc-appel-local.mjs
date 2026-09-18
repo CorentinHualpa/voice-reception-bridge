@@ -34,6 +34,13 @@ const pont = spawn(process.execPath, ["server.js"], {
     TOURS: MODE, ...(process.env.BARGE_IN ? { BARGE_IN: process.env.BARGE_IN } : {}), ...(process.env.FIN_DE_TOUR_MS ? { FIN_DE_TOUR_MS: process.env.FIN_DE_TOUR_MS } : {}),
     // Réponse anticipée et « Mmm » d'attente (portés de palazzo-v1) : ANTICIPATION_MS=0 MMM_APRES_MS=0 pour l'ancien pont.
     ...(process.env.ANTICIPATION_MS ? { ANTICIPATION_MS: process.env.ANTICIPATION_MS } : {}), ...(process.env.MMM_APRES_MS ? { MMM_APRES_MS: process.env.MMM_APRES_MS } : {}),
+    // Doublure et ambiance (portées de palazzo-v1). HEDGE_APRES_MS=300 la fait demander à CHAQUE tour,
+    // DOUBLURE_TEST_MS=3000 la fait gagner à coup sûr sans attendre un vrai pic de Grok.
+    ...(process.env.HEDGE_APRES_MS ? { HEDGE_APRES_MS: process.env.HEDGE_APRES_MS } : {}),
+    ...(process.env.DOUBLURE_TEST_MS ? { DOUBLURE_TEST_MS: process.env.DOUBLURE_TEST_MS } : {}),
+    ...(process.env.AMBIANCE_APRES_MS ? { AMBIANCE_APRES_MS: process.env.AMBIANCE_APRES_MS } : {}),
+    ...(process.env.AMBIANCE_GAIN ? { AMBIANCE_GAIN: process.env.AMBIANCE_GAIN } : {}),
+    ...(process.env.AMBIANCE_FICHIER ? { AMBIANCE_FICHIER: process.env.AMBIANCE_FICHIER } : {}),
   },
 });
 const t0 = Date.now();
@@ -168,7 +175,7 @@ h.writeUInt16LE(1, 20); h.writeUInt16LE(2, 22); h.writeUInt32LE(8000, 24); h.wri
 h.write("data", 36); h.writeUInt32LE(data.length, 40);
 fs.writeFileSync(path.join(SORTIES, `${NOM}.wav`), Buffer.concat([h, data]));
 fs.writeFileSync(path.join(SORTIES, `${NOM}.log`), `${journal.join("\n")}\n\n--- dialogue ---\n${dialogue}\n`);
-console.log(journal.filter((l) => /\[banc\]|\[tour\]|\[latence\]|\[reponse\]|coupe|erreur|\[session\]|\[son\]|jamais|toujours/.test(l)).map((l) => l.replace(/ sid=CA\w+/, "").slice(0, 230)).join("\n"));
+console.log(journal.filter((l) => /\[banc\]|\[tour\]|\[latence\]|\[reponse\]|coupe|erreur|\[session\]|\[son\]|\[doublure\]|\[ambiance\]|\[redite\]|jamais|toujours/.test(l)).map((l) => l.replace(/ sid=CA\w+/, "").slice(0, 230)).join("\n"));
 const med = [...latences].sort((a, b) => a - b)[Math.floor(latences.length / 2)];
 console.log(`\n--- latences (fin du client -> premier son) : ${latences.join(", ")} ms ; médiane ${med} ms`);
 console.log(`--- dialogue ---\n${dialogue}`);
