@@ -1083,6 +1083,29 @@ wss.on("connection", (twilio) => {
     grok.on("error", (err) => console.error("[grok] ws error", err.message));
   }
 
+  // RTT reel entre le pont et le Media Engine de Twilio, par ping WebSocket natif. C'est la SEULE mesure
+  // possible de ce saut : Voice Insights ne donne le poste reseau que pour ConversationRelay, jamais pour Media
+  // Streams. Elle dit si le pont est bien place : nos numeros sont traites en `us1` (Virginie), donc un pont
+  // europeen faisait traverser l'Atlantique a l'audio deux fois de plus par tour. Cinq pings au debut de
+  // l'appel, la mediane au journal, rien d'autre : aucune incidence sur la conversation.
+  function mesurerRttTwilio() {
+    const mesures = [];
+    let n = 0;
+    const tic = setInterval(() => {
+      if (finalized || twilio.readyState !== WebSocket.OPEN || n >= 5) {
+        clearInterval(tic);
+        if (mesures.length) {
+          const tri = mesures.slice().sort((a, b) => a - b);
+          console.log(`[reseau] rtt twilio mediane ${tri[tri.length >> 1]} ms (${mesures.map(Math.round).join(", ")}) sid=${callSid}`);
+        }
+        return;
+      }
+      n++;
+      const t0 = Date.now();
+      try { twilio.ping(); } catch { clearInterval(tic); return; }
+      twilio.once("pong", () => mesures.push(Date.now() - t0));
+    }, 1500);
+  }
   twilio.on("message", (raw) => {
     let m;
     try { m = JSON.parse(raw.toString()); } catch { return; }
@@ -1091,6 +1114,7 @@ wss.on("connection", (twilio) => {
       callSid = m.start.callSid;
       fromNumber = (m.start.customParameters && (m.start.customParameters.from || m.start.customParameters.From)) || null;
       console.log(`[call] start sid=${callSid} from=${fromNumber}`);
+      mesurerRttTwilio();
       openGrok();
     } else if (m.event === "media") {
       // Filet si le mark "agentdone" se perd : jamais tant que l'audio envoye n'a pas fini de jouer, et le silence
