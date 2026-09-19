@@ -1,9 +1,12 @@
 # Provenance et licences des ambiances
 
-Tous les enregistrements du catalogue sont en **CC0 1.0 Universal** (domaine public).
-Ils sont donc redistribuables à l'intérieur d'un produit commercial, sans obligation
-d'attribution et sans reversement. Aucun fichier sous licence non commerciale ou exigeant
-une attribution n'a été retenu, précisément parce que le pont est vendu à des clients.
+Tous les enregistrements du catalogue sont dans le **domaine public** : CC0 1.0 Universal,
+ou versement volontaire par l'auteur (`PD-author` sur Wikimedia Commons, qui a le même effet
+juridique : pas d'attribution, pas de reversement). Ils sont donc redistribuables à
+l'intérieur d'un produit commercial. Aucun fichier sous licence non commerciale, sous
+Public Domain Mark (qui n'est pas une licence mais une simple affirmation par un tiers,
+invérifiable sur un enregistrement récent) ou exigeant une attribution n'a été retenu,
+précisément parce que le pont est vendu à des clients.
 
 | Ambiance | Fichier | Source | Licence | Page de licence |
 |---|---|---|---|---|
@@ -11,6 +14,7 @@ une attribution n'a été retenu, précisément parce que le pont est vendu à d
 | Bureau | `bureau.wav` | archive.org, collection *office-sound-effects*, `mixkit-office-ambience-447.wav` | CC0 1.0 | https://archive.org/details/office-sound-effects |
 | Salle de restaurant | `salle.wav` | archive.org, collection *Designers-Choice-Collection-Ambiences*, `AMBRest-...Restaurant Or Bar Walla...mp3` | CC0 1.0 | https://archive.org/details/Designers-Choice-Collection-Ambiences |
 | Rue | `rue.wav` | Wikimedia Commons, `Sagetyrtle_-_citystreet3_(cc0)_(freesound).mp3` | CC0 1.0 | https://commons.wikimedia.org/wiki/File:Sagetyrtle_-_citystreet3_(cc0)_(freesound).mp3 |
+| Restaurant animé | `restaurant.wav` | Wikimedia Commons, `Restaurant_ambience.ogg` (pdsounds.org n° 274, « restaurant_walla », enregistré par stephan en 2007) | Domaine public par l'auteur (`PD-author`) | https://commons.wikimedia.org/wiki/File:Restaurant_ambience.ogg |
 
 Le préréglage **bruit de confort** n'a pas de fichier : il est synthétisé à la volée. Ce n'est
 pas un décor mais du bruit de confort au sens du codec (RFC 3389), dont le rôle est justement de
