@@ -34,8 +34,11 @@ function fausseVoix(n, amplitude = 0.3) {
 
 console.log("\n== Le catalogue ==");
 const liste = listerAmbiances();
-ok("cinq ambiances", liste.length === 5, String(liste.length));
-ok("quatre viennent d'enregistrements", liste.filter((a) => a.origine === "enregistrement").length === 4);
+// Les nombres sont EN DUR exprès : ajouter une ambiance doit faire tomber ce banc, parce qu'un
+// preset se pose a TROIS endroits (ici, AMBIANCES_PRESETS de la console, et son apercu MP3) et
+// qu'en oublier un le rend choisissable et jamais joue. 19/09/2026 : 5 -> 6 (« restaurant »).
+ok("six ambiances", liste.length === 6, String(liste.length));
+ok("cinq viennent d'enregistrements", liste.filter((a) => a.origine === "enregistrement").length === 5);
 ok("le bruit de confort est synthétisé", liste.find((a) => a.id === "confort")?.origine === "synthèse");
 for (const a of liste) console.log(`       ${a.id.padEnd(15)} ${a.origine}`);
 

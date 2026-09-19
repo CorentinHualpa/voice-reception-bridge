@@ -38,9 +38,11 @@ const pont = spawn(process.execPath, ["server.js"], {
     // DOUBLURE_TEST_MS=3000 la fait gagner à coup sûr sans attendre un vrai pic de Grok.
     ...(process.env.HEDGE_APRES_MS ? { HEDGE_APRES_MS: process.env.HEDGE_APRES_MS } : {}),
     ...(process.env.DOUBLURE_TEST_MS ? { DOUBLURE_TEST_MS: process.env.DOUBLURE_TEST_MS } : {}),
-    ...(process.env.AMBIANCE_APRES_MS ? { AMBIANCE_APRES_MS: process.env.AMBIANCE_APRES_MS } : {}),
+    // Ambiance CONTINUE (19/09/2026) : AMBIANCE=<preset|chemin|url> suffit, il n'y a plus de seuil de
+    // declenchement. AMBIANCE=centre-appels pour l'entendre sur l'enregistrement du banc.
+    ...(process.env.AMBIANCE ? { AMBIANCE: process.env.AMBIANCE } : {}),
     ...(process.env.AMBIANCE_GAIN ? { AMBIANCE_GAIN: process.env.AMBIANCE_GAIN } : {}),
-    ...(process.env.AMBIANCE_FICHIER ? { AMBIANCE_FICHIER: process.env.AMBIANCE_FICHIER } : {}),
+    ...(process.env.AMBIANCE_RATIO_VOIX ? { AMBIANCE_RATIO_VOIX: process.env.AMBIANCE_RATIO_VOIX } : {}),
   },
 });
 const t0 = Date.now();
@@ -63,6 +65,7 @@ const ecrits = []; // { de, a } échantillons de l'agent planifiés
 const ech = (ms) => Math.max(0, Math.round(((ms - debutFlux) / 1000) * 8000));
 const agentParle = () => Date.now() < finLecture;
 let premierSonApres = null, dernierSonAgent = 0, sonsAgent = 0, reponsesAgent = 0;
+let fondSeul = 0; // octets recus sous le seuil de parole : le fond sonore, quand il y en a un
 const latences = [];
 const envoyer = (o) => ws.send(JSON.stringify(o));
 ws.onmessage = (m) => {
@@ -74,6 +77,18 @@ ws.onmessage = (m) => {
     const i0 = ech(debut);
     for (let i = 0; i < u.length && i0 + i < agent.length; i++) agent[i0 + i] = ulawDecodeSample(u[i]);
     ecrits.push({ de: i0, a: i0 + u.length });
+    /* ⚠ TOUT PAQUET N'EST PAS DE LA PAROLE (19/09/2026). Depuis le fond sonore continu, le pont envoie des
+       paquets SANS DISCONTINUER pendant tout l'appel. Ce banc deduisait « l'agent parle » de la simple arrivee
+       d'un paquet : `finLecture` ne redescendait donc plus jamais, `silenceAgent()` n'etait plus jamais vrai, et
+       le banc attendait ses 30 a 40 s de delai de garde avant CHAQUE replique du client. L'appel entier
+       deraillait, et tout accusait l'ambiance alors que le pont etait sain. On mesure donc le NIVEAU : le fond
+       tourne a 0,0044 de niveau efficace (0,06 en crete), la voix a 0,05 et plus, il y a un ordre de grandeur
+       entre les deux. En dessous du seuil, le paquet est enregistre dans la voie agent mais ne compte pas comme
+       de la parole. C'est aussi ce que fait le pont lui-meme pour la voix du client. */
+    let somme = 0;
+    for (let i = 0; i < u.length; i++) { const v = ulawDecodeSample(u[i]) / 32768; somme += v * v; }
+    const niveau = Math.sqrt(somme / Math.max(1, u.length));
+    if (niveau < 0.02) { fondSeul += u.length; return; }
     if (!agentParle()) reponsesAgent++;
     if (!agentParle() && premierSonApres) { latences.push(debut - premierSonApres); journal.push(`${horo()} [banc] premier son de l'agent ${debut - premierSonApres} ms après la fin du client`); premierSonApres = null; }
     finLecture = debut + (u.length / 8000) * 1000;
@@ -178,5 +193,6 @@ fs.writeFileSync(path.join(SORTIES, `${NOM}.log`), `${journal.join("\n")}\n\n---
 console.log(journal.filter((l) => /\[banc\]|\[tour\]|\[latence\]|\[reponse\]|coupe|erreur|\[session\]|\[son\]|\[doublure\]|\[ambiance\]|\[redite\]|jamais|toujours/.test(l)).map((l) => l.replace(/ sid=CA\w+/, "").slice(0, 230)).join("\n"));
 const med = [...latences].sort((a, b) => a - b)[Math.floor(latences.length / 2)];
 console.log(`\n--- latences (fin du client -> premier son) : ${latences.join(", ")} ms ; médiane ${med} ms`);
+if (fondSeul) console.log(`--- fond sonore : ${(fondSeul / 8000).toFixed(1)} s reçues sous le seuil de parole (elles sont dans l'enregistrement, mais ne comptent pas comme de la parole)`);
 console.log(`--- dialogue ---\n${dialogue}`);
 process.exit(0);
