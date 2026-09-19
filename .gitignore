@@ -4,3 +4,9 @@ node_modules/
 *.log
 .DS_Store
 test/results/
+
+# Sources brutes et rendus du banc d ambiance
+.sources/
+sortie-ambiance/
+.tmp-ambiance-*
+.tmp-scan.raw
