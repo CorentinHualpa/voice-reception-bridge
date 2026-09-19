@@ -23,9 +23,9 @@
 //   Parades aux pics de Grok (une reponse sur cinq met 2,7 a 3,7 s avant son premier son) :
 //   HEDGE_APRES_MS     seconde session Grok a qui on demande la meme reponse quand la premiere reste muette
 //                      apres N ms (0 = coupee, valeur de travail 1000). Voir lib/doublure.js.
-//   AMBIANCE_APRES_MS  fond de salle tres bas pendant les blancs, apres N ms (0 = coupe, valeur de travail 1800)
-//   AMBIANCE_FICHIER   WAV PCM 16 bits mono a jouer en fond ; a defaut, bruit de confort synthetise
-//   AMBIANCE_GAIN      volume du fond, 0,06 par defaut
+//   AMBIANCE           fond sonore CONTINU : nom d'un preset, chemin d'un WAV, URL d'un WAV, ou "off"
+//   AMBIANCE_RATIO_VOIX  niveau du fond pendant que l'agent parle, en fraction du niveau des blancs (0,55)
+//   AMBIANCE_GAIN      volume du fond, 0,06 par defaut (assez bas pour ne pas passer le seuil de detection)
 //   REDITE_ATTENTE_MS  battement laisse a la transcription avant de jeter une reponse qui n'a rien de neuf a
 //                      dire (600 par defaut, 0 desactive la garde)
 
@@ -33,7 +33,7 @@ import http from "http";
 import fs from "fs";
 import { WebSocketServer, WebSocket } from "ws";
 import { ulaw8kToPcm16, pcm16ToUlaw8k, ulawDecodeSample, ulawEncodeSample } from "./lib/audio.js";
-import { chargerAmbiance } from "./lib/ambiance.js";
+import { creerAmbiance, listerAmbiances, telechargerWav } from "./lib/ambiance.js";
 import { creerDoublure } from "./lib/doublure.js";
 
 const PORT = process.env.PORT || 8080;
@@ -114,21 +114,69 @@ const REPONSE_IGNOREE_MS = Number(process.env.REPONSE_IGNOREE_MS || 1000);
 const MMM_APRES_MS = Number(process.env.MMM_APRES_MS ?? 0);
 const MMM_CREEE_DEPUIS_MS = Number(process.env.MMM_CREEE_DEPUIS_MS || 1300);
 const MMM_TEXTE = process.env.MMM_TEXTE || "Mmm…";
-// AMBIANCE DE SALLE (17/09/2026, portee de Palazzo). Le G.711 transmet le silence tel quel, donc un blanc de
-// 3,7 s s'entend comme une ligne coupee. Un fond tres bas, joue seulement pendant ces blancs, l'enleve sans rien
-// pretendre. Il ne compte PAS comme audible (les tours et la coupure de parole continuent), part en temps reel
-// (rien a purger) et dure exactement le blanc. Coupe par defaut. ⚠ Dany etant en DEMI-DUPLEX, verifier sur un
-// vrai appel que ce fond ne rentre pas dans son propre micro avant de l'activer.
-const AMBIANCE_APRES_MS = Number(process.env.AMBIANCE_APRES_MS ?? 0);
+// AMBIANCE DE SALLE (17/09/2026, apres le rejet du « Mmm » ; rendue CONTINUE le 19/09/2026).
+// Ce qui gene dans un pic de Grok n'est pas l'absence de mot, c'est le SILENCE NUMERIQUE TOTAL : le G.711 de
+// Twilio transmet le silence tel quel, donc un blanc de 3,7 s s'entend comme une ligne coupee. Un fond de
+// salle tres bas enleve cette impression sans rien pretendre : personne ne l'entend comme une replique, donc
+// rien ne peut sonner faux. Il ne compte PAS comme audible (finLecture ne bouge pas), donc la coupure de
+// parole et la detection de tours continuent normalement et il ne retarde jamais la vraie reponse.
+// ⚠ CORRECTION DU 19/09/2026 : le fond est desormais CONTINU, il ne se declenche plus sur les blancs.
+// L'oreille detecte un DEBUT et une FIN de son bien mieux qu'un niveau constant, donc un fond qui s'allume
+// quand il y a un blanc ne masque pas le blanc, il l'ANNONCE. C'est pour ca que la premiere version n'a
+// jamais convaincu. Vapi, dont le fond marche bien, joue simplement une boucle du debut a la fin de l'appel
+// (verifie sur leur API : `backgroundSound` n'accepte que off, office, ou une URL, sans aucune condition).
+//
+// Consequence technique : l'audio de l'agent est DEVERSE dans la file de Twilio sans cadencement temps reel,
+// alors qu'un fond joue « a cote » partirait, lui, au rythme reel. Les deux se decaleraient. Le fond est donc
+// MELANGE DANS les paquets de l'agent (voir envoyerMedia), et envoye seul uniquement quand rien d'autre ne part.
+//
+// AMBIANCE          nom d'un preset (voir lib/ambiance.js), chemin d'un WAV, URL d'un WAV, ou "off"
+// AMBIANCE_GAIN     niveau en crete dans les blancs (0,06 = ~ -24 dB, sous le seuil de detection de voix)
+// AMBIANCE_RATIO_VOIX  facteur applique pendant que l'agent parle (0,55) : au meme niveau, le fond encombre la voix
+//
+// ⚠ CE PONT-CI SERT UN AGENT EN DEMI-DUPLEX (Dany). Le fond revient donc dans son propre micro par le
+// haut-parleur de l'appelant. Il est calibre pour que ce soit sans consequence : a 0,06 en crete, son niveau
+// EFFICACE est de 0,0044, tres loin du seuil de detection de voix a 0,05, donc il ne peut pas se faire prendre
+// pour une prise de parole. Verifier quand meme sur un vrai appel avant de l'activer durablement.
+const AMBIANCE = process.env.AMBIANCE ?? "off";
 const AMBIANCE_GAIN = Number(process.env.AMBIANCE_GAIN ?? 0.06);
-const AMBIANCE_FICHIER = process.env.AMBIANCE_FICHIER || "";
-const ambianceBoucle = AMBIANCE_APRES_MS > 0 ? chargerAmbiance({ source: AMBIANCE_FICHIER, gain: AMBIANCE_GAIN }) : null;
-// DOUBLURE (17/09/2026, portee de Palazzo, ou elle est en production). Le blocage de Grok est propre a UNE
-// SESSION : au banc, deux sessions recevant la meme question au meme instant n'ont jamais ete lentes ensemble
-// (24 tours, la premiere des deux : 0 pic au-dela de 2 s, max 1007 ms, contre 2418 ms pour la plus lente seule).
-// On demande donc la meme reponse a une seconde session quand la premiere reste muette, et on joue celle qui
-// parle. Voir lib/doublure.js. Le seuil se compte depuis la CREATION de la reponse : une reponse normale parle
-// entre 0,6 et 1,4 s apres. Valeur de travail 1000. HEDGE_APRES_MS=0 la coupe.
+const AMBIANCE_RATIO_VOIX = Number(process.env.AMBIANCE_RATIO_VOIX ?? 0.55);
+console.log(`[ambiance] presets disponibles : ${listerAmbiances().map((a) => a.id).join(", ")}`);
+
+// Resolution d'un choix d'ambiance, qu'il vienne de la variable d'environnement ou de la fiche de l'agent
+// dans Dale Voz. Trois formes acceptees : un nom de preset, un chemin de fichier local, une URL de WAV.
+// Le telechargement d'une URL est mis en cache pour l'execution : un client qui a depose son propre fond
+// ne le fait pas retelecharger a chaque appel.
+const cacheAmbianceUrl = new Map();
+async function resoudreAmbiance(choix, gain, ratioVoix) {
+  const nom = String(choix ?? "").trim();
+  if (!nom || nom === "off" || nom === "aucune" || !(gain > 0)) return null;
+  try {
+    if (/^https?:\/\//i.test(nom)) {
+      let wavBuffer = cacheAmbianceUrl.get(nom);
+      if (!wavBuffer) { wavBuffer = await telechargerWav(nom); cacheAmbianceUrl.set(nom, wavBuffer); }
+      return creerAmbiance({ wavBuffer, gain, ratioVoix });
+    }
+    if (nom.includes("/") || nom.includes("\\") || nom.endsWith(".wav")) {
+      return creerAmbiance({ wavBuffer: fs.readFileSync(nom), gain, ratioVoix });
+    }
+    return creerAmbiance({ preset: nom, gain, ratioVoix });
+  } catch (err) {
+    // Une ambiance qui ne charge pas ne doit JAMAIS empecher un appel : on la coupe et on le dit.
+    console.error(`[ambiance] « ${nom} » indisponible (${err.message}), appel sans fond sonore`);
+    return null;
+  }
+}
+// DOUBLURE (17/09/2026, apres le rejet du « Mmm »). Le blocage de Grok est propre a UNE SESSION : au banc, deux
+// sessions recevant la meme question au meme instant n'ont jamais ete lentes ensemble (24 tours, la premiere des
+// deux : 0 pic au-dela de 2 s, max 1007 ms, contre 2418 ms pour la plus lente seule). Plutot que de masquer le
+// blanc, on demande la meme reponse a une seconde session quand la premiere est muette, et on joue celle qui
+// parle. Voir lib/doublure.js pour la coherence des deux historiques. HEDGE_APRES_MS=0 la coupe entierement.
+// Le seuil se compte depuis la CREATION de la reponse, pas depuis la fin de parole du client : une relance
+// d'apres outil est creee tard mais parle vite, elle ne doit pas declencher la doublure. Une reponse normale
+// parle entre 0,6 et 1,4 s apres sa creation. Valeur de travail : 1000 ms. Un seuil plus bas ne degrade RIEN
+// (la primaire garde son avance et gagne la course), il coute seulement des generations jetees ; un seuil plus
+// haut retarde d'autant la parade. Sur un blocage a 3,7 s, la doublure parle vers 1,9 s au lieu de 3,7 s.
 const HEDGE_APRES_MS = Number(process.env.HEDGE_APRES_MS ?? 0);
 // BANC SEULEMENT : retarde le son de la primaire pour que la doublure gagne a coup sur. Jamais en production.
 const DOUBLURE_TEST_MS = Number(process.env.DOUBLURE_TEST_MS || 0);
@@ -416,8 +464,9 @@ wss.on("connection", (twilio) => {
   // « Mmm » d'attente (voir MMM_APRES_MS) : fin de parole du client dont la reponse n'a encore rien fait entendre,
   // indicateur pour le journal de latence, son pret pour la voix de cet appel.
   let attenteDepuis = 0, mmmJusqua = 0, mmmAvantReponse = false;
-  // Ambiance de salle (voir AMBIANCE_APRES_MS) : position dans la boucle, debut du blanc en cours, total joue.
-  let ambiancePos = 0, ambianceDepuis = 0, ambianceMs = 0;
+  // Ambiance de salle (voir AMBIANCE) : construite au decroche. Null = pas de fond sur cet appel. Ce pont-ci
+  // n'interroge pas Dale Voz, le choix vient donc de la seule variable de service.
+  let ambiance = null;
   // Doublure (voir HEDGE_APRES_MS et lib/doublure.js) : seconde session Grok, curseur de synchronisation sur
   // `dialog`, tour en cours de doublage, et compteurs pour le compte rendu de fin d'appel.
   let doublure = null, doublureSyncIdx = 0, doublureTour = 0, doublureGagnees = 0, doublureDemandees = 0;
@@ -592,29 +641,31 @@ wss.on("connection", (twilio) => {
     attenteDepuis = 0;
     if (!sonMmm || !streamSid || twilio.readyState !== WebSocket.OPEN) return;
     for (let o = 0; o < sonMmm.length; o += 800) {
-      twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: sonMmm.subarray(o, o + 800).toString("base64") } }));
+      envoyerMedia(sonMmm.subarray(o, o + 800));
     }
     finLecture = Math.max(finLecture, maintenant) + (sonMmm.length / 8000) * 1000;
     mmmJusqua = finLecture;
     mmmAvantReponse = true;
     console.log(`[attente] « ${MMM_TEXTE} » ${depuis} ms apres la fin de parole du client ${t()} sid=${callSid}`);
   }
-  // Un paquet d'ambiance de salle vers Twilio, au rythme des paquets entrants (voir AMBIANCE_APRES_MS).
-  // Ne touche NI finLecture NI attenteDepuis : ce fond n'est pas la parole de l'agent, il ne rend le pont
-  // ni sourd ni occupe, et la vraie reponse passe devant sans rien avoir a purger.
-  function jouerAmbiance(maintenant, octets) {
-    if (!ambianceBoucle || !streamSid || twilio.readyState !== WebSocket.OPEN) return;
-    if (!ambianceDepuis) { ambianceDepuis = maintenant; console.log(`[ambiance] blanc comble ${maintenant - attenteDepuis} ms apres la fin de parole du client ${t()} sid=${callSid}`); }
-    const n = Math.min(octets, 800);
-    if (ambiancePos + n > ambianceBoucle.length) ambiancePos = 0;
-    twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: ambianceBoucle.subarray(ambiancePos, ambiancePos + n).toString("base64") } }));
-    ambiancePos += n;
-    ambianceMs += (n / 8000) * 1000;
+  // POINT DE PASSAGE UNIQUE de tout l'audio sortant. C'est ici, et nulle part ailleurs, que l'ambiance
+  // se pose sous ce qui part : la voix de l'agent, sa queue de silence, le « Mmm ». Le fond doit etre
+  // MELANGE et non envoye a cote, parce que cet audio-la est deverse dans la file de Twilio sans
+  // cadencement temps reel : un fond envoye separement arriverait decale de toute la file d'attente.
+  //   sousVoix = true  -> l'ambiance est posee plus bas (AMBIANCE_RATIO_VOIX), pour ne pas encombrer la voix
+  //   sousVoix = false -> niveau plein, pour un silence ou un blanc
+  function envoyerMedia(ulaw, { sousVoix = true } = {}) {
+    if (!streamSid || twilio.readyState !== WebSocket.OPEN) return;
+    const charge = ambiance ? ambiance.melanger(ulaw, { sousVoix }) : ulaw;
+    twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: charge.toString("base64") } }));
   }
-  function arreterAmbiance(maintenant) {
-    if (!ambianceDepuis) return;
-    console.log(`[ambiance] ${maintenant - ambianceDepuis} ms de fond joues ${t()} sid=${callSid}`);
-    ambianceDepuis = 0;
+  // Le fond seul, quand rien d'autre ne part : c'est ce qui remplit les blancs, au rythme reel des paquets
+  // entrants. Ne touche NI finLecture NI attenteDepuis : ce fond n'est pas la parole de l'agent, il ne rend
+  // le pont ni sourd ni occupe, et la vraie reponse passe devant sans rien avoir a purger.
+  function jouerAmbiance(octets) {
+    if (!ambiance || !streamSid || twilio.readyState !== WebSocket.OPEN) return;
+    const n = Math.min(octets, 800);
+    twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: ambiance.paquet(n).toString("base64") } }));
   }
   // ---- Doublure (voir HEDGE_APRES_MS et lib/doublure.js) ----
   // Les deux sessions doivent avoir le meme historique, et une seule entend le client. `dialog` est deja la
@@ -716,7 +767,7 @@ wss.on("connection", (twilio) => {
           // repondu dans le vide. Il faut donc les refaire ici, a l'identique.
           if (streamSid && audioReponseOctets > 0 && reponseCoupee !== tourDoublure.marque && twilio.readyState === WebSocket.OPEN) {
             const silence = Buffer.alloc(2400, 0xff); // mu-law 0xFF = zero, 300 ms a 8 kHz
-            twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: silence.toString("base64") } }));
+            envoyerMedia(silence, { sousVoix: false });
             finLecture = Math.max(finLecture, Date.now()) + 300;
           }
           if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `agentdone:${tourDoublure.marque}` } }));
@@ -779,11 +830,10 @@ wss.on("connection", (twilio) => {
       return;
     }
     attenteDepuis = 0;
-    arreterAmbiance(Date.now());
     // La primaire a parle la premiere : la doublure n'a plus lieu d'etre, et son son ne doit surtout pas
     // s'ajouter derriere. (Quand c'est ELLE qui parle, doublureGagnante est deja vrai.)
     if (!doublureGagnante && doublure?.occupee) doublure.abandonner("la primaire a parle");
-    twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: ulaw.toString("base64") } }));
+    envoyerMedia(ulaw);
     finLecture = Math.max(finLecture, Date.now()) + (ulaw.length / 8000) * 1000;
     audioReponseOctets += ulaw.length;
     if (!premierSon) {
@@ -823,7 +873,10 @@ wss.on("connection", (twilio) => {
     // apres, et la fin se perd sur le trajet telephonique. 300 ms de silence laissent a la ligne le temps de la jouer.
     if (streamSid && audioReponseOctets > 0 && respSeq !== reponseCoupee && twilio.readyState === WebSocket.OPEN) {
       const silence = Buffer.alloc(2400, 0xff); // mu-law 0xFF = zero, 300 ms a 8 kHz
-      twilio.send(JSON.stringify({ event: "media", streamSid, media: { payload: silence.toString("base64") } }));
+      // Par envoyerMedia, et `sousVoix: false` : cette queue n'est pas de la voix, le fond y reprend donc son
+      // niveau plein. Sans ce passage, ces 300 ms seraient les seules de l'appel a etre du silence NUMERIQUE,
+      // et on entendrait le fond se couper net a la fin de chaque reponse.
+      envoyerMedia(silence, { sousVoix: false });
       finLecture = Math.max(finLecture, Date.now()) + 300;
     }
     // Dany a fini de GENERER, mais Twilio joue encore l'audio en file. On rouvre l'ecoute seulement au mark "agentdone"
@@ -920,6 +973,10 @@ wss.on("connection", (twilio) => {
     }
     if (!token) { console.error("[grok] pas de token"); return; }
 
+    // Fond sonore (voir AMBIANCE). Ce pont-ci n'interroge pas Dale Voz : le choix vient de la seule variable
+    // de service, et « off » par defaut, donc rien ne change tant que personne ne l'a demande.
+    ambiance = await resoudreAmbiance(AMBIANCE, AMBIANCE_GAIN, AMBIANCE_RATIO_VOIX);
+    if (ambiance) console.log(`[ambiance] « ${ambiance.libelle} », boucle de ${ambiance.secondes.toFixed(0)} s, gain ${AMBIANCE_GAIN} ${t()} sid=${callSid}`);
     grok = new WebSocket(`wss://api.x.ai/v1/realtime?model=${GROK_MODEL}`, [`xai-client-secret.${token}`]);
     if (TOURS_PAR_LE_PONT && MMM_APRES_MS > 0) sonDAttente(GROK_VOICE, GROK_SPEED).then((s) => { sonMmm = s; });
 
@@ -932,7 +989,7 @@ wss.on("connection", (twilio) => {
       ].filter(Boolean).join("\n");
       const contexteTypo = [contexte, TYPO_COLLEE ? CONSIGNE_PONCTUATION : ""].filter(Boolean).join("\n");
       const sessionInstructions = collerPonctuation(contexteTypo ? `${RECEPTION_PROMPT}\n\n# Contexte de cet appel\n${contexteTypo}` : RECEPTION_PROMPT);
-      console.log(`[session] modele=${GROK_MODEL} voix=${GROK_VOICE} reflexion=${GROK_REASONING} tours=${TOURS_PAR_LE_PONT ? "pont fin_de_tour=" + FIN_DE_TOUR_MS + "ms" : "grok seuil=" + GROK_VAD_THRESHOLD} vitesse=${GROK_SPEED} coupure=${BARGE_IN ? "oui" : "non"} anticipation=${ANTICIPATION_MS}ms doublure=${HEDGE_APRES_MS ? HEDGE_APRES_MS + "ms" : "non"} ambiance=${AMBIANCE_APRES_MS ? AMBIANCE_APRES_MS + "ms" : "non"} ${t()} sid=${callSid}`);
+      console.log(`[session] modele=${GROK_MODEL} voix=${GROK_VOICE} reflexion=${GROK_REASONING} tours=${TOURS_PAR_LE_PONT ? "pont fin_de_tour=" + FIN_DE_TOUR_MS + "ms" : "grok seuil=" + GROK_VAD_THRESHOLD} vitesse=${GROK_SPEED} coupure=${BARGE_IN ? "oui" : "non"} anticipation=${ANTICIPATION_MS}ms doublure=${HEDGE_APRES_MS ? HEDGE_APRES_MS + "ms" : "non"} ambiance=${ambiance ? ambiance.libelle : "non"} ${t()} sid=${callSid}`);
       grok.send(JSON.stringify({
         type: "session.update",
         session: {
@@ -1134,12 +1191,12 @@ wss.on("connection", (twilio) => {
           && !agentAudibleA(maintenant) && (generation || tourEnAttente)
           && !(reponseActive && maintenant - debutReponseMs < MMM_CREEE_DEPUIS_MS) // son imminent : pas de « Mmm » devant
           && !(generation && !reponseActive && maintenant - generationDemandeeA < 400)) jouerMmm(maintenant); // relance tout juste demandee
-        // Ambiance de salle (voir AMBIANCE_APRES_MS) : meme blanc que le « Mmm », mais tant qu'il dure, et sans
-        // aucune des gardes qui protegent la vraie reponse (elle passe devant, ce fond ne retarde rien).
-        if (ambianceBoucle && attenteDepuis && !tour && !endRequested
-          && maintenant - attenteDepuis >= AMBIANCE_APRES_MS && !agentAudibleA(maintenant)
-          && (generation || tourEnAttente)) jouerAmbiance(maintenant, Math.round(paquetMs * 8));
-        else arreterAmbiance(maintenant);
+        // Ambiance de salle (voir AMBIANCE). Le fond est CONTINU : il ne dépend plus d'un blanc qui dure, il
+        // comble simplement tout moment où rien d'autre ne part. Le reste du temps il est déjà mélangé dans
+        // l'audio de l'agent par envoyerMedia, donc il n'y a ici aucune condition sur l'état du dialogue :
+        // la seule question est « la file de Twilio est-elle vide ? », et c'est ce que dit finLecture.
+        // Aucune garde n'est nécessaire, ce fond ne retarde rien et la vraie réponse passe devant.
+        if (ambiance && maintenant >= finLecture && !endRequested) jouerAmbiance(Math.round(paquetMs * 8));
         // Doublure (voir HEDGE_APRES_MS) : une reponse CREEE, muette depuis plus de HEDGE_APRES_MS, est un vrai
         // blocage de Grok (une reponse normale parle 0,6 a 1,4 s apres sa creation).
         if (doublure && !doublureGagnante && reponseActive && !tour && !endRequested
@@ -1259,7 +1316,7 @@ wss.on("connection", (twilio) => {
       doublure.fermer();
       doublure = null;
     }
-    if (ambianceMs) console.log(`[ambiance] ${(ambianceMs / 1000).toFixed(1)} s de fond joues sur l'appel sid=${callSid}`);
+    if (ambiance?.msJoues) console.log(`[ambiance] « ${ambiance.libelle} », ${(ambiance.msJoues / 1000).toFixed(1)} s de fond joues sur l'appel sid=${callSid}`);
     const lignes = dialog.filter((l) => String(l.msg || "").trim()); // une place reservee a une transcription jamais arrivee reste vide
     const text = lignes.map((l) => `${l.who} : ${l.msg}`).join("\n");
     console.log(`[call] stop sid=${callSid} lignes=${lignes.length}`);
