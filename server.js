@@ -36,6 +36,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { ulaw8kToPcm16, pcm16ToUlaw8k, ulawDecodeSample, ulawEncodeSample } from "./lib/audio.js";
 import { creerAmbiance, listerAmbiances, telechargerWav } from "./lib/ambiance.js";
 import { creerDoublure } from "./lib/doublure.js";
+import { creerFinDeTour } from "./lib/fin-de-tour.mjs";
 import { OUTILS_DE_COMMANDE, consigneClotureCommande, createPizzeria } from "./lib/pizzeria.js";
 import {
   chargerSession,
@@ -202,6 +203,19 @@ async function resoudreAmbiance(choix, gain, ratioVoix) {
 // (la primaire garde son avance et gagne la course), il coute seulement des generations jetees ; un seuil plus
 // haut retarde d'autant la parade. Sur un blocage a 3,7 s, la doublure parle vers 1,9 s au lieu de 3,7 s.
 const HEDGE_APRES_MS = Number(process.env.HEDGE_APRES_MS ?? 0);
+// FIN DE TOUR PAR MODELE (18/09/2026). Le pont conclut aujourd'hui qu'un client a fini quand il a compte
+// FIN_DE_TOUR_MS de silence. C'est le plus gros poste de latence qui reste, et c'est ce qui coupe la parole a
+// qui hesite : mesure sur 400 tours humains reels (corpus livekit/eot-bench-data, part francaise), le
+// detecteur d'energie coupe 17,6 % des hesitations pour 685 ms d'attente moyenne. Smart Turn v3 regarde la
+// forme d'onde, donc la prosodie : a attente egale, 10 % de coupures, soit 40 % d'interruptions en moins.
+// Le modele REMPLACE le seuil de silence, il ne s'y empile pas : finDeTourMs ne sert plus que de FILET, pour
+// les 30 a 43 % de fins de tour qu'il ne reconnait pas. EOT_MODELE=0 rend le pont d'avant, sans toucher au
+// code. Reglage mesure au banc (10 % de coupures, 697 ms d'attente moyenne) : 0,98 / 500 ms / filet 900 ms.
+// Le modele tourne dans un fil separe (voir lib/fin-de-tour.mjs) : son mel en JS pur bloquerait la pompe audio.
+const EOT_MODELE = process.env.EOT_MODELE === "1";
+const EOT_SEUIL = Number(process.env.EOT_SEUIL ?? 0.98);
+const EOT_DELAI_MS = Number(process.env.EOT_DELAI_MS ?? 500);
+const EOT_CADENCE_MS = Number(process.env.EOT_CADENCE_MS ?? 100);
 // Battement laisse a la transcription du client avant de conclure qu'un tour ne portait aucun mot (voir
 // `entreeNouvelle`). REDITE_ATTENTE_MS=0 desactive la garde anti-redite sans toucher au code.
 const REDITE_ATTENTE_MS = Number(process.env.REDITE_ATTENTE_MS ?? 600);
@@ -608,6 +622,12 @@ wss.on("connection", (twilio, requete) => {
   let reponseActive = false;                    // entre response.created et response.done
   let retenue = [];                             // paquets PCM retenus pendant la generation
   let tour = null;                              // prise de parole en cours : { debut, voixMs, derniereVoix, coupe }
+  // Fin de tour par modele (voir EOT_MODELE) : un fil separe qui ecoute tout l'appel et repond « il a fini »
+  // bien avant le filet. `eotFini` compte les tours qu'il a conclus, pour le bilan de fin d'appel.
+  const eot = EOT_MODELE && TOURS_PAR_LE_PONT
+    ? creerFinDeTour({ cadenceMs: EOT_CADENCE_MS, surErreur: (m) => console.log(`[eot] fil en erreur : ${m} sid=${callSid}`) })
+    : null;
+  let eotFini = 0;
   const preroll = [];
   let tourEnAttente = false;                    // prise de parole finie pendant une generation ou des outils
   let outilsEnCours = false;
@@ -1292,7 +1312,7 @@ wss.on("connection", (twilio, requete) => {
       // envoyait toujours GROK_REASONING (defaut "high") : un agent regle sur « Rapide » dans l'onglet
       // Voix (Palazzo) reflechissait quand meme avant chaque reponse, d'ou la latence remontee par Jacky.
       const effort = sessionDV?.reasoning === "none" || sessionDV?.reasoning === "high" ? sessionDV.reasoning : GROK_REASONING;
-      console.log(`[session] modele=${modele} reflexion=${effort} tours=${TOURS_PAR_LE_PONT ? "pont fin_de_tour=" + finDeTourMs + "ms" : "grok seuil=" + seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} carte=${carteAjoutee ? "ajoutee" : "non"} anticipation=${ANTICIPATION_MS}ms doublure=${HEDGE_APRES_MS ? HEDGE_APRES_MS + "ms" : "non"} ambiance=${ambiance ? ambiance.libelle : "non"} ${t()} sid=${callSid}`);
+      console.log(`[session] modele=${modele} reflexion=${effort} tours=${TOURS_PAR_LE_PONT ? "pont fin_de_tour=" + finDeTourMs + "ms" : "grok seuil=" + seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} carte=${carteAjoutee ? "ajoutee" : "non"} anticipation=${ANTICIPATION_MS}ms doublure=${HEDGE_APRES_MS ? HEDGE_APRES_MS + "ms" : "non"} ambiance=${ambiance ? ambiance.libelle : "non"} fin_de_tour=${eot ? "modele seuil=" + EOT_SEUIL + " delai=" + EOT_DELAI_MS + "ms filet=" + finDeTourMs + "ms" : "silence seul"} ${t()} sid=${callSid}`);
       grok.send(JSON.stringify({
         type: "session.update",
         session: {
@@ -1519,6 +1539,9 @@ wss.on("connection", (twilio, requete) => {
       // Une fois l'annonce du transfert partie, plus rien ne va a Grok : le client parle deja a l'humain.
       if (transfert && transfert.etat !== "annonce") return;
       const pcm = ulaw8kToPcm16(Buffer.from(m.media.payload, "base64"), GROK_RATE);
+      // Le modele de fin de tour voit TOUT l'appel, sans trou : il juge la prosodie des secondes qui precedent
+      // la pause, pas la pause elle-meme. Le decoupage par tour se fait au moment de l'interroger, pas ici.
+      eot?.pousser(pcm);
       const rms = rmsPcm16(pcm);
       const niveau = rms < 150 ? 0 : rms < 300 ? 1 : rms < 600 ? 2 : rms < 1200 ? 3 : rms < 2400 ? 4 : 5;
       sonHisto[niveau]++;
@@ -1591,6 +1614,19 @@ wss.on("connection", (twilio, requete) => {
           envoyerAGrok([pcm]);
           verifierCoupure();
           if (tour && !voix && peutAnticiper(maintenant)) lancerAnticipation();
+          // Fin de tour par modele (voir EOT_MODELE). Il REMPLACE le comptage de silence, qui ne reste qu'en
+          // filet : des EOT_DELAI_MS de silence on interroge le modele, et sa reponse ne vaut que si le client
+          // n'a pas reparle depuis l'instant ou on la lui a demandee (il n'a vu que l'audio d'alors).
+          if (eot && tour && !voix && maintenant - tour.derniereVoix >= EOT_DELAI_MS) eot.demander(maintenant);
+          if (eot && tour) {
+            const v = eot.prendreVerdict();
+            if (v && v.p >= EOT_SEUIL && v.demandeA > tour.derniereVoix) {
+              eotFini++;
+              const silence = Math.round(maintenant - tour.derniereVoix);
+              console.log(`[eot] fini a ${(v.p).toFixed(3)} apres ${Math.round(v.demandeA - tour.derniereVoix)} ms de silence, verdict rendu en ${Math.round(v.ms)} ms, ${Math.round(finDeTourMs - silence)} ms avant le filet ${t()} sid=${callSid}`);
+              finDuTour();
+            }
+          }
           if (tour && ((!voix && maintenant - tour.derniereVoix >= finDeTourMs) || maintenant - tour.debut > TOUR_MAX_MS)) finDuTour();
         } else {
           preroll.push(pcm);
@@ -1823,6 +1859,10 @@ wss.on("connection", (twilio, requete) => {
       console.log(`[doublure] ${doublureGagnees} reponse(s) jouee(s) sur ${doublureDemandees} demandee(s) sid=${callSid}`);
       doublure.fermer();
       doublure = null;
+    }
+    if (eot) {
+      console.log(`[eot] ${eotFini} tour(s) conclu(s) par le modele sur ${toursValides} valides, ${eot.resume()} sid=${callSid}`);
+      eot.fermer();
     }
     if (ambiance?.msJoues) console.log(`[ambiance] « ${ambiance.libelle} », ${(ambiance.msJoues / 1000).toFixed(1)} s de fond joues sur l'appel sid=${callSid}`);
     const lignes = dialog.filter((l) => String(l.msg || "").trim()); // une place reservee a une transcription jamais arrivee reste vide

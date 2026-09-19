@@ -4,6 +4,8 @@ node_modules/
 *.log
 .DS_Store
 test/results/
+test/bancs/fixtures/eot-livekit/
+.sorties/
 
 # Sources brutes et rendus du banc d ambiance
 .sources/

@@ -64,6 +64,14 @@ const pont = spawn(process.execPath, ["server.js"], {
     ...(process.env.AMBIANCE_APRES_MS ? { AMBIANCE_APRES_MS: process.env.AMBIANCE_APRES_MS } : {}),
     ...(process.env.AMBIANCE_GAIN ? { AMBIANCE_GAIN: process.env.AMBIANCE_GAIN } : {}),
     ...(process.env.AMBIANCE_FICHIER ? { AMBIANCE_FICHIER: process.env.AMBIANCE_FICHIER } : {}),
+    // Fin de tour par modele (EOT_MODELE=1). ⚠ Ce banc joue un client de SYNTHESE, qui prononce chaque
+    // fragment avec une intonation descendante : le modele le croit fini et coupe. Il verifie la plomberie
+    // (le fil se charge, les verdicts arrivent, le tour se conclut plus tot, l'audio ne bafouille pas),
+    // JAMAIS la qualite des decisions, qui ne se mesure que sur de vrais enregistrements.
+    ...(process.env.EOT_MODELE ? { EOT_MODELE: process.env.EOT_MODELE } : {}),
+    ...(process.env.EOT_SEUIL ? { EOT_SEUIL: process.env.EOT_SEUIL } : {}),
+    ...(process.env.EOT_DELAI_MS ? { EOT_DELAI_MS: process.env.EOT_DELAI_MS } : {}),
+    ...(process.env.EOT_CADENCE_MS ? { EOT_CADENCE_MS: process.env.EOT_CADENCE_MS } : {}),
   },
 });
 const t0 = Date.now();
@@ -163,7 +171,7 @@ if (SCENARIO === "lorenzo") {
   pont.kill();
   fs.writeFileSync(`${S}/${NOM}.log`, journal.join("\n"));
   const iDialogue = journal.findIndex((l) => /\[dialogue\]/.test(l));
-  console.log(journal.filter((l, i) => /\[banc\]|\[tour\] client|\[latence\]|\[outil\]|\[garde\]|hangup|erreur/.test(l) || (iDialogue >= 0 && i > iDialogue)).map((l) => l.replace(/ sid=CA\w+/, "").slice(0, 230)).join("\n"));
+  console.log(journal.filter((l, i) => /\[banc\]|\[tour\] client|\[latence\]|\[outil\]|\[garde\]|\[eot\]|hangup|erreur/.test(l) || (iDialogue >= 0 && i > iDialogue)).map((l) => l.replace(/ sid=CA\w+/, "").slice(0, 230)).join("\n"));
   process.exit(0);
 }
 if (SCENARIO === "anticipation") {
@@ -185,7 +193,7 @@ if (SCENARIO === "anticipation") {
   pont.kill();
   fs.writeFileSync(`${S}/${NOM}.log`, journal.join("\n"));
   const iDialogue = journal.findIndex((l) => /\[dialogue\]/.test(l));
-  console.log(journal.filter((l, i) => /\[banc\]|\[tour\]|\[latence\]|\[reponse\]|coupe|erreur|\[son\]|jamais|deleted|cancel/.test(l) || (iDialogue >= 0 && i > iDialogue)).map((l) => l.replace(/ sid=CA\w+/, "").slice(0, 230)).join("\n"));
+  console.log(journal.filter((l, i) => /\[banc\]|\[tour\]|\[latence\]|\[reponse\]|\[eot\]|coupe|erreur|\[son\]|jamais|deleted|cancel/.test(l) || (iDialogue >= 0 && i > iDialogue)).map((l) => l.replace(/ sid=CA\w+/, "").slice(0, 230)).join("\n"));
   process.exit(0);
 }
 await jouer("question");
@@ -221,5 +229,5 @@ h.writeUInt16LE(1, 20); h.writeUInt16LE(2, 22); h.writeUInt32LE(8000, 24); h.wri
 h.write("data", 36); h.writeUInt32LE(data.length, 40);
 fs.writeFileSync(`${S}/${NOM}.wav`, Buffer.concat([h, data]));
 fs.writeFileSync(`${S}/${NOM}.log`, journal.join("\n"));
-console.log(journal.filter((l) => /\[banc\]|\[tour\]|\[latence\]|\[reponse\]|coupe|erreur|\[session\]|\[son\]|\[doublure\]|\[ambiance\]|jamais/.test(l)).map((l) => l.replace(/ sid=CA\w+/, "").slice(0, 230)).join("\n"));
+console.log(journal.filter((l) => /\[banc\]|\[tour\]|\[latence\]|\[reponse\]|\[eot\]|coupe|erreur|\[session\]|\[son\]|\[doublure\]|\[ambiance\]|jamais/.test(l)).map((l) => l.replace(/ sid=CA\w+/, "").slice(0, 230)).join("\n"));
 process.exit(0);
