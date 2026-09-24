@@ -1325,15 +1325,16 @@ wss.on("connection", (twilio) => {
     console.log(`[son] rms <150:${sonHisto[0]} <300:${sonHisto[1]} <600:${sonHisto[2]} <1200:${sonHisto[3]} <2400:${sonHisto[4]} >=2400:${sonHisto[5]} pendant_agent=${sonHistoAgent.join("/")} seuil=${SEUIL_SON_RMS}${TOURS_PAR_LE_PONT ? ` seuil_max=${Math.round(seuilMax)} tours=${toursValides} ignores=${toursIgnores}` : ""} sid=${callSid}`);
     if (lignes.length) pushCall({ ts: new Date().toISOString(), from: fromNumber, sid: callSid, endReason, dialog: text });
     const hasClient = lignes.some((l) => l.who === "Client");
-    if (hasClient && RECAP_EXCLURE.has(String(fromNumber || "").replace(/[^\d+]/g, ""))) {
+    // Tout appel doit laisser une trace chez le client (demande de Motralec, 24/09/2026) : celui qui
+    // raccroche sans parler part aussi, en « appel en absence » (sans_parole), avec son numero.
+    if (RECAP_EXCLURE.has(String(fromNumber || "").replace(/[^\d+]/g, ""))) {
       console.log(`[recap] numero de test ${fromNumber}, pas de recap sid=${callSid}`);
-    } else if (hasClient && N8N_RECAP_URL) {
+    } else if (N8N_RECAP_URL) {
       const payload = { dialog: text, phone: fromNumber || "inconnu", call_sid: callSid };
+      if (!hasClient) Object.assign(payload, { sans_parole: true, duree_s: Math.round((Date.now() - debutAppelMs) / 1000) });
       const ok = await postRecap(payload, 4); // essais immediats au raccrochage : 1s, 2s, 4s, 8s
-      if (ok) console.log(`[recap] envoye a n8n sid=${callSid}`);
+      if (ok) console.log(`[recap] ${hasClient ? "envoye" : "appel en absence envoye"} a n8n sid=${callSid}`);
       else { pendingRecaps.push(payload); console.error(`[recap] n8n injoignable, mis en file de reessai sid=${callSid}`); }
-    } else if (!hasClient) {
-      console.log(`[call] raccroche sans parole, pas de recap sid=${callSid}`);
     }
   }
 });
