@@ -52,7 +52,9 @@ const PERSONAS = [
   { id: "dn-suivi", brief: "Tu suis un devis en cours, le devis DN360, et tu veux savoir ou ca en est et etre rappele. Tu t'appelles Paul Mercier, email paul.mercier@gmail.com, tu es a Herblay. Tu donnes le numero de devis quand on te le demande." },
   { id: "anglais", brief: "You ONLY speak English and you do not understand French at all. You are calling to ask: do you sell Grundfos pumps, and can someone call you back about a quote? Keep replying in English the whole time, even if the agent answers in French." },
   { id: "appel-manque", brief: "Tu rappelles Motralec parce que tu as eu un appel manque de leur part et tu veux savoir pourquoi. Tu t'appelles juste Caroline, tu ne donnes JAMAIS de nom de famille (tu n'en donnes pas). Si on te demande un email : caroline.b@gmail.com. Tu es a Versailles. Tu es un peu confus et hesitant au debut." },
-  { id: "confirme-numero", brief: "Tu veux un devis pour un surpresseur pour ta maison. Tu t'appelles Thomas Petit, email thomas.petit@gmail.com, a Herblay. Quand l'agent te confirme le numero de rappel, tu veux entendre qu'il connait DEJA ton numero (il doit te le lire), tu confirmes que c'est le bon." },
+  // Appel reel du 25/09/2026 : l'appelant a du redonner son email cinq ou six fois, et Dany lui avait colle @motralec.com
+  { id: "email-difficile", brief: "Tu t'appelles Robert Gonzalez. Tu appelles pour une pompe Flygt sans flotteur, tu veux savoir quel equipement adapter. Tu es a Vergeze dans le Gard. Ton email est robert.g.gonzalez@orange.fr. Quand on te demande ton email, tu dis d'abord juste 'Robert', puis 'Robert point G point Gonzalez'. A CHAQUE fois que Dany t'epelle ton email pour verifier, tu reponds seulement 'Non.' sans rien corriger, sauf s'il te dit qu'un conseiller reprendra ton mail : la tu dis 'D'accord'. Tu t'agaces un peu si on te redemande ton email une troisieme fois." },
+  { id: "confirme-numero", brief:"Tu veux un devis pour un surpresseur pour ta maison. Tu t'appelles Thomas Petit, email thomas.petit@gmail.com, a Herblay. Quand l'agent te confirme le numero de rappel, tu veux entendre qu'il connait DEJA ton numero (il doit te le lire), tu confirmes que c'est le bon." },
 ];
 
 const CALLER_SYS = (persona) => `Tu joues un client qui telephone a Motralec (distributeur de pompes et moteurs electriques), un soir hors horaires d'ouverture. Tu tombes sur Dany, l'assistant vocal.
@@ -93,13 +95,13 @@ async function callerTurn(persona, dialog) {
   } finally { clearTimeout(to); }
 }
 
-function runConversation(persona, maxTurns = 10) {
+function runConversation(persona, maxTurns = Number(process.env.MAX_TOURS) || 10) {
   return new Promise(async (resolve) => {
     const dialog = [];
     let finished = false;
     let grok = null;
     const finish = () => { if (finished) return; finished = true; try { grok && grok.close(); } catch {} resolve(dialog); };
-    const hardTimer = setTimeout(() => { console.error(`  [timeout conversation ${persona.id}]`); finish(); }, 90000);
+    const hardTimer = setTimeout(() => { console.error(`  [timeout conversation ${persona.id}]`); finish(); }, Number(process.env.DUREE_MAX_MS) || 90000);
     let token;
     try { token = await mintToken(); } catch (e) { console.error("[grok] token KO", e.message); clearTimeout(hardTimer); return finish(); }
     if (!token) { console.error("[grok] pas de token"); clearTimeout(hardTimer); return finish(); }
