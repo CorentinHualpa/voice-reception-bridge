@@ -64,6 +64,13 @@ const pont = spawn(process.execPath, ["server.js"], {
     ...(process.env.AMBIANCE_APRES_MS ? { AMBIANCE_APRES_MS: process.env.AMBIANCE_APRES_MS } : {}),
     ...(process.env.AMBIANCE_GAIN ? { AMBIANCE_GAIN: process.env.AMBIANCE_GAIN } : {}),
     ...(process.env.AMBIANCE_FICHIER ? { AMBIANCE_FICHIER: process.env.AMBIANCE_FICHIER } : {}),
+    // Lecture par ElevenLabs (LECTURE=elevenlabs) : la cle est lue dans le vault, la voix et la balise viennent de
+    // l'environnement du banc (ELEVEN_VOIX, ELEVEN_BALISE, ELEVEN_MODELE).
+    ...(process.env.LECTURE === "elevenlabs" ? {
+      LECTURE: "elevenlabs",
+      ELEVENLABS_API_KEY: (vault.match(/^ELEVENLABS_API_KEY=(.*)$/m)?.[1] ?? "").trim().replace(/^["']|["']$/g, ""),
+      ...Object.fromEntries(["ELEVEN_VOIX", "ELEVEN_BALISE", "ELEVEN_MODELE", "ELEVEN_DELAI_MAX_MS"].filter((k) => process.env[k]).map((k) => [k, process.env[k]])),
+    } : {}),
     // Fin de tour par modele (EOT_MODELE=1). ⚠ Ce banc joue un client de SYNTHESE, qui prononce chaque
     // fragment avec une intonation descendante : le modele le croit fini et coupe. Il verifie la plomberie
     // (le fil se charge, les verdicts arrivent, le tour se conclut plus tot, l'audio ne bafouille pas),

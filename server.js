@@ -36,6 +36,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { ulaw8kToPcm16, pcm16ToUlaw8k, ulawDecodeSample, ulawEncodeSample } from "./lib/audio.js";
 import { creerAmbiance, listerAmbiances, telechargerWav } from "./lib/ambiance.js";
 import { creerDoublure } from "./lib/doublure.js";
+import { configLectureEleven, creerLectureEleven } from "./lib/lecture-eleven.js";
 import { creerFinDeTour } from "./lib/fin-de-tour.mjs";
 import { OUTILS_DE_COMMANDE, consigneClotureCommande, createPizzeria } from "./lib/pizzeria.js";
 import {
@@ -203,6 +204,14 @@ async function resoudreAmbiance(choix, gain, ratioVoix) {
 // (la primaire garde son avance et gagne la course), il coute seulement des generations jetees ; un seuil plus
 // haut retarde d'autant la parade. Sur un blocage a 3,7 s, la doublure parle vers 1,9 s au lieu de 3,7 s.
 const HEDGE_APRES_MS = Number(process.env.HEDGE_APRES_MS ?? 0);
+
+// LECTURE (28/09/2026) : « grok » (defaut) garde la voix de Grok ; « elevenlabs » fait lire le texte de chaque
+// reponse par ElevenLabs (voir lib/lecture-eleven.js). Reglages : ELEVENLABS_API_KEY, ELEVEN_VOIX (obligatoires),
+// ELEVEN_MODELE (eleven_v4_turbo), ELEVEN_BALISE (balise de jeu posee devant chaque morceau, ex. l'accent),
+// ELEVEN_STABILITE (0.5), ELEVEN_SIMILARITE (0.75). Retour arriere sans code : LECTURE=grok.
+// Si ElevenLabs tombe pendant un appel (cle, quota, reseau), l'appel repasse sur la voix de Grok jusqu'a la fin.
+const LECTURE_ELEVEN = configLectureEleven();
+console.log(`[lecture] ${LECTURE_ELEVEN ? `ElevenLabs voix=${LECTURE_ELEVEN.voix} modele=${LECTURE_ELEVEN.modele} balise=${LECTURE_ELEVEN.balise ? `« ${LECTURE_ELEVEN.balise} »` : "aucune"}` : "voix de Grok"}`);
 // FIN DE TOUR PAR MODELE (18/09/2026). Le pont conclut aujourd'hui qu'un client a fini quand il a compte
 // FIN_DE_TOUR_MS de silence. C'est le plus gros poste de latence qui reste, et c'est ce qui coupe la parole a
 // qui hesite : mesure sur 400 tours humains reels (corpus livekit/eot-bench-data, part francaise), le
@@ -644,6 +653,13 @@ wss.on("connection", (twilio, requete) => {
   let doublureGagnante = false; // la reponse en cours est jouee par la doublure, pas par la primaire
   let resteAudioDoublure = Buffer.alloc(0); // octet impair en attente, comme pour la primaire
   let primaireJetee = 0;                    // n° de la reponse de la primaire dont le son ne doit plus partir
+  // Lecture ElevenLabs (voir LECTURE_ELEVEN) : un flux par reponse, pour la primaire et pour la doublure. La voix
+  // de Grok est gardee de cote pendant la reponse en cours, pour le secours (`lectureEnEchec`).
+  const lecture = LECTURE_ELEVEN ? creerLectureEleven(LECTURE_ELEVEN, { log: (m) => console.log(`${m.trimEnd()} ${t()} sid=${callSid}`) }) : null;
+  let lectureEnEchec = false;               // ElevenLabs a lache sur cet appel : voix de Grok jusqu'a la fin
+  let fluxPrimaire = null, fluxDoublure = null;
+  let voixGrokGardee = [];                  // ulaw de Grok de la reponse en cours, pour le secours
+  const lectureActive = () => Boolean(lecture) && !lectureEnEchec;
   // GROK REDIT SA DERNIERE REPONSE quand on lui demande une reponse SANS nouvelle entree (banc
   // `banc-parades-pics.mjs avide` : premiere demande a vide ignoree en silence, seconde repetee mot pour mot).
   // Le pont valide un tour des que le client a fait assez de bruit, or un « mmm » ou un souffle ne cree AUCUN
@@ -709,6 +725,7 @@ wss.on("connection", (twilio, requete) => {
     finLecture = Date.now();
     reponseCoupee = respSeq;
     if (doublure?.occupee) doublure.abandonner("le client a coupe");
+    fluxPrimaire?.couper(); fluxDoublure?.couper(); voixGrokGardee = [];
     pushAgent();
     agentSpeaking = false;
     console.log(`[turn] client coupe l'agent (reponse n°${respSeq}, ${Math.round(sonMs)} ms de voix) ${t()} sid=${callSid}`);
@@ -816,6 +833,7 @@ wss.on("connection", (twilio, requete) => {
     a.annuleeA = Date.now();
     toursValides--;
     console.log(`[tour] anticipation annulee : ${pourquoi} ${t()}`);
+    fluxPrimaire?.couper(); voixGrokGardee = [];
     if (a.etat === "finie") { finirAnnulation(null); return; }
     // Envoye avant response.created, l'annulation s'applique a la reponse des sa creation (banc du 17/09).
     if (grok && grok.readyState === WebSocket.OPEN) grok.send(JSON.stringify({ type: "response.cancel" }));
@@ -840,6 +858,46 @@ wss.on("connection", (twilio, requete) => {
     lacherRetenue();
     console.log(`[tour] anticipation effacee (${aEffacer.length} element${aEffacer.length > 1 ? "s" : ""}), la suite de la phrase repart (${(suite * 0.02).toFixed(1)} s) ${t()}`);
     if (tourEnAttente && !tour) { validerTour(); demanderReponse(); }
+  }
+  // `response.done` de la primaire (differe tant que la lecture ElevenLabs n'a pas livre toute la voix).
+  function finReponseGrok(e) {
+    if (anticipation) {
+      // Reponse anticipee : annulee, elle s'efface ; finie avant la fin du tour, tout attend la confirmation.
+      if (anticipation.annulee) finirAnnulation(e);
+      else { anticipation.etat = "finie"; anticipation.fin = e; reponseActive = false; }
+      return;
+    }
+    if (e.response?.status === "cancelled") { // le pont n'annule qu'une anticipation : reliquat d'une annulation deja soldee
+      console.log(`[reponse] n°${respSeq} statut=cancelled (reliquat) ${t()} sid=${callSid}`);
+      reponseActive = false; generation = false; pendingCalls = []; agentBuf = "";
+      lacherRetenue();
+      return;
+    }
+    terminerReponse(e);
+  }
+  // Tout le son d'une reponse de la primaire passe ici, qu'il vienne de Grok ou d'ElevenLabs : memes gardes,
+  // meme retenue pendant une anticipation.
+  function livrerSonPrimaire(ulaw, marque = respSeq) {
+    if (marque !== respSeq || respSeq === reponseCoupee || respSeq === primaireJetee) return;
+    if (anticipation) { // la fin du tour n'est pas confirmee : le son attend
+      if (!anticipation.annulee) { if (!anticipation.pretA) anticipation.pretA = Date.now(); anticipation.audio.push(ulaw); }
+      return;
+    }
+    envoyerSonAgent(ulaw);
+  }
+  function ouvrirLecturePrimaire(marque) {
+    return lecture.flux(marque, {
+      surSon: (u) => livrerSonPrimaire(u, marque),
+      // SECOURS : ElevenLabs a lache (cle, quota, reseau, delai). Si rien de cette reponse n'a encore ete joue,
+      // la voix de Grok gardee de cote part a sa place ; la suite de l'appel reste sur Grok. Au milieu d'une
+      // reponse, on ne rejoue rien (le client entendrait le debut deux fois) : la reponse suivante sera en Grok.
+      surEchec: ({ octetsLivres, erreur }) => {
+        lectureEnEchec = true;
+        const garde = voixGrokGardee; voixGrokGardee = [];
+        console.log(`[lecture] ElevenLabs en echec (${erreur}) : voix de Grok jusqu'a la fin de l'appel${octetsLivres ? "" : `, ${(garde.reduce((n, u) => n + u.length, 0) / 8000).toFixed(1)} s de la reponse n°${marque} rejouees`} ${t()} sid=${callSid}`);
+        if (!octetsLivres && marque === respSeq) for (const u of garde) livrerSonPrimaire(u, marque);
+      },
+    });
   }
   // Fin d'une reponse de Grok : journal, queue de silence, outils, relances. Differee pour une reponse anticipee.
   function terminerReponse(e) {
@@ -979,7 +1037,10 @@ wss.on("connection", (twilio, requete) => {
   function doublurePrendLaMain() {
     if (doublureGagnante) return true;
     if (premierSon || audioReponseOctets > 0) return false; // la primaire a parle la premiere
+    // Lecture ElevenLabs : la course se joue sur le TEXTE, puisque c'est lui qui part a la synthese.
+    if (lectureActive() && fluxPrimaire?.marque === respSeq && fluxPrimaire.texteRecu) return false;
     doublureGagnante = true;
+    fluxPrimaire?.couper(); voixGrokGardee = [];
     doublureGagnees++;
     // Les deltas de la primaire sont jetes a partir d'ici. ⚠ NE PAS se servir de `reponseCoupee` pour ca : il
     // sert aussi de garde a la coupure de parole (`reponseCoupee !== respSeq`), et le client ne pouvait alors
@@ -1012,7 +1073,24 @@ wss.on("connection", (twilio, requete) => {
         },
       },
       sur: {
+        // Lecture ElevenLabs : la doublure est lue comme la primaire, a partir de son texte ; sa voix est jetee.
+        texte: (delta, tourDoublure) => {
+          if (!lectureActive()) return;
+          if (tourDoublure.marque !== respSeq || tourDoublure.outil) return;
+          if (reponseCoupee === respSeq) return;
+          if (!doublurePrendLaMain()) return;
+          if (!fluxDoublure || fluxDoublure.marque !== tourDoublure.marque) {
+            fluxDoublure?.couper();
+            const marque = tourDoublure.marque;
+            fluxDoublure = lecture.flux(marque, {
+              surSon: (u) => { if (marque === respSeq && reponseCoupee !== marque) envoyerSonAgent(u); },
+              surEchec: () => { lectureEnEchec = true; console.log(`[lecture] ElevenLabs en echec : voix de Grok jusqu'a la fin de l'appel ${t()} sid=${callSid}`); },
+            });
+          }
+          fluxDoublure.texte(delta);
+        },
         son: (pcm, tourDoublure) => {
+          if (lectureActive()) return;
           // Le tour a change (le client a repris, la primaire a fini) : ce son n'a plus lieu d'etre.
           if (tourDoublure.marque !== respSeq || tourDoublure.outil) return;
           if (reponseCoupee === respSeq) return; // le client a coupe : la suite ne part plus, comme pour la primaire
@@ -1029,44 +1107,54 @@ wss.on("connection", (twilio, requete) => {
           doublure.abandonner("outil demande");
         },
         finie: (statut, tourDoublure) => {
-          resteAudioDoublure = Buffer.alloc(0);
-          if (!doublureGagnante || tourDoublure.marque !== respSeq) return;
-          // Ce que la doublure a dit doit devenir l'historique de la PRIMAIRE, sinon elle le redirait au tour
-          // suivant. L'injection en role assistant est acceptee et relue fidelement (banc du 17/09). La
-          // doublure, elle, le recevra par le curseur sur `dialog` : ne pas le lui poser deux fois.
-          const texte = (tourDoublure.texte || "").trim();
-          if (texte) {
-            try { grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "assistant", content: [{ type: "output_text", text: texte }] } })); } catch {}
-            pushLine("Agent", texte);
-            consommerEntreeClient(); // la doublure a repondu : l'entree du tour est consommee, coupee ou non
-            // Coupee par le client : le tour n'a pas ete entendu en entier, il ne compte pas comme dit (meme
-            // regle que pour la primaire, cf. terminerReponse).
-            if (reponseCoupee !== tourDoublure.marque) {
-              repliqueEnCours = `${repliqueEnCours} ${texte}`.trim().slice(-4000);
-              if (CLOSING_RE.test(texte)) closingSaid = true;
-            }
+          // Lecture ElevenLabs : le tour ne se clot qu'une fois tout son texte lu, sinon la queue de silence et
+          // le mark de fin partiraient AVANT la voix (meme raison que pour la primaire, voir response.done).
+          const f = fluxDoublure;
+          if (f && f.marque === tourDoublure.marque && !f.fini) {
+            f.fin();
+            if (!f.fini) { f.quandFini(() => finDoublure(statut, tourDoublure)); return; }
           }
-          console.log(`[doublure] reponse n°${tourDoublure.marque} finie (${statut}), ${texte.length} car${reponseCoupee === tourDoublure.marque ? ", coupee par le client" : ""}${texte ? ` : « ${texte.slice(0, 120)} »` : ""} ${t()} sid=${callSid}`);
-          // Fin du tour, maintenant que la primaire sait ce qui a ete dit : elle peut de nouveau entendre le
-          // client, et repondre a ce qu'il a dit pendant que la doublure parlait.
-          doublureGagnante = false;
-          generation = false;
-          lacherRetenue();
-          // ⚠⚠ La queue de silence ET le mark de fin de lecture sont d'ordinaire poses par terminerReponse,
-          // que la doublure court-circuite. Sans la queue, la derniere syllabe de sa reponse se perd sur la
-          // ligne ; sans le mark, un pont en DEMI-DUPLEX reste sourd jusqu'a son filet (12 s de blanc mesurees
-          // sur un vrai appel de Dany). Il faut donc les refaire ici, a l'identique.
-          if (streamSid && audioReponseOctets > 0 && reponseCoupee !== tourDoublure.marque && twilio.readyState === WebSocket.OPEN) {
-            const silence = Buffer.alloc(2400, 0xff); // mu-law 0xFF = zero, 300 ms a 8 kHz
-            envoyerMedia(silence, { sousVoix: false });
-            finLecture = Math.max(finLecture, Date.now()) + 300;
-          }
-          if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `agentdone:${tourDoublure.marque}` } }));
-          if (tourEnAttente && !tour) { validerTour(); demanderReponse(); }
+          finDoublure(statut, tourDoublure);
         },
       },
     });
     doublure.ouvrir().then((ok) => { if (!ok) doublure = null; });
+    function finDoublure(statut, tourDoublure) {
+      resteAudioDoublure = Buffer.alloc(0);
+      if (!doublureGagnante || tourDoublure.marque !== respSeq) return;
+      // Ce que la doublure a dit doit devenir l'historique de la PRIMAIRE, sinon elle le redirait au tour
+      // suivant. L'injection en role assistant est acceptee et relue fidelement (banc du 17/09). La
+      // doublure, elle, le recevra par le curseur sur `dialog` : ne pas le lui poser deux fois.
+      const texte = (tourDoublure.texte || "").trim();
+      if (texte) {
+        try { grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "assistant", content: [{ type: "output_text", text: texte }] } })); } catch {}
+        pushLine("Agent", texte);
+        consommerEntreeClient(); // la doublure a repondu : l'entree du tour est consommee, coupee ou non
+        // Coupee par le client : le tour n'a pas ete entendu en entier, il ne compte pas comme dit (meme
+        // regle que pour la primaire, cf. terminerReponse).
+        if (reponseCoupee !== tourDoublure.marque) {
+          repliqueEnCours = `${repliqueEnCours} ${texte}`.trim().slice(-4000);
+          if (CLOSING_RE.test(texte)) closingSaid = true;
+        }
+      }
+      console.log(`[doublure] reponse n°${tourDoublure.marque} finie (${statut}), ${texte.length} car${reponseCoupee === tourDoublure.marque ? ", coupee par le client" : ""}${texte ? ` : « ${texte.slice(0, 120)} »` : ""} ${t()} sid=${callSid}`);
+      // Fin du tour, maintenant que la primaire sait ce qui a ete dit : elle peut de nouveau entendre le
+      // client, et repondre a ce qu'il a dit pendant que la doublure parlait.
+      doublureGagnante = false;
+      generation = false;
+      lacherRetenue();
+      // ⚠⚠ La queue de silence ET le mark de fin de lecture sont d'ordinaire poses par terminerReponse,
+      // que la doublure court-circuite. Sans la queue, la derniere syllabe de sa reponse se perd sur la
+      // ligne ; sans le mark, un pont en DEMI-DUPLEX reste sourd jusqu'a son filet (12 s de blanc mesurees
+      // sur un vrai appel de Dany). Il faut donc les refaire ici, a l'identique.
+      if (streamSid && audioReponseOctets > 0 && reponseCoupee !== tourDoublure.marque && twilio.readyState === WebSocket.OPEN) {
+        const silence = Buffer.alloc(2400, 0xff); // mu-law 0xFF = zero, 300 ms a 8 kHz
+        envoyerMedia(silence, { sousVoix: false });
+        finLecture = Math.max(finLecture, Date.now()) + 300;
+      }
+      if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `agentdone:${tourDoublure.marque}` } }));
+      if (tourEnAttente && !tour) { validerTour(); demanderReponse(); }
+    }
   }
   // REDITE (voir `entreeNouvelle`). Une reponse dont le tour n'a apporte AUCUN message nouveau ne peut etre que
   // la precedente redite : son son n'est pas joue et la reponse est annulee. Tant que le doute subsiste, le son
@@ -1083,6 +1171,7 @@ wss.on("connection", (twilio, requete) => {
     rediteTranchee = true;
     retenueRedite = [];
     reponseCoupee = respSeq; // la suite du son est jetee, comme pour une reponse coupee
+    fluxPrimaire?.couper(); voixGrokGardee = [];
     const debut = agentBuf.trim();
     agentBuf = "";
     try { grok.send(JSON.stringify({ type: "response.cancel" })); } catch {}
@@ -1270,6 +1359,13 @@ wss.on("connection", (twilio, requete) => {
       AMBIANCE_RATIO_VOIX
     );
     if (ambiance) console.log(`[ambiance] « ${ambiance.libelle} », boucle de ${ambiance.secondes.toFixed(0)} s, gain ${AMBIANCE_GAIN} ${t()} sid=${callSid}`);
+    // La connexion a ElevenLabs s'ouvre pendant que Grok se prepare : l'accueil n'attend pas la poignee de main,
+    // et une cle morte ou une voix retiree fait partir l'appel sur la voix de Grok avant le premier mot.
+    if (lecture) lecture.chauffer().then((ok) => {
+      if (ok === true) return;
+      lectureEnEchec = true;
+      console.log(`[lecture] ElevenLabs injoignable a l'ouverture (${ok}) : voix de Grok pour cet appel ${t()} sid=${callSid}`);
+    });
     if (TOURS_PAR_LE_PONT && MMM_APRES_MS > 0) sonDAttente(sessionDV?.voice || GROK_VOICE, vitesse).then((s) => { sonMmm = s; });
     grok = new WebSocket(`wss://api.x.ai/v1/realtime?model=${modele}`, [`xai-client-secret.${token}`]);
 
@@ -1312,7 +1408,7 @@ wss.on("connection", (twilio, requete) => {
       // envoyait toujours GROK_REASONING (defaut "high") : un agent regle sur « Rapide » dans l'onglet
       // Voix (Palazzo) reflechissait quand meme avant chaque reponse, d'ou la latence remontee par Jacky.
       const effort = sessionDV?.reasoning === "none" || sessionDV?.reasoning === "high" ? sessionDV.reasoning : GROK_REASONING;
-      console.log(`[session] modele=${modele} reflexion=${effort} tours=${TOURS_PAR_LE_PONT ? "pont fin_de_tour=" + finDeTourMs + "ms" : "grok seuil=" + seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} carte=${carteAjoutee ? "ajoutee" : "non"} anticipation=${ANTICIPATION_MS}ms doublure=${HEDGE_APRES_MS ? HEDGE_APRES_MS + "ms" : "non"} ambiance=${ambiance ? ambiance.libelle : "non"} fin_de_tour=${eot ? "modele seuil=" + EOT_SEUIL + " delai=" + EOT_DELAI_MS + "ms filet=" + finDeTourMs + "ms" : "silence seul"} ${t()} sid=${callSid}`);
+      console.log(`[session] modele=${modele} reflexion=${effort} tours=${TOURS_PAR_LE_PONT ? "pont fin_de_tour=" + finDeTourMs + "ms" : "grok seuil=" + seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} carte=${carteAjoutee ? "ajoutee" : "non"} anticipation=${ANTICIPATION_MS}ms doublure=${HEDGE_APRES_MS ? HEDGE_APRES_MS + "ms" : "non"} ambiance=${ambiance ? ambiance.libelle : "non"} lecture=${lectureActive() ? "elevenlabs" : "grok"} fin_de_tour=${eot ? "modele seuil=" + EOT_SEUIL + " delai=" + EOT_DELAI_MS + "ms filet=" + finDeTourMs + "ms" : "silence seul"} ${t()} sid=${callSid}`);
       grok.send(JSON.stringify({
         type: "session.update",
         session: {
@@ -1372,6 +1468,8 @@ wss.on("connection", (twilio, requete) => {
           if (doublure?.occupee) doublure.abandonner("nouvelle reponse de la primaire");
           pushUser(); // le tour du client est fini, l'agent repond
           respSeq++;
+          fluxPrimaire?.couper(); fluxDoublure?.couper(); fluxDoublure = null; voixGrokGardee = [];
+          fluxPrimaire = lectureActive() ? ouvrirLecturePrimaire(respSeq) : null;
           agentSpeaking = true; agentSpeakingSince = Date.now(); // Dany commence a parler -> on coupe l'ecoute (anti-echo)
           if (reponseAnticipee === -1) reponseAnticipee = respSeq;
           console.log(`[turn] Dany n°${respSeq}${anticipation || reponseAnticipee === respSeq ? " (anticipee)" : ""} ${t()}`);
@@ -1393,30 +1491,36 @@ wss.on("connection", (twilio, requete) => {
           const pcm = Buffer.from(brut.subarray(0, pair)); // copie : offset pair, sinon Int16Array leve
           const ulaw = pcm16ToUlaw8k(pcm, GROK_RATE);
           if (ulaw.length === 0) { mediasVides++; break; }
-          if (anticipation) { // la fin du tour n'est pas confirmee : le son attend
-            if (!anticipation.annulee) { if (!anticipation.pretA) anticipation.pretA = Date.now(); anticipation.audio.push(ulaw); }
-            break;
-          }
-          envoyerSonAgent(ulaw);
+          // Lecture ElevenLabs : la voix de Grok ne part pas, elle attend de cote au cas ou ElevenLabs lacherait.
+          if (lectureActive()) { voixGrokGardee.push(ulaw); break; }
+          livrerSonPrimaire(ulaw);
           break;
         }
         case "response.output_audio_transcript.delta":
           if (e.delta) { agentBuf += e.delta; if (CLOSING_RE.test(agentBuf)) closingSaid = true; }
+          if (e.delta && lectureActive() && fluxPrimaire?.marque === respSeq && respSeq !== reponseCoupee && respSeq !== primaireJetee) {
+            // La primaire a du texte : c'est elle qui parlera, la doublure n'a plus d'objet (en mode Grok, c'est
+            // son premier son qui la congedie, dans envoyerSonAgent).
+            if (!doublureGagnante && doublure?.occupee && !fluxPrimaire.texteRecu) doublure.abandonner("la primaire a du texte");
+            fluxPrimaire.texte(e.delta);
+          }
           break;
         case "response.done": {
-          if (anticipation) {
-            // Reponse anticipee : annulee, elle s'efface ; finie avant la fin du tour, tout attend la confirmation.
-            if (anticipation.annulee) finirAnnulation(e);
-            else { anticipation.etat = "finie"; anticipation.fin = e; reponseActive = false; }
-            break;
+          // Lecture ElevenLabs : Grok a fini d'ECRIRE, mais la synthese de la fin de son texte est peut-etre encore en
+          // route. Tout ce qui clot la reponse (queue de silence, mark de fin de lecture, outils, relance, au
+          // revoir) attend qu'elle soit livree, sinon il partirait AVANT la voix.
+          const f = fluxPrimaire;
+          if (f && f.marque === respSeq && !f.fini) {
+            f.fin();
+            if (!f.fini) {
+              f.quandFini(() => {
+                if (respSeq !== f.marque) { console.log(`[lecture] fin de la reponse n°${f.marque} ignoree : la n°${respSeq} a commence ${t()} sid=${callSid}`); return; }
+                finReponseGrok(e);
+              });
+              break;
+            }
           }
-          if (e.response?.status === "cancelled") { // le pont n'annule qu'une anticipation : reliquat d'une annulation deja soldee
-            console.log(`[reponse] n°${respSeq} statut=cancelled (reliquat) ${t()} sid=${callSid}`);
-            reponseActive = false; generation = false; pendingCalls = []; agentBuf = "";
-            lacherRetenue();
-            break;
-          }
-          terminerReponse(e);
+          finReponseGrok(e);
           break;
         }
         case "conversation.item.input_audio_transcription.updated":
@@ -1584,6 +1688,7 @@ wss.on("connection", (twilio, requete) => {
         // sait pas les executer, et la relance qui suit un outil est simplement lente, pas bloquee.
         if (doublure && !doublureGagnante && reponseActive && !outilsEnCours && !tour && !transfert && !endRequested
           && !premierSon && audioReponseOctets === 0 && doublureTour !== respSeq
+          && !(lectureActive() && fluxPrimaire?.marque === respSeq && fluxPrimaire.texteRecu) // lue par ElevenLabs : muette = sans texte
           && maintenant - debutReponseMs >= HEDGE_APRES_MS) demanderDoublure(maintenant);
         // Filet : si la doublure ne rend jamais son `response.done` (ws morte), la generation resterait ouverte
         // et le pont sourd. Au-dela de TOUR_MAX_MS on rend la main a la primaire, quoi qu'il arrive.
@@ -1852,6 +1957,7 @@ wss.on("connection", (twilio, requete) => {
     if (finalized) return;
     finalized = true;
     clearInterval(inactivityTimer);
+    fluxPrimaire?.couper(); fluxDoublure?.couper();
     pushUser();
     pushAgent();
     try { if (grok && grok.readyState === WebSocket.OPEN) grok.close(); } catch {}
