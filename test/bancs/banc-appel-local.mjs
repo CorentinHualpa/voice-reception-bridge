@@ -55,7 +55,7 @@ const pont = spawn(process.execPath, ["server.js"], {
     RECEPTION_PROMPT: session.instructions, AGENT_TOOLS: "pizzeria", MENU_FILE: "menus/palazzo.json",
     BARGE_IN: "1", GROK_VOICE: session.voice || "eve", GROK_REASONING: "none", GROK_SPEED: String(session.speed || 1), TOURS: MODE,
     // Comme Palazzo en production : 900 ms d'attente de fin de phrase (silenceMs de l'agent). ANTICIPATION_MS=0 pour comparer.
-    FIN_DE_TOUR_MS: process.env.FIN_DE_TOUR_MS || String(session.silenceMs || 900), ANTICIPATION_MS: process.env.ANTICIPATION_MS ?? "400", JOURNAL_DIALOGUE: "1",
+    FIN_DE_TOUR_MS: process.env.FIN_DE_TOUR_MS || String(session.silenceMs || 900), ANTICIPATION_MS: process.env.ANTICIPATION_MS ?? "400", JOURNAL_DIALOGUE: "1", JOURNAL_ELEMENTS: process.env.JOURNAL_ELEMENTS || "",
     MMM_APRES_MS: process.env.MMM_APRES_MS ?? "2400", // un seuil bas (700) force le « Mmm » d'attente pour l'entendre
     // Parades aux pics de Grok (17/09). HEDGE_APRES_MS=300 fait doubler CHAQUE tour, pour voir la doublure a
     // l'oeuvre sans attendre un vrai blocage ; AMBIANCE_APRES_MS=600 remplit tous les blancs, pour l'entendre.

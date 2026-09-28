@@ -653,6 +653,9 @@ wss.on("connection", (twilio, requete) => {
   let doublureGagnante = false; // la reponse en cours est jouee par la doublure, pas par la primaire
   let resteAudioDoublure = Buffer.alloc(0); // octet impair en attente, comme pour la primaire
   let primaireJetee = 0;                    // n° de la reponse de la primaire dont le son ne doit plus partir
+  let primaireASolder = 0;                  // n° de la reponse doublee que la primaire n'a pas encore finie
+  let itemsReponse = [];                    // elements ajoutes par la reponse en cours de la primaire (hors client)
+  let finDoublureEnAttente = null;          // fin du tour de la doublure, en attente de la primaire soldee
   // Lecture ElevenLabs (voir LECTURE_ELEVEN) : un flux par reponse, pour la primaire et pour la doublure. La voix
   // de Grok est gardee de cote pendant la reponse en cours, pour le secours (`lectureEnEchec`).
   const lecture = LECTURE_ELEVEN ? creerLectureEleven(LECTURE_ELEVEN, { log: (m) => console.log(`${m.trimEnd()} ${t()} sid=${callSid}`) }) : null;
@@ -859,6 +862,29 @@ wss.on("connection", (twilio, requete) => {
     console.log(`[tour] anticipation effacee (${aEffacer.length} element${aEffacer.length > 1 ? "s" : ""}), la suite de la phrase repart (${(suite * 0.02).toFixed(1)} s) ${t()}`);
     if (tourEnAttente && !tour) { validerTour(); demanderReponse(); }
   }
+  // Effacer un element de l'historique de Grok. ⚠ Juste apres `response.done`, xAI repond parfois « Item not found »
+  // pour un element qui existe bel et bien (banc du 28/09 : un essai sur deux, le meme effacement passant
+  // 300 ms plus tard) : l'element n'est pas encore range. On reessaie donc, trois fois au plus.
+  const essaisSuppression = new Map();
+  function supprimerElement(id) {
+    if (!(grok && grok.readyState === WebSocket.OPEN)) return;
+    essaisSuppression.set(id, (essaisSuppression.get(id) || 0) + 1);
+    suppressionsEnCours++;
+    grok.send(JSON.stringify({ type: "conversation.item.delete", item_id: id }));
+  }
+  // La reponse doublee de la primaire est finie, et personne ne l'a entendue : ses elements (message, appels
+  // d'outil) s'effacent de son historique, et la doublure peut clore le tour en y injectant ce qu'elle a dit.
+  function solderPrimaire(e) {
+    const marque = primaireASolder;
+    primaireASolder = 0;
+    const ids = [...new Set([...itemsReponse, ...(e.response?.output || []).map((o) => o?.id)].filter((id) => id && itemsAjoutes.has(id)))];
+    for (const id of ids) supprimerElement(id);
+    itemsReponse = []; pendingCalls = []; agentBuf = "";
+    reponseActive = false;
+    console.log(`[doublure] reponse n°${marque} de la primaire finie sans etre jouee (${e.response?.status || "?"}), ${ids.length} element(s) efface(s) ${ids.join(",")} ${t()} sid=${callSid}`);
+    const suite = finDoublureEnAttente; finDoublureEnAttente = null;
+    if (suite) suite();
+  }
   // `response.done` de la primaire (differe tant que la lecture ElevenLabs n'a pas livre toute la voix).
   function finReponseGrok(e) {
     if (anticipation) {
@@ -1047,7 +1073,13 @@ wss.on("connection", (twilio, requete) => {
     // plus couper une reponse doublee. Appel de controle du 17/09 : « Très bien, je vous rappellerai » n'a rien
     // arrete, la file Twilio n'a pas ete purgee, et la fin de la doublure s'est melee a la reponse suivante.
     primaireJetee = respSeq;
-    try { grok.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+    // ⚠ PLUS D'ANNULATION (28/09/2026). Annulee avant d'avoir rien produit, la reponse de la primaire laissait le
+    // message du client OUVERT chez xAI : la parole suivante s'y ajoutait au lieu d'ouvrir un nouveau message,
+    // AVANT la reponse injectee de la doublure. Grok voyait alors une conversation qui finissait deja par sa
+    // reponse, et redisait la precedente (appel de controle du 28/09 : « Et vous fermez à quelle heure ? »
+    // colle a la question sur les pizzas, redite jetee, 7 s de silence ; rejoue au banc, en voix Grok aussi).
+    // La primaire finit donc sa reponse sans etre entendue, puis on l'efface de son historique (solderPrimaire).
+    primaireASolder = respSeq;
     agentBuf = "";                            // son texte n'a pas ete dit
     // La primaire ne sait pas encore ce que la doublure est en train de dire : elle ne le saura qu'a la fin,
     // quand on le lui injectera. Tant que ce n'est pas fait, le client ne doit pas lui arriver, sinon elle
@@ -1122,6 +1154,22 @@ wss.on("connection", (twilio, requete) => {
     function finDoublure(statut, tourDoublure) {
       resteAudioDoublure = Buffer.alloc(0);
       if (!doublureGagnante || tourDoublure.marque !== respSeq) return;
+      // La primaire genere encore sa reponse doublee : on ne rend la main (et l'oreille) qu'une fois qu'elle l'a
+      // finie et qu'elle est effacee, sinon le client lui parlerait pendant qu'elle genere. Filet a 6 s : au-dela,
+      // on l'annule quand meme plutot que de laisser le client sans reponse.
+      if (primaireASolder === tourDoublure.marque) {
+        const marque = tourDoublure.marque;
+        finDoublureEnAttente = () => finDoublure(statut, tourDoublure);
+        setTimeout(() => {
+          if (primaireASolder !== marque || !finDoublureEnAttente) return;
+          console.log(`[doublure] la primaire n'a pas fini la reponse n°${marque} en 6 s : annulee ${t()} sid=${callSid}`);
+          try { grok.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+          primaireASolder = 0;
+          const suite = finDoublureEnAttente; finDoublureEnAttente = null;
+          suite();
+        }, 6000);
+        return;
+      }
       // Ce que la doublure a dit doit devenir l'historique de la PRIMAIRE, sinon elle le redirait au tour
       // suivant. L'injection en role assistant est acceptee et relue fidelement (banc du 17/09). La
       // doublure, elle, le recevra par le curseur sur `dialog` : ne pas le lui poser deux fois.
@@ -1468,13 +1516,14 @@ wss.on("connection", (twilio, requete) => {
           if (doublure?.occupee) doublure.abandonner("nouvelle reponse de la primaire");
           pushUser(); // le tour du client est fini, l'agent repond
           respSeq++;
-          fluxPrimaire?.couper(); fluxDoublure?.couper(); fluxDoublure = null; voixGrokGardee = [];
+          fluxPrimaire?.couper(); fluxDoublure?.couper(); fluxDoublure = null; voixGrokGardee = []; itemsReponse = [];
           fluxPrimaire = lectureActive() ? ouvrirLecturePrimaire(respSeq) : null;
           agentSpeaking = true; agentSpeakingSince = Date.now(); // Dany commence a parler -> on coupe l'ecoute (anti-echo)
           if (reponseAnticipee === -1) reponseAnticipee = respSeq;
           console.log(`[turn] Dany n°${respSeq}${anticipation || reponseAnticipee === respSeq ? " (anticipee)" : ""} ${t()}`);
           break;
         case "response.function_call_arguments.done":
+          if (respSeq === primaireJetee) break; // reponse doublee : ses outils ne s'executent pas, elle sera effacee
           pendingCalls.push({ name: e.name, callId: e.call_id, args: e.arguments });
           break;
         case "response.output_audio.delta": {
@@ -1497,8 +1546,10 @@ wss.on("connection", (twilio, requete) => {
           break;
         }
         case "response.output_audio_transcript.delta":
+          if (respSeq === primaireJetee) break; // reponse doublee : son texte n'est pas dit
           if (e.delta) { agentBuf += e.delta; if (CLOSING_RE.test(agentBuf)) closingSaid = true; }
-          if (e.delta && lectureActive() && fluxPrimaire?.marque === respSeq && respSeq !== reponseCoupee && respSeq !== primaireJetee) {
+          if (e.delta && lectureActive() && fluxPrimaire?.marque === respSeq && respSeq !== reponseCoupee && respSeq !== primaireJetee
+            && !(DOUBLURE_TEST_MS && doublure && Date.now() - debutReponseMs < DOUBLURE_TEST_MS)) { // banc : la primaire muette
             // La primaire a du texte : c'est elle qui parlera, la doublure n'a plus d'objet (en mode Grok, c'est
             // son premier son qui la congedie, dans envoyerSonAgent).
             if (!doublureGagnante && doublure?.occupee && !fluxPrimaire.texteRecu) doublure.abandonner("la primaire a du texte");
@@ -1506,6 +1557,7 @@ wss.on("connection", (twilio, requete) => {
           }
           break;
         case "response.done": {
+          if (primaireASolder && respSeq === primaireASolder) { solderPrimaire(e); break; }
           // Lecture ElevenLabs : Grok a fini d'ECRIRE, mais la synthese de la fin de son texte est peut-etre encore en
           // route. Tout ce qui clot la reponse (queue de silence, mark de fin de lecture, outils, relance, au
           // revoir) attend qu'elle soit livree, sinon il partirait AVANT la voix.
@@ -1535,13 +1587,16 @@ wss.on("connection", (twilio, requete) => {
           break;
         case "conversation.item.added":
           if (e.item?.id) itemsAjoutes.add(e.item.id);
+          if (reponseActive && e.item?.id && e.item.role !== "user") itemsReponse.push(e.item.id);
+          if (process.env.JOURNAL_ELEMENTS === "1") console.log(`[element] ajoute ${e.item?.id} ${e.item?.role || e.item?.type} apres ${e.previous_item_id ?? "-"} (reponse n°${respSeq}${reponseActive ? " active" : ""}) ${t()}`);
           // Ce que la reponse anticipee ajoute (message, appels d'outil) s'effacera avec elle si elle est annulee.
           if (anticipation && anticipation.etat !== "demandee" && e.item?.id && e.item.role !== "user") anticipation.items.push(e.item.id);
           if (!typesVus.has(e.type)) { typesVus.add(e.type); console.log(`[grok] ${e.type}${e.item?.type ? " " + e.item.type : ""} ${t()}`); }
           break;
         case "conversation.item.deleted":
           suppressionsEnCours = Math.max(0, suppressionsEnCours - 1);
-          console.log(`[grok] ${e.type} ${t()}`);
+          essaisSuppression.delete(e.item_id);
+          console.log(`[grok] ${e.type}${e.item_id ? " " + e.item_id : ""} ${t()}`);
           break;
         case "input_audio_buffer.speech_started": {
           if (TOURS_PAR_LE_PONT) break; // en mode manuel, Grok signale encore la parole : le pont a deja decide
@@ -1568,7 +1623,16 @@ wss.on("connection", (twilio, requete) => {
           console.log(`[turn] client se tait ${t()}${e.audio_end_ms != null ? ` fin_audio=${e.audio_end_ms} pos=${Math.round(audioEnvoyeMs)}` : ""}`);
           if (entenduSurAgent && !coupeCeTour) console.log(`[turn] son bref ignore (${Math.round(voixMaxTour)} ms de voix), l'agent finit sa phrase sid=${callSid}`);
           break;
-        case "error":
+        case "error": {
+          // Effacement refuse trop tot (voir supprimerElement) : nouvel essai, sans rien relacher d'autre.
+          const introuvable = /Item not found: ([0-9a-f-]{36})/i.exec(e.error?.message || "");
+          if (introuvable && essaisSuppression.has(introuvable[1])) {
+            const id = introuvable[1];
+            suppressionsEnCours = Math.max(0, suppressionsEnCours - 1);
+            if (essaisSuppression.get(id) < 4) setTimeout(() => supprimerElement(id), 300);
+            else { essaisSuppression.delete(id); console.log(`[grok] effacement abandonne apres 4 essais : ${id} ${t()} sid=${callSid}`); }
+            break;
+          }
           // Ignorees en silence jusqu'au 16/09/2026 : une erreur de Grok ne laissait aucune trace.
           console.error(`[grok] erreur ${JSON.stringify(e.error || e).slice(0, 300)} ${t()} sid=${callSid}`);
           // Un effacement refuse (anticipation annulee) n'est pas un refus de reponse : rien a relacher.
@@ -1576,6 +1640,7 @@ wss.on("connection", (twilio, requete) => {
           // Une demande de reponse refusee ne doit pas laisser la voix du client retenue pour toujours.
           if (TOURS_PAR_LE_PONT && generation && !reponseActive && !anticipation) { generation = false; attenteCreation = false; lacherRetenue(); }
           break;
+        }
         default:
           // Tout le reste une fois par appel, sauf ce qui peut expliquer une reponse perdue (annulation,
           // remplacement, tampon valide), journalise a chaque fois : l'essai du 16/09 a vu une reponse creee
