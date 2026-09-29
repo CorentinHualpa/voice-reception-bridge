@@ -1,7 +1,8 @@
 // Lecture par ElevenLabs : decoupage du texte de Grok en morceaux a synthetiser, configuration. Sans reseau.
 // node test/lecture-eleven-test.mjs
 import assert from "assert";
-import { configLectureEleven, decouper, texteALire } from "../lib/lecture-eleven.js";
+import { configLectureEleven, creerRognure, decouper, texteALire } from "../lib/lecture-eleven.js";
+import { ulawEncodeSample } from "../lib/audio.js";
 
 let ok = 0;
 const cas = (nom, fn) => { fn(); ok++; console.log("ok -", nom); };
@@ -74,6 +75,45 @@ cas("configuration : coupee par defaut, et jamais a moitie", () => {
   assert.equal(c.modele, "eleven_v4_turbo");
   assert.equal(c.balise, "[warmly]");
   assert.equal(c.stabilite, 0.5);
+});
+
+// Un morceau synthetique : silence, voix (sinus), silence, en mu-law 8 kHz.
+const silence = (ms) => Buffer.alloc(ms * 8, 0xff);
+const voix = (ms) => Buffer.from(Array.from({ length: ms * 8 }, (_, i) => ulawEncodeSample(Math.round(5000 * Math.sin(i / 3)))));
+function rogner(morceau, premier, pas = 160) {
+  const r = creerRognure({ premier });
+  const sortie = [];
+  for (let o = 0; o < morceau.length; o += pas) sortie.push(...r.pousser(morceau.subarray(o, o + pas)));
+  sortie.push(...r.finir());
+  return Buffer.concat(sortie);
+}
+
+cas("les silences de bord sont rognes, la voix reste entiere", () => {
+  const m = Buffer.concat([silence(200), voix(500), silence(300)]);
+  const premier = rogner(m, true), suivant = rogner(m, false);
+  assert.equal(premier.length / 8, 30 + 500 + 80, "premier morceau : 30 ms avant la voix, 80 ms apres");
+  assert.equal(suivant.length / 8, 60 + 500 + 80, "morceau suivant : 60 ms avant la voix");
+});
+
+cas("une fin de phrase qui s'eteint doucement n'est pas mangee", () => {
+  // La voix, puis 200 ms a faible niveau (le « -de » de « commande »), puis le vrai silence.
+  const douce = Buffer.from(Array.from({ length: 1600 }, (_, i) => ulawEncodeSample(Math.round(250 * Math.sin(i / 3)))));
+  const m = Buffer.concat([voix(400), douce, silence(300)]);
+  assert.equal(rogner(m, false).length / 8, 400 + 200 + 80);
+});
+
+cas("un morceau sans voix detectable passe tel quel, sans rien retenir", () => {
+  const m = silence(900);
+  assert.equal(rogner(m, true).length, m.length);
+  assert.equal(rogner(silence(100), false).length, 800);
+});
+
+cas("une voix longue part au fil de l'eau, seule la fin attend", () => {
+  const r = creerRognure({ premier: false });
+  let parti = 0;
+  const m = Buffer.concat([silence(100), voix(2000)]);
+  for (let o = 0; o < m.length; o += 400) for (const x of r.pousser(m.subarray(o, o + 400))) parti += x.length;
+  assert.ok(parti >= (60 + 2000 - 500) * 8 - 400, `seuls les 500 derniers ms attendent (${parti / 8} ms partis)`);
 });
 
 console.log(`\n${ok} cas passes`);
