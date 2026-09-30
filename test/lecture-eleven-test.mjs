@@ -123,6 +123,7 @@ cas("accueil : bonjour/bonsoir devient le bon mot selon l'heure de Paris", () =>
   assert.equal(saluerSelonHeure(texte, new Date("2026-09-30T15:30:00Z")), "Palazzo pizza bonsoir, qu'est-ce qui vous ferait plaisir ?");
   assert.equal(saluerSelonHeure("Bonjour / bonsoir !", new Date("2026-09-30T18:00:00Z")), "Bonsoir !");
   assert.equal(saluerSelonHeure("Palazzo bonjour", new Date("2026-09-30T20:00:00Z")), "Palazzo bonjour", "un texte sans barre ne bouge pas");
+  assert.equal(saluerSelonHeure("Palazzo pizza bonsoir/bonsoir, qu'est-ce", new Date("2026-09-30T20:30:00Z")), "Palazzo pizza bonsoir, qu'est-ce", "le doublon fabrique par DaleVoz");
 });
 
 console.log(`\n${ok} cas passes`);
