@@ -37,6 +37,7 @@ import { ulaw8kToPcm16, pcm16ToUlaw8k, ulawDecodeSample, ulawEncodeSample } from
 import { creerAmbiance, listerAmbiances, telechargerWav } from "./lib/ambiance.js";
 import { creerDoublure } from "./lib/doublure.js";
 import { configLectureEleven, creerLectureEleven } from "./lib/lecture-eleven.js";
+import { saluerSelonHeure } from "./lib/accueil.js";
 import { creerFinDeTour } from "./lib/fin-de-tour.mjs";
 import { OUTILS_DE_COMMANDE, consigneClotureCommande, createPizzeria } from "./lib/pizzeria.js";
 import {
@@ -1494,7 +1495,7 @@ wss.on("connection", (twilio, requete) => {
             grokReady = true;
             // L'accueil de la porte Telephone (Format et Accueil de Dale Voz) se dit MOT POUR MOT au premier tour.
             // Laisse au modele, il perdait contre un prompt qui imposait sa propre premiere phrase.
-            const accueil = typeof sessionDV?.greeting === "string" ? sessionDV.greeting.trim() : "";
+            const accueil = typeof sessionDV?.greeting === "string" ? saluerSelonHeure(sessionDV.greeting.trim()) : "";
             if (TOURS_PAR_LE_PONT) marquerGeneration();
             grok.send(JSON.stringify(accueil
               ? { type: "response.create", response: { instructions: `Dis exactement cette phrase, mot pour mot, sans rien ajouter avant ni apres, avec le sourire et beaucoup d'entrain, comme une Italienne ravie d'accueillir, puis ecoute : « ${collerPonctuation(accueil)} »` } }

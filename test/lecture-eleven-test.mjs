@@ -3,6 +3,7 @@
 import assert from "assert";
 import { configLectureEleven, creerRognure, decouper, texteALire } from "../lib/lecture-eleven.js";
 import { ulawEncodeSample } from "../lib/audio.js";
+import { saluerSelonHeure } from "../lib/accueil.js";
 
 let ok = 0;
 const cas = (nom, fn) => { fn(); ok++; console.log("ok -", nom); };
@@ -114,6 +115,14 @@ cas("une voix longue part au fil de l'eau, seule la fin attend", () => {
   const m = Buffer.concat([silence(100), voix(2000)]);
   for (let o = 0; o < m.length; o += 400) for (const x of r.pousser(m.subarray(o, o + 400))) parti += x.length;
   assert.ok(parti >= (60 + 2000 - 500) * 8 - 400, `seuls les 500 derniers ms attendent (${parti / 8} ms partis)`);
+});
+
+cas("accueil : bonjour/bonsoir devient le bon mot selon l'heure de Paris", () => {
+  const texte = "Palazzo pizza bonjour/bonsoir, qu'est-ce qui vous ferait plaisir ?";
+  assert.equal(saluerSelonHeure(texte, new Date("2026-09-30T10:00:00Z")), "Palazzo pizza bonjour, qu'est-ce qui vous ferait plaisir ?");
+  assert.equal(saluerSelonHeure(texte, new Date("2026-09-30T15:30:00Z")), "Palazzo pizza bonsoir, qu'est-ce qui vous ferait plaisir ?");
+  assert.equal(saluerSelonHeure("Bonjour / bonsoir !", new Date("2026-09-30T18:00:00Z")), "Bonsoir !");
+  assert.equal(saluerSelonHeure("Palazzo bonjour", new Date("2026-09-30T20:00:00Z")), "Palazzo bonjour", "un texte sans barre ne bouge pas");
 });
 
 console.log(`\n${ok} cas passes`);
