@@ -209,7 +209,8 @@ const HEDGE_APRES_MS = Number(process.env.HEDGE_APRES_MS ?? 0);
 // LECTURE (28/09/2026) : « grok » (defaut) garde la voix de Grok ; « elevenlabs » fait lire le texte de chaque
 // reponse par ElevenLabs (voir lib/lecture-eleven.js). Reglages : ELEVENLABS_API_KEY, ELEVEN_VOIX (obligatoires),
 // ELEVEN_MODELE (eleven_v4_turbo), ELEVEN_BALISE (balise de jeu posee devant chaque morceau, ex. l'accent),
-// ELEVEN_STABILITE (0.5), ELEVEN_SIMILARITE (0.75). Retour arriere sans code : LECTURE=grok.
+// ELEVEN_STABILITE (0.5), ELEVEN_SIMILARITE (0.75), ELEVEN_LANGUE (« fr » : impose la langue de lecture).
+// Retour arriere sans code : LECTURE=grok.
 // Si ElevenLabs tombe pendant un appel (cle, quota, reseau), l'appel repasse sur la voix de Grok jusqu'a la fin.
 const LECTURE_ELEVEN = configLectureEleven();
 console.log(`[lecture] ${LECTURE_ELEVEN ? `ElevenLabs voix=${LECTURE_ELEVEN.voix} modele=${LECTURE_ELEVEN.modele} balise=${LECTURE_ELEVEN.balise ? `« ${LECTURE_ELEVEN.balise} »` : "aucune"}` : "voix de Grok"}`);
