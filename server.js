@@ -2309,7 +2309,10 @@ wss.on("connection", (twilio, requete) => {
       console.log(`[recap] numero de test ${fromNumber}, pas de recap sid=${callSid}`);
     } else if ((hasClient || RECAP_APPEL_EN_ABSENCE) && N8N_RECAP_URL) {
       const payload = { dialog: text, phone: fromNumber || "inconnu", call_sid: callSid };
-      if (!hasClient) Object.assign(payload, { sans_parole: true, duree_s: Math.round((Date.now() - debutAppelMs) / 1000) });
+      // Duree et heure de debut pour TOUS les appels : les deux mails (message laisse, appel en absence) partagent
+      // le meme gabarit, avec « Quand » et « Durée » (demande de Damien, 01/10/2026).
+      Object.assign(payload, { duree_s: Math.round((Date.now() - debutAppelMs) / 1000), debut: new Date(debutAppelMs).toISOString() });
+      if (!hasClient) payload.sans_parole = true;
       const ok = await postRecap(payload, 4); // essais immediats au raccrochage : 1s, 2s, 4s, 8s
       if (ok) console.log(`[recap] ${hasClient ? "envoye" : "appel en absence envoye"} a n8n sid=${callSid}`);
       else { pendingRecaps.push(payload); console.error(`[recap] n8n injoignable, mis en file de reessai sid=${callSid}`); }
