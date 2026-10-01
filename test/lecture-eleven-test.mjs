@@ -38,11 +38,27 @@ cas("coupe sur les fins de phrase, et garde le reste pour la suite", () => {
   assert.equal(parts.join(" ").replace(/\s+/g, " "), "Bonjour ! Chez Palazzo, notre carte sans viande propose quatre délicieuses pizzas. Voici les ingrédients de chacune : - Fiorella : tomate, mozzarella et basilic frais. - Veggie : tomate et légumes grillés. Laquelle vous fait envie ? Je vous écoute !");
 });
 
-cas("le premier morceau part sans attendre la fin de phrase, mais jamais minuscule", () => {
-  assert.deepEqual(decouper("Bien sûr, c'est tout à fait", { premier: true }), { part: "Bien sûr, c'est tout à fait", reste: "" });
-  assert.deepEqual(decouper("Bien sûr", { premier: true }), { part: "", reste: "Bien sûr" });
+cas("le premier morceau attend une proposition entiere, puis part au dernier mot entier si ca tarde", () => {
+  // Trop court pour etre lu seul : on attend la suite (« Je… comprends » entendu le 01/10).
+  assert.deepEqual(decouper("Je comprends", { premier: true }), { part: "", reste: "Je comprends" });
+  assert.deepEqual(decouper("Bien sûr, c'est tout à fait", { premier: true }), { part: "", reste: "Bien sûr, c'est tout à fait" });
+  // Une proposition assez longue part a sa virgule.
+  assert.deepEqual(decouper("Je comprends tout à fait, mais il faudrait", { premier: true }), { part: "Je comprends tout à fait,", reste: " mais il faudrait" });
+  // Passe le delai : on coupe au dernier mot ENTIER, la suite d'un mot entame attend.
+  assert.deepEqual(decouper("Bien sûr, c'est tout à fai", { premier: true, presse: true }), { part: "Bien sûr, c'est tout à", reste: " fai" });
+  assert.deepEqual(decouper("Je compr", { premier: true, presse: true }), { part: "", reste: "Je compr" });
   // Plus loin dans la reponse, une phrase inachevee attend la suite.
   assert.deepEqual(decouper(" Et à quelle heure", { premier: false }), { part: "", reste: " Et à quelle heure" });
+});
+
+cas("le texte d'OpenAI arrive par fragments de mots : jamais de mot coupe en deux", () => {
+  const t = "Nous avons plusieurs pizzas sans viande que vous pouvez commander ce soi";
+  assert.deepEqual(decouper(t, { premier: false }), { part: "Nous avons plusieurs pizzas sans viande que vous pouvez commander ce", reste: " soi" });
+  assert.equal(decouper("Ça fait 4,50 euros pour le tiramisu et quatorze euros pour la Pacino ici", { premier: false }).part, "Ça fait 4,50 euros pour le tiramisu et quatorze euros pour la Pacino", "« 4,50 » n'est pas une virgule de phrase");
+  // Rejoue d'un flux token par token : rien n'est perdu ni coupe dans un mot.
+  const parts = rejouer(["Je", " compr", "ends", " tout", " à", " fait", ",", " mais", " il", " faud", "rait", " un", " poste", " séparé", "."]);
+  assert.equal(parts[0], "Je comprends tout à fait,");
+  assert.equal(parts.join(" "), "Je comprends tout à fait, mais il faudrait un poste séparé.");
 });
 
 cas("une longue phrase sans point se coupe a la derniere virgule", () => {
