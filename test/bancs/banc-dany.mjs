@@ -43,6 +43,8 @@ async function synthese(texte) {
 }
 const MORCEAUX = [];
 for (const t of REPLIQUES) MORCEAUX.push({ texte: t, buf: await synthese(t) });
+// VOILA=1 : « Voilà. » 400 ms apres l'email epele, avant que sa transcription arrive (cas qui perdait la ligne).
+const VOILA = process.env.VOILA === "1" ? { texte: "Voilà.", buf: await synthese("Voilà.") } : null;
 
 const journal = [];
 const envPont = {
@@ -144,6 +146,7 @@ const silenceAgent = (ms) => () => sonsAgent > 0 && !agentParle() && Date.now() 
 await jusqua(silenceAgent(1200), 40000); // accueil fini
 for (const m of MORCEAUX) {
   await jouer(m);
+  if (VOILA && /arobase/.test(m.texte)) { await attendre(Number(process.env.VOILA_MS || 400)); await jouer(VOILA); }
   const n = sonsAgent;
   await jusqua(() => sonsAgent > n, 15000);
   await jusqua(silenceAgent(1500), 45000);
