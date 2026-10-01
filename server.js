@@ -1373,11 +1373,23 @@ wss.on("connection", (twilio, requete) => {
 
   // ---- Cerveau OpenAI (voir CERVEAU) ----
   // `voix` : OpenAI parle lui-meme (secours quand ElevenLabs tombe), en mu-law 8 kHz pour Twilio.
+  // ⚠ Les outils de DaleVoz arrivent SANS `type` : Grok les acceptait, OpenAI refuse alors TOUTE la session
+  // (« Missing required parameter: 'session.tools[0].type' », bascule du 01/10 02:52 UTC) et l'agent repond sans
+  // consigne, en anglais, avec le decoupage des tours d'OpenAI. On remet chaque outil a la forme exacte attendue.
+  function outilsPourOpenAI(outils) {
+    return (outils || []).filter((o) => o?.name).map((o) => ({
+      type: "function",
+      name: o.name,
+      ...(o.description ? { description: o.description } : {}),
+      parameters: o.parameters && typeof o.parameters === "object" ? o.parameters : { type: "object", properties: {} },
+    }));
+  }
   function configSessionOpenAI(instructions, outils, voix) {
+    const normes = outilsPourOpenAI(outils);
     return {
       type: "realtime",
       ...(instructions ? { instructions } : {}),
-      ...(outils?.length ? { tools: outils, tool_choice: "auto" } : {}),
+      ...(normes.length ? { tools: normes, tool_choice: "auto" } : {}),
       output_modalities: voix ? ["audio"] : ["text"],
       audio: {
         input: { format: { type: "audio/pcmu" }, transcription: { model: OPENAI_TRANSCRIPTION, language: AGENT_LANG }, turn_detection: null },
@@ -1385,6 +1397,7 @@ wss.on("connection", (twilio, requete) => {
       },
     };
   }
+  let sessionOpenAI = null, sessionOpenAIReessayee = false;
   let voixDeSecoursActive = false;
   function voixDeSecours() {
     if (!CERVEAU_OPENAI || voixDeSecoursActive || !(grok && grok.readyState === WebSocket.OPEN)) return;
@@ -1565,6 +1578,7 @@ wss.on("connection", (twilio, requete) => {
       if (CERVEAU_OPENAI) {
         // Sortie TEXTE seule (ElevenLabs lit) ; l'audio du client arrive en mu-law tel que Twilio le donne.
         // ElevenLabs deja injoignable a l'ouverture : OpenAI parle lui-meme, avec sa voix (voir voixDeSecours).
+        sessionOpenAI = { instructions: sessionInstructions, outils };
         grok.send(JSON.stringify({ type: "session.update", session: configSessionOpenAI(sessionInstructions, outils, !lectureActive()) }));
         return;
       }
@@ -1746,6 +1760,15 @@ wss.on("connection", (twilio, requete) => {
           }
           // OpenAI signale une annulation sans reponse active (anticipation deja soldee), xAI l'ignorait : rien a faire.
           if (e.error?.code === "response_cancel_not_active") break;
+          // Configuration de session refusee par OpenAI : sans elle, l'agent parle sans consigne et OpenAI decoupe
+          // les tours lui-meme. On la renvoie une fois SANS les outils, la consigne et le decoupage par le pont
+          // valant mieux que rien, et on le crie dans le journal.
+          if (CERVEAU_OPENAI && !grokReady && /^session/.test(e.error?.param || "") && sessionOpenAI && !sessionOpenAIReessayee) {
+            sessionOpenAIReessayee = true;
+            console.error(`[cerveau] session refusee par OpenAI (${e.error?.message}) : renvoyee SANS outils ${t()} sid=${callSid}`);
+            grok.send(JSON.stringify({ type: "session.update", session: configSessionOpenAI(sessionOpenAI.instructions, [], !lectureActive()) }));
+            break;
+          }
           // Ignorees en silence jusqu'au 16/09/2026 : une erreur de Grok ne laissait aucune trace.
           console.error(`[grok] erreur ${JSON.stringify(e.error || e).slice(0, 300)} ${t()} sid=${callSid}`);
           // Un effacement refuse (anticipation annulee) n'est pas un refus de reponse : rien a relacher.
