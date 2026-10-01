@@ -13,6 +13,9 @@
 //   BUSINESS_NAME      nom du commerce
 //   BUSINESS_DESC      description courte (pour cadrer l'agent)
 //   N8N_RECAP_URL      webhook n8n qui fait extraction + format + mail
+//   RECAP_EXCLURE      numeros appelants de test (E.164, virgules) : leurs appels n'envoient pas de recap
+//   RECAP_APPEL_EN_ABSENCE  "1" : un appel sans parole part aussi au recap (sans_parole, duree_s) ; Dany
+//   EVITER_FIN_SUR_QUESTION  "0" retire la consigne « ne finis jamais sur une question » (defaut : posee)
 //   PROMPT_FILE        fichier du prompt (si RECEPTION_PROMPT absent). {{CARTE}} y est remplace par la carte.
 //   CLOSING_REGEX      phrase de cloture qui arme le raccrochage (defaut "remercie pour votre appel")
 //   AGENT_TOOLS        "pizzeria" active les outils de prise de commande (voir lib/pizzeria.js)
@@ -69,6 +72,15 @@ const BUSINESS_DESC = process.env.BUSINESS_DESC || "";
 const N8N_RECAP_URL = process.env.N8N_RECAP_URL || "";
 const ADMIN_KEY = process.env.ADMIN_KEY || ""; // protege le tableau de bord /admin
 const CLOSING_RE = new RegExp(process.env.CLOSING_REGEX || "remercie pour votre appel", "i");
+// Numeros de test (Dany, 17/09/2026) : couper tout le recap pendant une recette ferait perdre les vrais appels du
+// moment ; seuls les numeros listes ici (E.164, separes par des virgules) n'en envoient pas.
+const RECAP_EXCLURE = new Set((process.env.RECAP_EXCLURE || "").split(",").map((n) => n.replace(/[^\d+]/g, "")).filter(Boolean));
+// Tout appel doit laisser une trace chez Motralec (demande de Damien, 24/09/2026) : celui qui raccroche sans parler
+// part aussi, en « appel en absence ». Coupe par defaut : Palazzo n'en veut pas.
+const RECAP_APPEL_EN_ABSENCE = process.env.RECAP_APPEL_EN_ABSENCE === "1";
+// La voix de Grok avalait la fin des questions (Palazzo, voix feminines) ; avec la voix leo de Dany, jamais, et une
+// confirmation d'email suivie de « Je vous écoute. » sonne faux. Posee par defaut, EVITER_FIN_SUR_QUESTION=0 la retire.
+const EVITER_FIN_SUR_QUESTION = process.env.EVITER_FIN_SUR_QUESTION !== "0";
 const AGENT_SPEAKING_MAX_MS = Number(process.env.AGENT_SPEAKING_MAX_MS || 12000); // filet anti-surdite si le mark de fin de parole se perd ; un recapitulatif de commande depasse 12 s
 const MAX_RELANCES_OUTILS = 4;
 const BARGE_IN_DEFAUT = process.env.BARGE_IN === "1"; // repli quand l'agent ne vient pas de Dale Voz (voir le handler media)
@@ -227,6 +239,16 @@ const OPENAI_VOIX = process.env.OPENAI_VOIX || "marin";
 if ((process.env.CERVEAU || "").toLowerCase() === "openai" && !CERVEAU_OPENAI) console.error("[cerveau] CERVEAU=openai exige LECTURE=elevenlabs et OPENAI_API_KEY : Grok conserve");
 console.log(`[cerveau] ${CERVEAU_OPENAI ? `OpenAI ${OPENAI_REALTIME_MODEL}, sortie texte, transcription ${OPENAI_TRANSCRIPTION}` : "Grok"}`);
 console.log(`[lecture] ${LECTURE_ELEVEN ? `ElevenLabs voix=${LECTURE_ELEVEN.voix} modele=${LECTURE_ELEVEN.modele} balise=${LECTURE_ELEVEN.balise ? `« ${LECTURE_ELEVEN.balise} »` : "aucune"}` : "voix de Grok"}`);
+// Accueil fixe (ACCUEIL_TEXTE, pont sans Dale Voz comme Dany) : synthetise des le demarrage, pour que le premier
+// appel apres un redeploiement ne paie pas ~2 s de synthese au decroche (mesure au banc de Dany, 01/10/2026).
+if (LECTURE_ELEVEN && (process.env.ACCUEIL_TEXTE || "").trim()) {
+  const debut = Date.now();
+  creerLectureEleven(LECTURE_ELEVEN).accueil(saluerSelonHeure(process.env.ACCUEIL_TEXTE.trim()))
+    .then(({ ulaw }) => console.log(`[accueil] pre-enregistre au demarrage en ${Date.now() - debut} ms, ${(ulaw.length / 8000).toFixed(1)} s`))
+    .catch((err) => console.log(`[accueil] synthese au demarrage en echec (${err.message}), elle sera retentee au premier appel`));
+}
+// Jeu demande au modele quand il doit dire l'accueil lui-meme (secours si ElevenLabs tombe, ou pas de lecture).
+const ACCUEIL_JEU = process.env.ACCUEIL_JEU || "avec le sourire et beaucoup d'entrain, comme une Italienne ravie d'accueillir";
 // FIN DE TOUR PAR MODELE (18/09/2026). Le pont conclut aujourd'hui qu'un client a fini quand il a compte
 // FIN_DE_TOUR_MS de silence. C'est le plus gros poste de latence qui reste, et c'est ce qui coupe la parole a
 // qui hesite : mesure sur 400 tours humains reels (corpus livekit/eot-bench-data, part francaise), le
@@ -674,7 +696,8 @@ wss.on("connection", (twilio, requete) => {
   // Lecture ElevenLabs (voir LECTURE_ELEVEN) : un flux par reponse, pour la primaire et pour la doublure. La voix
   // de Grok est gardee de cote pendant la reponse en cours, pour le secours (`lectureEnEchec`).
   const lecture = LECTURE_ELEVEN ? creerLectureEleven(LECTURE_ELEVEN, { log: (m) => console.log(`${m.trimEnd()} ${t()} sid=${callSid}`) }) : null;
-  let lectureEnEchec = false;               // ElevenLabs a lache sur cet appel : voix de Grok jusqu'a la fin
+  let redireApresEchec = 0;                 // reponse ecrite par OpenAI dont ElevenLabs n'a rien dit (voir terminerReponse)
+  let lectureEnEchec = false;              // ElevenLabs a lache sur cet appel : voix de Grok jusqu'a la fin
   let fluxPrimaire = null, fluxDoublure = null;
   let voixGrokGardee = [];                  // ulaw de Grok de la reponse en cours, pour le secours
   const lectureActive = () => Boolean(lecture) && !lectureEnEchec;
@@ -937,6 +960,7 @@ wss.on("connection", (twilio, requete) => {
       surEchec: ({ octetsLivres, erreur }) => {
         lectureEnEchec = true;
         voixDeSecours(); // cerveau OpenAI : pas de voix de Grok gardee, OpenAI parlera lui-meme des la reponse suivante
+        if (CERVEAU_OPENAI && !octetsLivres && marque === respSeq) redireApresEchec = marque; // et redira celle-ci
         const garde = voixGrokGardee; voixGrokGardee = [];
         console.log(`[lecture] ElevenLabs en echec (${erreur}) : voix de Grok jusqu'a la fin de l'appel${octetsLivres ? "" : `, ${(garde.reduce((n, u) => n + u.length, 0) / 8000).toFixed(1)} s de la reponse n°${marque} rejouees`} ${t()} sid=${callSid}`);
         if (!octetsLivres && marque === respSeq) for (const u of garde) livrerSonPrimaire(u, marque);
@@ -1003,6 +1027,22 @@ wss.on("connection", (twilio, requete) => {
     if (!calls.length && transfert && transfert.etat === "annonce") preparerTransfert();
     // Plus rien n'arrive pour ce tour (ni outil, ni reponse a un tour en attente) : pas de « Mmm » apres coup.
     if (!calls.length && !(TOURS_PAR_LE_PONT && tourEnAttente && !tour)) attenteDepuis = 0;
+    // SECOURS, cerveau OpenAI : ElevenLabs a lache avant le premier son de cette reponse, qu'OpenAI n'a ecrite qu'en
+    // texte. Personne ne l'a dite : on la lui fait dire de sa propre voix. Sans cela le client attendait la relance
+    // dans le blanc (banc de panne forcee de Dany, 01/10/2026 : accueil entendu a 15,7 s au lieu de 2 s).
+    // ⚠ Une consigne « redis exactement : … » se lit chez OpenAI comme une demande de l'utilisateur (« D'accord, je
+    // vais le dire exactement… ») : on efface la reponse muette et on la fait REGENERER, en audio cette fois.
+    if (redireApresEchec === respSeq && !calls.length && phrase && audioReponseOctets === 0 && respSeq !== reponseCoupee && grok?.readyState === WebSocket.OPEN) {
+      redireApresEchec = 0;
+      const ids = [...new Set([...itemsReponse, ...(e.response?.output || []).map((o) => o?.id)].filter((id) => id && itemsAjoutes.has(id)))];
+      for (const id of ids) { suppressionsEnCours++; grok.send(JSON.stringify({ type: "conversation.item.delete", item_id: id })); }
+      const der = dialog[dialog.length - 1];
+      if (der?.who === "Agent" && der.msg === phrase) { dialog.pop(); tourNo = Math.max(0, tourNo - 1); }
+      console.log(`[lecture] reponse n°${respSeq} jamais dite (${ids.length} element${ids.length > 1 ? "s" : ""} efface${ids.length > 1 ? "s" : ""}) : OpenAI la regenere de sa voix ${t()} sid=${callSid}`);
+      if (TOURS_PAR_LE_PONT) marquerGeneration();
+      grok.send(JSON.stringify({ type: "response.create" }));
+      return;
+    }
     if (calls.length) runTools(calls).catch((err) => console.error("[outil] echec du cycle", err));
     else if (TOURS_PAR_LE_PONT && tourEnAttente && !tour) { validerTour(); demanderReponse(); } // le client a parle pendant la generation
     else if ((pizzeria || commandesParDaleVoz()) && !clotureVerifiee) {
@@ -1362,6 +1402,31 @@ wss.on("connection", (twilio, requete) => {
     itemClientConsomme = dernierItemClient;
     entreeNouvelle = false;
   }
+  // PHRASE DU CLIENT EN MORCEAUX (01/10/2026, banc de Dany). Chez xAI, la suite d'une phrase coupee par une
+  // anticipation annulee s'ajoute au MEME message, dont la transcription est cumulative. Chez OpenAI, chaque commit
+  // du tampon cree son PROPRE message : « Oui, bonjour. » | « J'ai une pompe de relevage… » | « Il me faudrait un
+  // devis… ». Le modele les voit tous, mais la ligne du dialogue ne gardait que le dernier morceau, et c'est elle
+  // qui part dans le mail de recap (« Client : arobase gmail.com » pour un email entierement epele). On rattache
+  // chaque message du client au tour ou il a ete cree, et la ligne du tour est la suite de tous ses morceaux.
+  let tourNo = 0;                       // avance a chaque reponse de l'agent reellement dite
+  const tourDeItem = new Map();         // item_id du client -> tour
+  const texteDeItem = new Map();        // item_id du client -> transcription
+  const ligneDuTour = new Map();        // tour -> index de sa ligne dans le dialogue
+  function texteDuTour(itemId, texte, cumule) {
+    const n = tourDeItem.has(itemId) ? tourDeItem.get(itemId) : tourNo;
+    if (!tourDeItem.has(itemId)) tourDeItem.set(itemId, n);
+    texteDeItem.set(itemId, cumule ? (texteDeItem.get(itemId) || "") + texte : texte);
+    const morceaux = [...texteDeItem].filter(([id]) => tourDeItem.get(id) === n).map(([, s]) => s.trim()).filter(Boolean);
+    return { n, phrase: morceaux.join(" ") };
+  }
+  function noterTranscription(itemId, texte, cumule) {
+    if (typeof texte !== "string") return;
+    if (!itemId) { setUser(texte, cumule); return; }
+    const { n, phrase } = texteDuTour(itemId, texte, cumule);
+    // Transcription tardive d'un tour deja clos par la reponse de l'agent : elle corrige SA ligne, pas la suivante.
+    if (n !== tourNo) { const i = ligneDuTour.get(n); if (i != null && dialog[i]?.who === "Client") dialog[i].msg = phrase; return; }
+    setUser(phrase, false);
+  }
   function setUser(texte, cumule) {
     if (typeof texte !== "string") return;
     if (tourClient && tourClient.idx != null && dialog[tourClient.idx]) {
@@ -1369,7 +1434,10 @@ wss.on("connection", (twilio, requete) => {
       l.msg = (cumule ? l.msg + texte : texte).replace(/^\s+/, "");
     } else userBuf = cumule ? userBuf + texte : texte;
   }
-  function pushAgent() { pushLine("Agent", agentBuf); agentBuf = ""; }
+  function pushAgent() {
+    if (agentBuf.trim()) { if (tourClient && tourClient.idx != null) ligneDuTour.set(tourNo, tourClient.idx); tourNo++; }
+    pushLine("Agent", agentBuf); agentBuf = "";
+  }
 
   // ---- Cerveau OpenAI (voir CERVEAU) ----
   // `voix` : OpenAI parle lui-meme (secours quand ElevenLabs tombe), en mu-law 8 kHz pour Twilio.
@@ -1422,9 +1490,16 @@ wss.on("connection", (twilio, requete) => {
   function demanderAccueilAGrok() {
     const accueil = texteAccueil();
     if (TOURS_PAR_LE_PONT) marquerGeneration();
+    const consigne = `Dis exactement cette phrase, mot pour mot, sans rien ajouter avant ni apres, ${ACCUEIL_JEU}, puis ecoute : « ${collerPonctuation(accueil)} »`;
+    // ⚠ Chez OpenAI, `instructions` d'une reponse REMPLACE celles de la session : avec la seule consigne, le modele
+    // repondait a la consigne (« D'accord, je vais le dire exactement comme vous l'avez demandé. », banc de Dany du
+    // 01/10/2026). On lui redonne donc sa consigne entiere, suivie de la phrase a dire.
+    const instructions = CERVEAU_OPENAI && sessionOpenAI?.instructions
+      ? `${sessionOpenAI.instructions}\n\n# Ta toute premiere replique\n${consigne}`
+      : consigne;
     grok.send(JSON.stringify(accueil
       // Laisse au modele, il perdait contre un prompt qui imposait sa propre premiere phrase.
-      ? { type: "response.create", response: { instructions: `Dis exactement cette phrase, mot pour mot, sans rien ajouter avant ni apres, avec le sourire et beaucoup d'entrain, comme une Italienne ravie d'accueillir, puis ecoute : « ${collerPonctuation(accueil)} »` } }
+      ? { type: "response.create", response: { instructions } }
       : { type: "response.create" }));
   }
   function lancerAccueilEnregistre() {
@@ -1442,6 +1517,9 @@ wss.on("connection", (twilio, requete) => {
       if (accueilEtat !== "attente") return;
       accueilEtat = "echec";
       console.log(`[accueil] ElevenLabs en echec (${err.message}) : Grok dira l'accueil ${t()} sid=${callSid}`);
+      // Cerveau OpenAI : il n'ecrit qu'en texte tant que la lecture est active, et personne ne dirait l'accueil.
+      // La lecture est donc coupee pour l'appel et OpenAI parle de sa voix (session ouverte en audio, ou basculee).
+      if (CERVEAU_OPENAI) { lectureEnEchec = true; voixDeSecours(); }
       if (grokReady) demanderAccueilAGrok();
     });
   }
@@ -1555,7 +1633,7 @@ wss.on("connection", (twilio, requete) => {
         callerFr ? `Le client appelle depuis le numéro ${callerFr}. Quand tu lui relis ce numéro à voix, tu prononces EXACTEMENT ceci, mot pour mot, sans le recalculer ni changer un seul groupe : « ${callerSpoken} ». C'est son numéro de rappel par défaut, tu le connais déjà.` : "",
         carteAjoutee,
         "Au téléphone, un silence de ta part laisse le client dans le vide. Ne termine jamais une réponse sur une simple confirmation (« Oui, vingt-deux heures est possible. ») : enchaîne dans la même réponse sur l'étape suivante, par une question. Seul l'au revoir final ne pose pas de question.",
-        "Au téléphone, ta voix avale la fin d'une réponse qui se termine sur une question. Ne finis donc jamais sur le point d'interrogation : après ta question, ajoute toujours deux ou trois mots, variés d'une fois sur l'autre (« Je vous écoute. », « Dites-moi. », « Prenez votre temps. »).",
+        EVITER_FIN_SUR_QUESTION ? "Au téléphone, ta voix avale la fin d'une réponse qui se termine sur une question. Ne finis donc jamais sur le point d'interrogation : après ta question, ajoute toujours deux ou trois mots, variés d'une fois sur l'autre (« Je vous écoute. », « Dites-moi. », « Prenez votre temps. »)." : "",
         TYPO_COLLEE ? CONSIGNE_PONCTUATION : "",
       ].filter(Boolean).join("\n");
       const sessionInstructions = collerPonctuation(contexte ? `${instructionsBase}\n\n# Contexte de cet appel\n${contexte}` : instructionsBase);
@@ -1704,14 +1782,15 @@ wss.on("connection", (twilio, requete) => {
         case "conversation.item.input_audio_transcription.completed":
           if (process.env.JOURNAL_DIALOGUE === "1") console.log(`[transcription] ${e.type.split(".").pop()} item=${e.item_id} ligne=${tourClient ? tourClient.idx : "aucune"} « ${e.transcript} » ${t()}`);
           noterEntreeClient(e.item_id, e.transcript);
-          setUser(e.transcript, false); // cumulatif ou final : remplace
+          noterTranscription(e.item_id, e.transcript, false); // cumulatif ou final : remplace le morceau
           break;
         case "conversation.item.input_audio_transcription.delta":
           noterEntreeClient(e.item_id, e.delta);
-          setUser(e.delta, true);
+          noterTranscription(e.item_id, e.delta, true);
           break;
         case "conversation.item.added":
           if (e.item?.id) itemsAjoutes.add(e.item.id);
+          if (e.item?.id && e.item.role === "user" && !tourDeItem.has(e.item.id)) tourDeItem.set(e.item.id, tourNo);
           if (reponseActive && e.item?.id && e.item.role !== "user") itemsReponse.push(e.item.id);
           if (process.env.JOURNAL_ELEMENTS === "1") console.log(`[element] ajoute ${e.item?.id} ${e.item?.role || e.item?.type} apres ${e.previous_item_id ?? "-"} (reponse n°${respSeq}${reponseActive ? " active" : ""}) ${t()}`);
           // Ce que la reponse anticipee ajoute (message, appels d'outil) s'effacera avec elle si elle est annulee.
@@ -2201,10 +2280,13 @@ wss.on("connection", (twilio, requete) => {
       sessionIdDV = ecrit?.sessionId ?? null;
       console.log(`[dalevoz] appel ${sessionIdDV ? "ecrit " + sessionIdDV : "NON ecrit"} sid=${callSid}`);
     }
-    if (hasClient && N8N_RECAP_URL) {
+    if (RECAP_EXCLURE.has(String(fromNumber || "").replace(/[^\d+]/g, ""))) {
+      console.log(`[recap] numero de test ${fromNumber}, pas de recap sid=${callSid}`);
+    } else if ((hasClient || RECAP_APPEL_EN_ABSENCE) && N8N_RECAP_URL) {
       const payload = { dialog: text, phone: fromNumber || "inconnu", call_sid: callSid };
+      if (!hasClient) Object.assign(payload, { sans_parole: true, duree_s: Math.round((Date.now() - debutAppelMs) / 1000) });
       const ok = await postRecap(payload, 4); // essais immediats au raccrochage : 1s, 2s, 4s, 8s
-      if (ok) console.log(`[recap] envoye a n8n sid=${callSid}`);
+      if (ok) console.log(`[recap] ${hasClient ? "envoye" : "appel en absence envoye"} a n8n sid=${callSid}`);
       else { pendingRecaps.push(payload); console.error(`[recap] n8n injoignable, mis en file de reessai sid=${callSid}`); }
     } else if (!hasClient) {
       console.log(`[call] raccroche sans parole, pas de recap sid=${callSid}`);
