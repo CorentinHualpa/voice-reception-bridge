@@ -1355,6 +1355,65 @@ wss.on("connection", (twilio, requete) => {
   }
   function pushAgent() { pushLine("Agent", agentBuf); agentBuf = ""; }
 
+  // ---- Accueil ----
+  // L'accueil de la porte Telephone (Format et Accueil de Dale Voz) se dit MOT POUR MOT au premier tour.
+  // PRE-ENREGISTRE quand la voix est ElevenLabs (30/09/2026) : le faire ecrire par Grok coutait la mise en route
+  // de sa session (~1,5 s, 20 000 caracteres de consigne) plus 1 a 5 s de Grok, soit 6,7 s de silence au
+  // decroche sur l'appel de Coq du 30/09. La phrase est fixe : sa voix sort du cache (lib/lecture-eleven.js)
+  // des que DaleVoz a repondu, pendant que Grok se prepare, puis Grok apprend qu'il l'a dite.
+  let accueilEtat = "aucun";   // aucun | attente | joue | echec
+  let accueilTexte = "", accueilInjecte = false;
+  // ACCUEIL_TEXTE : l'accueil d'un pont sans Dale Voz (bancs, configuration locale).
+  function texteAccueil() {
+    const brut = typeof sessionDV?.greeting === "string" ? sessionDV.greeting : (sessionDV ? "" : process.env.ACCUEIL_TEXTE || "");
+    return brut.trim() ? saluerSelonHeure(brut.trim()) : "";
+  }
+  function demanderAccueilAGrok() {
+    const accueil = texteAccueil();
+    if (TOURS_PAR_LE_PONT) marquerGeneration();
+    grok.send(JSON.stringify(accueil
+      // Laisse au modele, il perdait contre un prompt qui imposait sa propre premiere phrase.
+      ? { type: "response.create", response: { instructions: `Dis exactement cette phrase, mot pour mot, sans rien ajouter avant ni apres, avec le sourire et beaucoup d'entrain, comme une Italienne ravie d'accueillir, puis ecoute : « ${collerPonctuation(accueil)} »` } }
+      : { type: "response.create" }));
+  }
+  function lancerAccueilEnregistre() {
+    if (!lectureActive() || !streamSid) return;
+    accueilTexte = texteAccueil();
+    if (!accueilTexte) return;
+    accueilEtat = "attente";
+    const t0 = Date.now();
+    lecture.accueil(accueilTexte).then(({ ulaw, cache }) => {
+      if (finalized || accueilEtat !== "attente") return;
+      accueilEtat = "joue";
+      console.log(`[accueil] pre-enregistre (${cache ? "cache" : `synthetise en ${Date.now() - t0} ms`}), ${(ulaw.length / 8000).toFixed(1)} s ${t()} sid=${callSid}`);
+      jouerAccueil(ulaw);
+    }).catch((err) => {
+      if (accueilEtat !== "attente") return;
+      accueilEtat = "echec";
+      console.log(`[accueil] ElevenLabs en echec (${err.message}) : Grok dira l'accueil ${t()} sid=${callSid}`);
+      if (grokReady) demanderAccueilAGrok();
+    });
+  }
+  // L'accueil compte comme la reponse n°1 : memes compteurs, meme queue de silence, meme mark de fin de lecture.
+  function jouerAccueil(ulaw) {
+    respSeq++;
+    debutReponseMs = Date.now(); premierSon = false; audioReponseOctets = 0;
+    rediteTranchee = true; retenueRedite = [];
+    agentSpeaking = true; agentSpeakingSince = Date.now();
+    for (let o = 0; o < ulaw.length; o += 8000) envoyerSonAgent(ulaw.subarray(o, o + 8000));
+    envoyerMedia(Buffer.alloc(2400, 0xff), { sousVoix: false }); // 300 ms de silence, comme terminerReponse
+    finLecture = Math.max(finLecture, Date.now()) + 300;
+    if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `agentdone:${respSeq}` } }));
+    agentBuf = accueilTexte; pushAgent();
+    repliqueEnCours = accueilTexte;
+    if (grokReady) injecterAccueil();
+  }
+  function injecterAccueil() {
+    if (accueilInjecte || !(grok && grok.readyState === WebSocket.OPEN)) return;
+    accueilInjecte = true;
+    grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "assistant", content: [{ type: "output_text", text: accueilTexte }] } }));
+  }
+
   async function openGrok() {
     // L'agent joué vient de Dale Voz quand le numéro appelé y est rattaché ;
     // sinon le pont garde sa configuration locale (prompt en fichier), ce qui
@@ -1370,7 +1429,7 @@ wss.on("connection", (twilio, requete) => {
         if (!sessionDV) console.error(`[dalevoz] config introuvable pour ${canalDV.agentSlug}, repli sur la config locale`);
         else {
           if (typeof sessionDV.telephone?.couperLaParole === "boolean") bargeIn = sessionDV.telephone.couperLaParole;
-          console.log(`[dalevoz] agent ${canalDV.agentSlug} (${sessionDV.tools?.length ?? 0} outils, coupure ${bargeIn ? "oui" : "non"}) pour ${toNumber}`);
+          console.log(`[dalevoz] agent ${canalDV.agentSlug} (${sessionDV.tools?.length ?? 0} outils, coupure ${bargeIn ? "oui" : "non"}) pour ${toNumber} ${t()}`);
         }
         // Ce que la tablette du restaurant a regle (pause, ruptures...) doit etre dans le contexte
         // de CET appel, qui part juste apres. Plafonne : un Dale Voz lent ne retarde pas le decroche.
@@ -1381,6 +1440,7 @@ wss.on("connection", (twilio, requete) => {
         }
       }
     }
+    lancerAccueilEnregistre(); // sans attendre Grok
     let token;
     try {
       const tok = await fetch("https://api.x.ai/v1/realtime/client_secrets", {
@@ -1494,13 +1554,10 @@ wss.on("connection", (twilio, requete) => {
         case "session.updated":
           if (!grokReady) {
             grokReady = true;
-            // L'accueil de la porte Telephone (Format et Accueil de Dale Voz) se dit MOT POUR MOT au premier tour.
-            // Laisse au modele, il perdait contre un prompt qui imposait sa propre premiere phrase.
-            const accueil = typeof sessionDV?.greeting === "string" ? saluerSelonHeure(sessionDV.greeting.trim()) : "";
-            if (TOURS_PAR_LE_PONT) marquerGeneration();
-            grok.send(JSON.stringify(accueil
-              ? { type: "response.create", response: { instructions: `Dis exactement cette phrase, mot pour mot, sans rien ajouter avant ni apres, avec le sourire et beaucoup d'entrain, comme une Italienne ravie d'accueillir, puis ecoute : « ${collerPonctuation(accueil)} »` } }
-              : { type: "response.create" }));
+            // Accueil pre-enregistre (voir lancerAccueilEnregistre) : deja joue, Grok apprend seulement qu'il l'a
+            // dit ; encore en route, il le saura quand il partira ; sinon, c'est Grok qui le dit.
+            if (accueilEtat === "joue") injecterAccueil();
+            else if (accueilEtat !== "attente") demanderAccueilAGrok();
           } // salut une fois
           break;
         case "response.created":
