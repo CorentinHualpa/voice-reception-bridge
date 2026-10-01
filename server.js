@@ -894,8 +894,9 @@ wss.on("connection", (twilio, requete) => {
     pendingCalls = []; agentBuf = ""; closingSaid = a.closingAvant;
     reponseCoupee = respSeq; agentSpeaking = false;
     // La ligne du client reservee avec la phrase partielle : la transcription de la phrase entiere la remplacera.
-    if (tourClient && tourClient.idx != null && tourClient.idx === dialog.length - 1 && dialog[tourClient.idx].who === "Client") dialog.pop();
+    if (tourClient && tourClient.idx != null && tourClient.idx === dialog.length - 1 && dialog[tourClient.idx].who === "Client") { dialog.pop(); ligneDuTour.delete(tourClient.n); }
     tourClient = null; userBuf = "";
+    memeTourApresAnnulation = true;
     reponseActive = false; generation = false; attenteCreation = false;
     const suite = retenue.length;
     lacherRetenue();
@@ -997,6 +998,9 @@ wss.on("connection", (twilio, requete) => {
     if (TOURS_PAR_LE_PONT) { reponseActive = false; generation = false; lacherRetenue(); } // Grok peut de nouveau entendre le client
     // Une reponse coupee par le client n'a pas ete entendue en entier : elle ne compte pas comme dite.
     if (texteReponse.trim() && respSeq !== reponseCoupee) repliqueEnCours = `${repliqueEnCours} ${texteReponse.trim()}`.trim().slice(-4000);
+    // Etat du dialogue avant cette reponse : si elle n'a jamais ete dite (secours ci-dessous), on le restaure tel quel
+    // (pushLine peut l'avoir fusionnee avec la ligne precedente de l'agent, une comparaison de texte la manquerait).
+    const dialogueAvant = { n: dialog.length, msg: dialog[dialog.length - 1]?.msg };
     pushAgent();
     if (RECAP_RE.test(texteReponse) || (/euro/i.test(texteReponse) && /\?/.test(texteReponse))) { recapTs = Date.now(); clientApresRecap = false; }
     // Dany a fini de GENERER, mais Twilio joue encore l'audio en file. On rouvre l'ecoute seulement au mark "agentdone"
@@ -1035,12 +1039,14 @@ wss.on("connection", (twilio, requete) => {
     if (redireApresEchec === respSeq && !calls.length && phrase && audioReponseOctets === 0 && respSeq !== reponseCoupee && grok?.readyState === WebSocket.OPEN) {
       redireApresEchec = 0;
       const ids = [...new Set([...itemsReponse, ...(e.response?.output || []).map((o) => o?.id)].filter((id) => id && itemsAjoutes.has(id)))];
-      for (const id of ids) { suppressionsEnCours++; grok.send(JSON.stringify({ type: "conversation.item.delete", item_id: id })); }
-      const der = dialog[dialog.length - 1];
-      if (der?.who === "Agent" && der.msg === phrase) { dialog.pop(); tourNo = Math.max(0, tourNo - 1); }
+      for (const id of ids) supprimerElement(id); // avec nouvel essai sur « Item not found »
+      dialog.length = dialogueAvant.n;
+      if (dialogueAvant.n && dialog[dialogueAvant.n - 1]) dialog[dialogueAvant.n - 1].msg = dialogueAvant.msg;
       console.log(`[lecture] reponse n°${respSeq} jamais dite (${ids.length} element${ids.length > 1 ? "s" : ""} efface${ids.length > 1 ? "s" : ""}) : OpenAI la regenere de sa voix ${t()} sid=${callSid}`);
-      if (TOURS_PAR_LE_PONT) marquerGeneration();
-      grok.send(JSON.stringify({ type: "response.create" }));
+      // La reponse muette a consomme l'entree du client : sans ceci, la garde anti-redite (Palazzo) jetterait la
+      // regeneration. demanderReponse pose aussi le filet d'une reponse jamais creee.
+      entreeNouvelle = true;
+      demanderReponse();
       return;
     }
     if (calls.length) runTools(calls).catch((err) => console.error("[outil] echec du cycle", err));
@@ -1331,7 +1337,11 @@ wss.on("connection", (twilio, requete) => {
     if (repliqueEnCours) { repliqueAvantClient = repliqueEnCours; repliqueEnCours = ""; }
     if (!(grok && grok.readyState === WebSocket.OPEN)) return;
     grok.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-    tourClient = { idx: null };
+    // Un envoi du tampon = un tour du client, sauf la revalidation qui suit une anticipation annulee : c'est la
+    // suite de la MEME phrase, ses morceaux doivent finir sur la meme ligne (voir texteDuTour).
+    if (memeTourApresAnnulation) memeTourApresAnnulation = false; else tourNo++;
+    toursACommettre.push(tourNo);
+    tourClient = { idx: null, n: tourNo };
     if (recapTs) clientApresRecap = true;
     relancesOutils = 0;
     relanceSuiteFaite = false;
@@ -1389,6 +1399,7 @@ wss.on("connection", (twilio, requete) => {
   function pushUser() {
     if (!tourClient || tourClient.idx != null) { if (userBuf.trim()) pushLine("Client", userBuf); userBuf = ""; return; }
     tourClient.idx = dialog.length;
+    if (tourClient.n != null) ligneDuTour.set(tourClient.n, tourClient.idx);
     dialog.push({ who: "Client", msg: userBuf.trim() });
     userBuf = "";
   }
@@ -1407,25 +1418,36 @@ wss.on("connection", (twilio, requete) => {
   // du tampon cree son PROPRE message : « Oui, bonjour. » | « J'ai une pompe de relevage… » | « Il me faudrait un
   // devis… ». Le modele les voit tous, mais la ligne du dialogue ne gardait que le dernier morceau, et c'est elle
   // qui part dans le mail de recap (« Client : arobase gmail.com » pour un email entierement epele). On rattache
-  // chaque message du client au tour ou il a ete cree, et la ligne du tour est la suite de tous ses morceaux.
-  let tourNo = 0;                       // avance a chaque reponse de l'agent reellement dite
+  // chaque message du client au tour qui l'a envoye (validerTour : un envoi du tampon = un tour, la suite d'une
+  // phrase apres une anticipation annulee restant dans le meme), et la ligne du tour est la suite de ses morceaux.
+  // ⚠ La ligne s'ecrit DIRECTEMENT a sa place reservee : un « Voilà. » dit juste apres un email epele ouvre un
+  // nouveau tour avant que la transcription de l'email arrive, et elle ne doit ni se perdre ni tomber sur la ligne
+  // suivante (relecture du 01/10/2026).
+  let tourNo = 0;                       // avance a chaque nouveau tour du client
+  let memeTourApresAnnulation = false;  // la prochaine validation prolonge le tour en cours
+  const toursACommettre = [];           // tours envoyes, dans l'ordre, en attente de leur input_audio_buffer.committed
   const tourDeItem = new Map();         // item_id du client -> tour
   const texteDeItem = new Map();        // item_id du client -> transcription
   const ligneDuTour = new Map();        // tour -> index de sa ligne dans le dialogue
+  function rattacherItem(itemId, n) { if (itemId && !tourDeItem.has(itemId)) tourDeItem.set(itemId, n); }
   function texteDuTour(itemId, texte, cumule) {
-    const n = tourDeItem.has(itemId) ? tourDeItem.get(itemId) : tourNo;
-    if (!tourDeItem.has(itemId)) tourDeItem.set(itemId, n);
+    rattacherItem(itemId, tourClient?.n ?? tourNo);
+    const n = tourDeItem.get(itemId);
     texteDeItem.set(itemId, cumule ? (texteDeItem.get(itemId) || "") + texte : texte);
-    const morceaux = [...texteDeItem].filter(([id]) => tourDeItem.get(id) === n).map(([, s]) => s.trim()).filter(Boolean);
+    // Les morceaux du tour, plus ceux d'un tour precedent reste sans ligne (sinon ils seraient perdus).
+    const morceaux = [...texteDeItem]
+      .filter(([id]) => { const m = tourDeItem.get(id); return m === n || (m < n && !ligneDuTour.has(m)); })
+      .map(([, s]) => s.trim()).filter(Boolean);
     return { n, phrase: morceaux.join(" ") };
   }
   function noterTranscription(itemId, texte, cumule) {
     if (typeof texte !== "string") return;
     if (!itemId) { setUser(texte, cumule); return; }
     const { n, phrase } = texteDuTour(itemId, texte, cumule);
-    // Transcription tardive d'un tour deja clos par la reponse de l'agent : elle corrige SA ligne, pas la suivante.
-    if (n !== tourNo) { const i = ligneDuTour.get(n); if (i != null && dialog[i]?.who === "Client") dialog[i].msg = phrase; return; }
-    setUser(phrase, false);
+    const i = ligneDuTour.get(n);
+    if (i != null && dialog[i]?.who === "Client") { dialog[i].msg = phrase; return; }
+    if (n === (tourClient?.n ?? tourNo)) { setUser(phrase, false); return; }
+    console.log(`[transcription] tour n°${n} sans ligne, gardee pour la ligne suivante « ${phrase.slice(0, 80)} » ${t()} sid=${callSid}`);
   }
   function setUser(texte, cumule) {
     if (typeof texte !== "string") return;
@@ -1434,10 +1456,7 @@ wss.on("connection", (twilio, requete) => {
       l.msg = (cumule ? l.msg + texte : texte).replace(/^\s+/, "");
     } else userBuf = cumule ? userBuf + texte : texte;
   }
-  function pushAgent() {
-    if (agentBuf.trim()) { if (tourClient && tourClient.idx != null) ligneDuTour.set(tourNo, tourClient.idx); tourNo++; }
-    pushLine("Agent", agentBuf); agentBuf = "";
-  }
+  function pushAgent() { pushLine("Agent", agentBuf); agentBuf = ""; }
 
   // ---- Cerveau OpenAI (voir CERVEAU) ----
   // `voix` : OpenAI parle lui-meme (secours quand ElevenLabs tombe), en mu-law 8 kHz pour Twilio.
@@ -1790,7 +1809,7 @@ wss.on("connection", (twilio, requete) => {
           break;
         case "conversation.item.added":
           if (e.item?.id) itemsAjoutes.add(e.item.id);
-          if (e.item?.id && e.item.role === "user" && !tourDeItem.has(e.item.id)) tourDeItem.set(e.item.id, tourNo);
+          if (e.item?.role === "user" && e.item.type === "message" && (e.item.content || []).some((c) => /audio/.test(c?.type || ""))) rattacherItem(e.item.id, tourClient?.n ?? tourNo);
           if (reponseActive && e.item?.id && e.item.role !== "user") itemsReponse.push(e.item.id);
           if (process.env.JOURNAL_ELEMENTS === "1") console.log(`[element] ajoute ${e.item?.id} ${e.item?.role || e.item?.type} apres ${e.previous_item_id ?? "-"} (reponse n°${respSeq}${reponseActive ? " active" : ""}) ${t()}`);
           // Ce que la reponse anticipee ajoute (message, appels d'outil) s'effacera avec elle si elle est annulee.
@@ -1802,9 +1821,15 @@ wss.on("connection", (twilio, requete) => {
           essaisSuppression.delete(e.item_id);
           console.log(`[grok] ${e.type}${e.item_id ? " " + e.item_id : ""} ${t()}`);
           break;
+        case "input_audio_buffer.committed":
+          // Le message cree par un envoi du tampon appartient au tour qui l'a envoye (voir texteDuTour).
+          if (toursACommettre.length) rattacherItem(e.item_id, toursACommettre.shift());
+          if (!typesVus.has(e.type)) { typesVus.add(e.type); console.log(`[grok] ${e.type} ${t()}`); }
+          break;
         case "input_audio_buffer.speech_started": {
           if (TOURS_PAR_LE_PONT) break; // en mode manuel, Grok signale encore la parole : le pont a deja decide
-          tourClient = { idx: null };
+          tourNo++;
+          tourClient = { idx: null, n: tourNo };
           if (recapTs) clientApresRecap = true;
           lastCallerMs = Date.now();
           relancesOutils = 0;
