@@ -69,7 +69,8 @@ const pont = spawn(process.execPath, ["server.js"], {
     ...(process.env.LECTURE === "elevenlabs" ? {
       LECTURE: "elevenlabs",
       ELEVENLABS_API_KEY: (vault.match(/^ELEVENLABS_API_KEY=(.*)$/m)?.[1] ?? "").trim().replace(/^["']|["']$/g, ""),
-      ...Object.fromEntries(["ELEVEN_VOIX", "ELEVEN_BALISE", "ELEVEN_MODELE", "ELEVEN_DELAI_MAX_MS", "ELEVEN_LANGUE", "ACCUEIL_TEXTE"].filter((k) => process.env[k]).map((k) => [k, process.env[k]])),
+      ...Object.fromEntries(["ELEVEN_VOIX", "ELEVEN_BALISE", "ELEVEN_MODELE", "ELEVEN_DELAI_MAX_MS", "ELEVEN_LANGUE", "ACCUEIL_TEXTE", "CERVEAU", "OPENAI_REALTIME_MODEL", "OPENAI_TRANSCRIPTION"].filter((k) => process.env[k]).map((k) => [k, process.env[k]])),
+      ...(process.env.CERVEAU === "openai" ? { OPENAI_API_KEY: (vault.match(/^OPENAI_API_KEY=(.*)$/m)?.[1] ?? "").trim().replace(/^["']|["']$/g, "") } : {}),
     } : {}),
     // Fin de tour par modele (EOT_MODELE=1). ⚠ Ce banc joue un client de SYNTHESE, qui prononce chaque
     // fragment avec une intonation descendante : le modele le croit fini et coupe. Il verifie la plomberie

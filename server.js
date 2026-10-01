@@ -213,6 +213,19 @@ const HEDGE_APRES_MS = Number(process.env.HEDGE_APRES_MS ?? 0);
 // Retour arriere sans code : LECTURE=grok.
 // Si ElevenLabs tombe pendant un appel (cle, quota, reseau), l'appel repasse sur la voix de Grok jusqu'a la fin.
 const LECTURE_ELEVEN = configLectureEleven();
+
+// CERVEAU (01/10/2026) : « grok » (defaut) ou « openai ». Avec la voix lue par ElevenLabs, seul le TEXTE du
+// modele sert. OpenAI Realtime en sortie texte seule rend son premier jeton en ~0,42 s (mediane, consigne de
+// Palazzo) contre ~1 s pour Grok, et Grok a eu des pics de 3 a 5 s sur la moitie des tours le 30/09. Exige
+// LECTURE=elevenlabs et OPENAI_API_KEY ; sinon Grok. Reglages : OPENAI_REALTIME_MODEL (gpt-realtime),
+// OPENAI_TRANSCRIPTION (gpt-4o-mini-transcribe), OPENAI_VOIX (marin : voix de secours si ElevenLabs tombe).
+// Retour arriere sans code : CERVEAU=grok.
+const CERVEAU_OPENAI = (process.env.CERVEAU || "grok").toLowerCase() === "openai" && Boolean(LECTURE_ELEVEN) && Boolean(process.env.OPENAI_API_KEY);
+const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime";
+const OPENAI_TRANSCRIPTION = process.env.OPENAI_TRANSCRIPTION || "gpt-4o-mini-transcribe";
+const OPENAI_VOIX = process.env.OPENAI_VOIX || "marin";
+if ((process.env.CERVEAU || "").toLowerCase() === "openai" && !CERVEAU_OPENAI) console.error("[cerveau] CERVEAU=openai exige LECTURE=elevenlabs et OPENAI_API_KEY : Grok conserve");
+console.log(`[cerveau] ${CERVEAU_OPENAI ? `OpenAI ${OPENAI_REALTIME_MODEL}, sortie texte, transcription ${OPENAI_TRANSCRIPTION}` : "Grok"}`);
 console.log(`[lecture] ${LECTURE_ELEVEN ? `ElevenLabs voix=${LECTURE_ELEVEN.voix} modele=${LECTURE_ELEVEN.modele} balise=${LECTURE_ELEVEN.balise ? `« ${LECTURE_ELEVEN.balise} »` : "aucune"}` : "voix de Grok"}`);
 // FIN DE TOUR PAR MODELE (18/09/2026). Le pont conclut aujourd'hui qu'un client a fini quand il a compte
 // FIN_DE_TOUR_MS de silence. C'est le plus gros poste de latence qui reste, et c'est ce qui coupe la parole a
@@ -758,7 +771,9 @@ wss.on("connection", (twilio, requete) => {
     if (!(grok && grok.readyState === WebSocket.OPEN && grokReady)) return;
     for (const p of paquets) {
       if (generation) { retenue.push(p); continue; } // Grok abandonnerait la reponse qu'il genere
-      grok.send(JSON.stringify({ type: "input_audio_buffer.append", audio: p.toString("base64") }));
+      // OpenAI recoit du mu-law (audio/pcmu), Grok du PCM : le pont travaille en PCM 8 kHz, on reconvertit.
+      const charge = CERVEAU_OPENAI ? pcm16ToUlaw8k(p, GROK_RATE) : p;
+      grok.send(JSON.stringify({ type: "input_audio_buffer.append", audio: charge.toString("base64") }));
       audioEnvoyeMs += (p.length / 2 / GROK_RATE) * 1000;
     }
   }
@@ -921,6 +936,7 @@ wss.on("connection", (twilio, requete) => {
       // reponse, on ne rejoue rien (le client entendrait le debut deux fois) : la reponse suivante sera en Grok.
       surEchec: ({ octetsLivres, erreur }) => {
         lectureEnEchec = true;
+        voixDeSecours(); // cerveau OpenAI : pas de voix de Grok gardee, OpenAI parlera lui-meme des la reponse suivante
         const garde = voixGrokGardee; voixGrokGardee = [];
         console.log(`[lecture] ElevenLabs en echec (${erreur}) : voix de Grok jusqu'a la fin de l'appel${octetsLivres ? "" : `, ${(garde.reduce((n, u) => n + u.length, 0) / 8000).toFixed(1)} s de la reponse n°${marque} rejouees`} ${t()} sid=${callSid}`);
         if (!octetsLivres && marque === respSeq) for (const u of garde) livrerSonPrimaire(u, marque);
@@ -950,7 +966,7 @@ wss.on("connection", (twilio, requete) => {
     // tronque l'audio ou si la ligne l'avait perdu. Le statut de Grok, ses details, les secondes d'audio
     // reellement envoyees a Twilio et la duree de generation le disent en une ligne.
     const r = e.response || {};
-    console.log(`[reponse] n°${respSeq} statut=${r.status || "?"}${r.status_details ? " " + JSON.stringify(r.status_details).slice(0, 200) : ""} audio=${(audioReponseOctets / 8000).toFixed(1)}s generee_en=${((Date.now() - debutReponseMs) / 1000).toFixed(1)}s texte=${texteReponse.length}car${pendingCalls.length ? " outils=" + pendingCalls.map((c) => c.name).join(",") : ""}${r.usage ? " usage=" + JSON.stringify(r.usage).slice(0, 200) : ""} ${t()} sid=${callSid}`);
+    console.log(`[reponse] n°${respSeq} statut=${r.status || "?"}${r.status_details ? " " + JSON.stringify(r.status_details).slice(0, 200) : ""} audio=${(audioReponseOctets / 8000).toFixed(1)}s generee_en=${((Date.now() - debutReponseMs) / 1000).toFixed(1)}s texte=${texteReponse.length}car${pendingCalls.length ? " outils=" + pendingCalls.map((c) => c.name).join(",") : ""}${r.usage ? " usage=" + JSON.stringify(r.usage).slice(0, 800) : ""} ${t()} sid=${callSid}`); // 800 : le detail d'OpenAI (cache, audio) sert a chiffrer l'appel
     // La doublure parle a la place de cette reponse : c'est SON `finie` qui cloturera le tour, quand son texte
     // aura ete injecte dans la primaire. Jusque-la, la generation reste ouverte et le client attend.
     if (doublureGagnante) { reponseActive = false; return; }
@@ -1118,7 +1134,7 @@ wss.on("connection", (twilio, requete) => {
             const marque = tourDoublure.marque;
             fluxDoublure = lecture.flux(marque, {
               surSon: (u) => { if (marque === respSeq && reponseCoupee !== marque) envoyerSonAgent(u); },
-              surEchec: () => { lectureEnEchec = true; console.log(`[lecture] ElevenLabs en echec : voix de Grok jusqu'a la fin de l'appel ${t()} sid=${callSid}`); },
+              surEchec: () => { lectureEnEchec = true; voixDeSecours(); console.log(`[lecture] ElevenLabs en echec : voix de Grok jusqu'a la fin de l'appel ${t()} sid=${callSid}`); },
             });
           }
           fluxDoublure.texte(delta);
@@ -1355,6 +1371,28 @@ wss.on("connection", (twilio, requete) => {
   }
   function pushAgent() { pushLine("Agent", agentBuf); agentBuf = ""; }
 
+  // ---- Cerveau OpenAI (voir CERVEAU) ----
+  // `voix` : OpenAI parle lui-meme (secours quand ElevenLabs tombe), en mu-law 8 kHz pour Twilio.
+  function configSessionOpenAI(instructions, outils, voix) {
+    return {
+      type: "realtime",
+      ...(instructions ? { instructions } : {}),
+      ...(outils?.length ? { tools: outils, tool_choice: "auto" } : {}),
+      output_modalities: voix ? ["audio"] : ["text"],
+      audio: {
+        input: { format: { type: "audio/pcmu" }, transcription: { model: OPENAI_TRANSCRIPTION, language: AGENT_LANG }, turn_detection: null },
+        ...(voix ? { output: { format: { type: "audio/pcmu" }, voice: OPENAI_VOIX } } : {}),
+      },
+    };
+  }
+  let voixDeSecoursActive = false;
+  function voixDeSecours() {
+    if (!CERVEAU_OPENAI || voixDeSecoursActive || !(grok && grok.readyState === WebSocket.OPEN)) return;
+    voixDeSecoursActive = true;
+    grok.send(JSON.stringify({ type: "session.update", session: { type: "realtime", output_modalities: ["audio"], audio: { output: { format: { type: "audio/pcmu" }, voice: OPENAI_VOIX } } } }));
+    console.log(`[cerveau] OpenAI parle avec sa voix (${OPENAI_VOIX}) jusqu'a la fin de l'appel ${t()} sid=${callSid}`);
+  }
+
   // ---- Accueil ----
   // L'accueil de la porte Telephone (Format et Accueil de Dale Voz) se dit MOT POUR MOT au premier tour.
   // PRE-ENREGISTRE quand la voix est ElevenLabs (30/09/2026) : le faire ecrire par Grok coutait la mise en route
@@ -1442,21 +1480,23 @@ wss.on("connection", (twilio, requete) => {
     }
     lancerAccueilEnregistre(); // sans attendre Grok
     let token;
-    try {
-      const tok = await fetch("https://api.x.ai/v1/realtime/client_secrets", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${XAI_API_KEY}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ expires_after: { seconds: 600 } }),
-      }).then((r) => r.json());
-      token = tok.value || tok.secret || tok.token || (tok.client_secret && tok.client_secret.value);
-    } catch (e) {
-      console.error("[grok] token error", e);
-      return;
+    if (!CERVEAU_OPENAI) { // OpenAI s'ouvre cote serveur avec la cle, sans jeton ephemere
+      try {
+        const tok = await fetch("https://api.x.ai/v1/realtime/client_secrets", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${XAI_API_KEY}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ expires_after: { seconds: 600 } }),
+        }).then((r) => r.json());
+        token = tok.value || tok.secret || tok.token || (tok.client_secret && tok.client_secret.value);
+      } catch (e) {
+        console.error("[grok] token error", e);
+        return;
+      }
+      if (!token) { console.error("[grok] pas de token"); return; }
     }
-    if (!token) { console.error("[grok] pas de token"); return; }
 
     // Le modele, la vitesse et le seuil VAD viennent de l'onglet Voix de l'agent Dale Voz quand il y en a un.
-    const modele = sessionDV?.model || GROK_MODEL;
+    const modele = CERVEAU_OPENAI ? OPENAI_REALTIME_MODEL : sessionDV?.model || GROK_MODEL;
     const vitesse = Number(sessionDV?.speed) || GROK_SPEED;
     const seuilVad = Number(sessionDV?.threshold) || GROK_VAD_THRESHOLD;
     if (Number(sessionDV?.silenceMs) > 0) finDeTourMs = Math.min(1500, Math.max(500, Number(sessionDV.silenceMs)));
@@ -1474,10 +1514,13 @@ wss.on("connection", (twilio, requete) => {
     if (lecture) lecture.chauffer().then((ok) => {
       if (ok === true) return;
       lectureEnEchec = true;
-      console.log(`[lecture] ElevenLabs injoignable a l'ouverture (${ok}) : voix de Grok pour cet appel ${t()} sid=${callSid}`);
+      voixDeSecours(); // session OpenAI deja ouverte en texte : elle passe a la voix (sinon elle s'ouvre directement en voix)
+      console.log(`[lecture] ElevenLabs injoignable a l'ouverture (${ok}) : voix de ${CERVEAU_OPENAI ? "secours d'OpenAI" : "Grok"} pour cet appel ${t()} sid=${callSid}`);
     });
     if (TOURS_PAR_LE_PONT && MMM_APRES_MS > 0) sonDAttente(sessionDV?.voice || GROK_VOICE, vitesse).then((s) => { sonMmm = s; });
-    grok = new WebSocket(`wss://api.x.ai/v1/realtime?model=${modele}`, [`xai-client-secret.${token}`]);
+    grok = CERVEAU_OPENAI
+      ? new WebSocket(`wss://api.openai.com/v1/realtime?model=${modele}`, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } })
+      : new WebSocket(`wss://api.x.ai/v1/realtime?model=${modele}`, [`xai-client-secret.${token}`]);
 
     grok.on("open", () => {
       const callerFr = frPhone(fromNumber);
@@ -1518,7 +1561,13 @@ wss.on("connection", (twilio, requete) => {
       // envoyait toujours GROK_REASONING (defaut "high") : un agent regle sur « Rapide » dans l'onglet
       // Voix (Palazzo) reflechissait quand meme avant chaque reponse, d'ou la latence remontee par Jacky.
       const effort = sessionDV?.reasoning === "none" || sessionDV?.reasoning === "high" ? sessionDV.reasoning : GROK_REASONING;
-      console.log(`[session] modele=${modele} reflexion=${effort} tours=${TOURS_PAR_LE_PONT ? "pont fin_de_tour=" + finDeTourMs + "ms" : "grok seuil=" + seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} carte=${carteAjoutee ? "ajoutee" : "non"} anticipation=${ANTICIPATION_MS}ms doublure=${HEDGE_APRES_MS ? HEDGE_APRES_MS + "ms" : "non"} ambiance=${ambiance ? ambiance.libelle : "non"} lecture=${lectureActive() ? "elevenlabs" : "grok"} fin_de_tour=${eot ? "modele seuil=" + EOT_SEUIL + " delai=" + EOT_DELAI_MS + "ms filet=" + finDeTourMs + "ms" : "silence seul"} ${t()} sid=${callSid}`);
+      console.log(`[session] cerveau=${CERVEAU_OPENAI ? "openai" : "grok"} modele=${modele} reflexion=${effort} tours=${TOURS_PAR_LE_PONT ? "pont fin_de_tour=" + finDeTourMs + "ms" : "grok seuil=" + seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} carte=${carteAjoutee ? "ajoutee" : "non"} anticipation=${ANTICIPATION_MS}ms doublure=${HEDGE_APRES_MS ? HEDGE_APRES_MS + "ms" : "non"} ambiance=${ambiance ? ambiance.libelle : "non"} lecture=${lectureActive() ? "elevenlabs" : "grok"} fin_de_tour=${eot ? "modele seuil=" + EOT_SEUIL + " delai=" + EOT_DELAI_MS + "ms filet=" + finDeTourMs + "ms" : "silence seul"} ${t()} sid=${callSid}`);
+      if (CERVEAU_OPENAI) {
+        // Sortie TEXTE seule (ElevenLabs lit) ; l'audio du client arrive en mu-law tel que Twilio le donne.
+        // ElevenLabs deja injoignable a l'ouverture : OpenAI parle lui-meme, avec sa voix (voir voixDeSecours).
+        grok.send(JSON.stringify({ type: "session.update", session: configSessionOpenAI(sessionInstructions, outils, !lectureActive()) }));
+        return;
+      }
       grok.send(JSON.stringify({
         type: "session.update",
         session: {
@@ -1592,6 +1641,8 @@ wss.on("connection", (twilio, requete) => {
           if (respSeq === reponseCoupee) break;
           if (respSeq === primaireJetee) break; // la doublure joue ce tour a sa place
           if (DOUBLURE_TEST_MS && doublure && Date.now() - debutReponseMs < DOUBLURE_TEST_MS) break; // banc
+          // Voix de secours d'OpenAI : deja en mu-law 8 kHz (audio/pcmu), rien a convertir.
+          if (CERVEAU_OPENAI) { livrerSonPrimaire(Buffer.from(e.delta, "base64")); break; }
           const brut = Buffer.concat([resteAudio, Buffer.from(e.delta, "base64")]);
           const pair = brut.length - (brut.length % 2);
           resteAudio = Buffer.from(brut.subarray(pair)); // 0 ou 1 octet
@@ -1604,6 +1655,7 @@ wss.on("connection", (twilio, requete) => {
           livrerSonPrimaire(ulaw);
           break;
         }
+        case "response.output_text.delta": // OpenAI en sortie texte seule (voir CERVEAU)
         case "response.output_audio_transcript.delta":
           if (respSeq === primaireJetee) break; // reponse doublee : son texte n'est pas dit
           if (e.delta) { agentBuf += e.delta; if (CLOSING_RE.test(agentBuf)) closingSaid = true; }
@@ -1692,6 +1744,8 @@ wss.on("connection", (twilio, requete) => {
             else { essaisSuppression.delete(id); console.log(`[grok] effacement abandonne apres 4 essais : ${id} ${t()} sid=${callSid}`); }
             break;
           }
+          // OpenAI signale une annulation sans reponse active (anticipation deja soldee), xAI l'ignorait : rien a faire.
+          if (e.error?.code === "response_cancel_not_active") break;
           // Ignorees en silence jusqu'au 16/09/2026 : une erreur de Grok ne laissait aucune trace.
           console.error(`[grok] erreur ${JSON.stringify(e.error || e).slice(0, 300)} ${t()} sid=${callSid}`);
           // Un effacement refuse (anticipation annulee) n'est pas un refus de reponse : rien a relacher.
