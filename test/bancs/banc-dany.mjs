@@ -60,6 +60,9 @@ const envPont = {
   AMBIANCE: "centre-appels", JOURNAL_DIALOGUE: "1",
 };
 for (const k of Object.keys(envPont)) if (process.env[k] !== undefined && !/KEY/.test(k)) envPont[k] = process.env[k];
+// Transfert d'appel (02/10/2026) : TRANSFERT_NUMERO + identifiants factices font passer le cycle complet
+// (outil, annonce, mark, bascule refusee par Twilio, excuses de l'agent) sans toucher un vrai appel.
+for (const k of ["TRANSFERT_NUMERO", "TRANSFERT_NOM", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"]) if (process.env[k]) envPont[k] = process.env[k];
 const pont = spawn(process.execPath, ["server.js"], { cwd: RACINE, env: envPont });
 const t0 = Date.now();
 const horo = () => `${((Date.now() - t0) / 1000).toFixed(2)}`.padStart(6);
