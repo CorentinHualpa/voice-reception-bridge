@@ -724,6 +724,11 @@ wss.on("connection", (twilio, requete) => {
   // session publiee porte les outils de commande ET le contexte du restaurant (heure, pause, ruptures,
   // carte). Le profil local `pizzeria` s'efface alors : ni ses outils, ni sa carte, ni son contexte.
   const commandesParDaleVoz = () => Boolean(sessionDV?.tools?.some((t) => t.name === "enregistrer_commande"));
+  // LE PROFIL LOCAL `pizzeria` NE VAUT QUE SANS DALE VOZ (02/10/2026). Il s'allumait pour TOUT agent Dale Voz sans
+  // prise de commande : le premier autre client branche sur ce pont aurait recu la carte et les outils de Palazzo.
+  // Palazzo lui-meme ne s'en sert plus (prise de commande par Dale Voz, « carte=non » dans ses journaux) ; il reste
+  // le repli quand la plateforme est injoignable (pas de session chargee).
+  const profilPizzeria = () => Boolean(pizzeria) && !sessionDV;
   let commandeEnregistreeDV = false; // pour la garde de cloture, une commande par appel
   let sessionIdDV = null; // fil Dale Voz, cree a l'ecriture de l'appel
   let bargeIn = BARGE_IN_DEFAUT; // regle par l'agent Dale Voz (settings.telephone.couperLaParole) des que la session est chargee
@@ -1165,7 +1170,7 @@ wss.on("connection", (twilio, requete) => {
     if (!calls.length && transfert && transfert.etat === "annonce") preparerTransfert();
     if (calls.length) runTools(calls).catch((err) => console.error("[outil] echec du cycle", err));
     else if (TOURS_PAR_LE_PONT && tourEnAttente && !tour) { validerTour(); demanderReponse(); } // le client a parle pendant la generation
-    else if ((pizzeria || commandesParDaleVoz()) && !clotureVerifiee) {
+    else if ((profilPizzeria() || commandesParDaleVoz()) && !clotureVerifiee) {
       const consigne = commandesParDaleVoz()
         ? consigneClotureCommande(texteReponse, { outils: calls.map((c) => c.name), dejaEnregistree: commandeEnregistreeDV })
         : pizzeria.consigneCloture(texteReponse, { callSid, outils: calls.map((c) => c.name) });
@@ -1711,7 +1716,7 @@ wss.on("connection", (twilio, requete) => {
         }
         // Ce que la tablette du restaurant a regle (pause, ruptures...) doit etre dans le contexte
         // de CET appel, qui part juste apres. Plafonne : un Dale Voz lent ne retarde pas le decroche.
-        if (pizzeria && !commandesParDaleVoz()) {
+        if (profilPizzeria()) {
           const t0 = Date.now();
           await Promise.race([pizzeria.rafraichir({ tenantId: canalDV.tenantId, agentSlug: canalDV.agentSlug }, { forcer: true }), new Promise((r) => setTimeout(r, 1500))]);
           console.log(`[restaurant] etat relu en ${Date.now() - t0} ms`);
@@ -1783,7 +1788,7 @@ wss.on("connection", (twilio, requete) => {
       // reponse, soit deux a trois secondes de plus au telephone (et une fois 11 s de silence). La carte qui
       // chiffre les commandes est deja dans le pont : on la donne, sauf si le prompt la contient deja.
       // Commandes par Dale Voz : la carte et l'etat du restaurant sont deja dans les instructions publiees.
-      const profilLocal = Boolean(pizzeria) && !commandesParDaleVoz();
+      const profilLocal = profilPizzeria();
       const carte = profilLocal ? pizzeria.carteTexte() : "";
       const premiereLigneCarte = carte.split("\n").find((l) => l.startsWith("- ")) || "";
       const carteAjoutee = carte && !(premiereLigneCarte && instructionsBase.includes(premiereLigneCarte))
@@ -2235,7 +2240,7 @@ wss.on("connection", (twilio, requete) => {
 
   // Outils : un appel d'outil termine la reponse du modele. On renvoie le resultat PUIS on relance,
   // sinon il reste muet. Plafond de relances par tour client, sinon il s'enchaine tout seul.
-  const outilLocal = (nom) => Boolean(pizzeria) && !commandesParDaleVoz() && pizzeria.tools.some((t) => t.name === nom);
+  const outilLocal = (nom) => profilPizzeria() && pizzeria.tools.some((t) => t.name === nom);
 
   // Pendant les outils, une prise de parole qui se termine attend la relance au lieu de demander sa propre
   // reponse : deux response.create se croiseraient.
@@ -2387,7 +2392,7 @@ wss.on("connection", (twilio, requete) => {
       motif: transfert.motif,
       langue: sessionDV?.locale || canalDV?.locale || AGENT_LANG || "fr",
       dv: canalDV ? { tenantId: canalDV.tenantId, agentSlug: canalDV.agentSlug, locale: canalDV.locale } : null,
-      profilLocal: Boolean(pizzeria) && !commandesParDaleVoz(),
+      profilLocal: profilPizzeria(),
       accepte: false,
       sessionId: sessionIdDV,
       dialogue: "",
