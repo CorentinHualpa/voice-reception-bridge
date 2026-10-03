@@ -2598,9 +2598,9 @@ wss.on("connection", (twilio, requete) => {
             : "",
           rappelRdv,
         ].filter(Boolean).join("\n") || undefined,
-        // L'objet du mail quand c'est un rendez-vous a fixer, et pas un transfert sans reponse (Dale Voz l'ecrit
-        // dans la langue de l'agent).
-        rappelMotif: rappelRdv ? "rdv" : undefined,
+        // L'objet du mail quand c'est SEULEMENT un rendez-vous a fixer (Dale Voz l'ecrit dans la langue de l'agent).
+        // Avec une reprise apres transfert dans le meme appel, l'objet du transfert reste, les deux textes sont dedans.
+        rappelMotif: rappelRdv && !(reprise && !reprise.alerteEnvoyee) ? "rdv" : undefined,
       });
       if (reprise) reprise.alerteEnvoyee = true;
       sessionIdDV = ecrit?.sessionId ?? null;
