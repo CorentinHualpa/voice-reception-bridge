@@ -61,7 +61,9 @@ import {
 import {
   basculerAppel,
   creerRegistreTransferts,
+  etatAppelTwilio,
   issueTransfert,
+  texteARappeler,
   numeroE164,
   outilTransfert,
   phraseAnnonceAppelant,
@@ -362,6 +364,55 @@ if (process.env.TRANSFERT_NUMERO && !TRANSFERT_NUMERO) console.error("[boot] TRA
 else if (TRANSFERT_NUMERO) console.log(`[boot] transfert d'appel vers ${TRANSFERT_NOM || "l'equipe"} actif`);
 // Les transferts en cours, par CallSid de l'appel d'origine (voir lib/transfert.js).
 const registreTransferts = creerRegistreTransferts();
+
+// LE COMPTE RENDU D'UN TRANSFERT : la trace dans le fil Dale Voz (une fois), les secondes passees avec l'humain, et
+// l'alerte a l'equipe quand l'appel est a rappeler (une fois). Appele par /apres-transfert, par la surveillance (Twilio
+// n'a jamais rappele l'action : l'appelant a raccroche pendant la sonnerie), et quand la reprise n'arrive pas.
+// Sans Dale Voz, l'alerte passe par le profil local du restaurant, comme un message transmis.
+async function ecrireCompteRendu(sid, e, { issue, secondes = 0, alerte = "" }) {
+  // La premiere partie de l'appel, ecrite par finalize() ; 15 s au plus, une ecriture perdue ne bloque rien.
+  try { await Promise.race([e.ecrit, new Promise((r) => setTimeout(r, 15000))]); } catch {}
+  const trace = !e.traceEcrite && issue;
+  const aRappeler = alerte && !e.alerteEnvoyee ? alerte : "";
+  if (!trace && !aRappeler) return;
+  if (trace) e.traceEcrite = true;
+  if (aRappeler) e.alerteEnvoyee = true;
+  if (e.dv) {
+    await enregistrerAppel({
+      tenantId: e.dv.tenantId,
+      agentSlug: e.dv.agentSlug,
+      turns: [],
+      // Sans fil connu (premiere ecriture perdue), Dale Voz le retrouve par le CallSid.
+      ...(e.sessionId ? { sessionId: e.sessionId } : { appelId: sid }),
+      userId: frPhone(e.from) || undefined,
+      locale: e.dv.locale,
+      diagnostic: trace ? `transfert ${issue}${secondes ? ` (${secondes} s)` : ""}` : "alerte de rappel apres transfert",
+      ...(trace ? { transfert: { nom: e.reglage?.nom, numero: e.reglage?.numero, statut: issue, secondes, motif: e.motif } } : {}),
+      ...(aRappeler ? { aRappeler } : {}),
+    });
+  } else if (aRappeler && pizzeria) {
+    pizzeria.runAsync("transmettre_message", { motif: aRappeler }, { callSid: sid || null, from: frPhone(e.from) });
+  }
+}
+
+// LA SURVEILLANCE D'UN TRANSFERT : si Twilio ne rappelle jamais l'action du <Dial> (l'appelant a raccroche pendant la
+// sonnerie), personne ne serait prevenu. On regarde l'appel d'origine chez Twilio apres la sonnerie, puis toutes les
+// cinq minutes tant qu'il est en cours (une conversation avec l'humain peut durer).
+async function surveillerTransfert(sid) {
+  const e = registreTransferts.lire(sid);
+  if (!e || e.actionRecue) return;
+  const etat = await etatAppelTwilio({ accountSid: e.accountSid, authToken: e.authToken, callSid: sid });
+  if (!etat || ["queued", "ringing", "in-progress"].includes(etat)) {
+    e.surveillance = setTimeout(() => surveillerTransfert(sid), 5 * 60 * 1000);
+    return;
+  }
+  console.log(`[transfert] appel fini (${etat}) sans retour du transfert : l'appelant a raccroche pendant la sonnerie sid=${sid}`);
+  await ecrireCompteRendu(sid, e, {
+    issue: "sans_reponse",
+    alerte: texteARappeler({ issue: "sans_reponse", nom: e.reglage?.nom, motif: e.motif, langue: e.langue, raccroche: true }),
+  });
+  registreTransferts.retirer(sid);
+}
 // Identifiants du compte quand le numero n'est pas rattache a Dale Voz (Dale Voz les donne par numero sinon).
 const TWILIO_LOCAL = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? { accountSid: process.env.TWILIO_ACCOUNT_SID, authToken: process.env.TWILIO_AUTH_TOKEN }
@@ -626,7 +677,7 @@ const server = http.createServer((req, res) => {
       if (!authToken && TWILIO_LOCAL) authToken = TWILIO_LOCAL.authToken;
       const signatureOk = authToken
         ? signatureTwilioValide({ authToken, url: `https://${req.headers.host}${req.url}`, params: post, signature: req.headers["x-twilio-signature"] || "" })
-        : !dalevozActif; // pont sans Dale Voz ni identifiants : aucun transfert n'a pu partir d'ici
+        : false; // ni Dale Voz ni identifiants : aucun transfert n'a pu partir d'ici, rien a accepter
       if (!signatureOk) {
         console.error(`[transfert] ${path} refuse (signature) sid=${sid}`);
         res.writeHead(403, { "Content-Type": "text/plain" });
@@ -659,8 +710,11 @@ const server = http.createServer((req, res) => {
       const duree = Number(post.DialCallDuration || 0) || 0;
       const reglage = entree?.reglage || { nom: TRANSFERT_NOM, confirmation: false, siPasDeReponse: "message" };
       const issue = issueTransfert({ statut, duree, confirmation: reglage.confirmation, accepte: Boolean(entree?.accepte) });
-      const reprendra = issue !== "pris" && Boolean(entree) && reglage.siPasDeReponse === "agent";
-      console.log(`[transfert] fin statut=${statut} issue=${issue} duree=${duree}s ${reprendra ? "-> l'agent reprend" : ""} sid=${sid}`);
+      // L'appelant a raccroche pendant la sonnerie : Twilio rappelle l'action avec CallStatus=completed, et ignore le
+      // TwiML rendu. Pas de reprise possible, l'alerte part tout de suite (relecture du 02/10/2026).
+      const appelantParti = String(post.CallStatus || "") === "completed";
+      const reprendra = issue !== "pris" && Boolean(entree) && reglage.siPasDeReponse === "agent" && !appelantParti;
+      console.log(`[transfert] fin statut=${statut} issue=${issue} duree=${duree}s${appelantParti ? " appelant parti" : ""}${reprendra ? " -> l'agent reprend" : ""} sid=${sid}`);
       repondre(twimlApresTransfert({
         issue,
         nom: reglage.nom,
@@ -673,33 +727,29 @@ const server = http.createServer((req, res) => {
       if (entree) {
         entree.issue = issue;
         entree.secondes = duree;
-        // La premiere partie de l'appel, ecrite par finalize() ; 15 s au plus, une ecriture perdue ne bloque rien.
-        try { await Promise.race([entree.ecrit, new Promise((r) => setTimeout(r, 15000))]); } catch {}
-        const libelle = { sans_reponse: "personne n'a décroché", occupe: "ligne occupée", refuse: "appel non pris", echec: "le transfert n'a pas pu se faire" }[issue] || issue;
-        if (entree.dv && entree.sessionId) {
-          await enregistrerAppel({
-            tenantId: entree.dv.tenantId,
-            agentSlug: entree.dv.agentSlug,
-            turns: [],
-            sessionId: entree.sessionId,
-            userId: frPhone(entree.from) || undefined,
-            locale: entree.dv.locale,
-            diagnostic: `transfert ${issue}${duree ? ` (${duree} s)` : ""}`,
-            transfert: { nom: reglage.nom, numero: reglage.numero, statut: issue, secondes: duree, motif: entree.motif },
-            // Reprise par l'agent : l'alerte partira a la fin, avec le message qu'il aura pris.
-            aRappeler: issue !== "pris" && !reprendra
-              ? `Appel à rappeler : le transfert à ${reglage.nom || "un conseiller"} n'a pas abouti (${libelle}).${entree.motif ? ` Motif : ${entree.motif}.` : ""}`
-              : undefined,
-          });
+        entree.actionRecue = true;
+        clearTimeout(entree.surveillance);
+        if (reprendra) {
+          // La reprise doit se connecter dans les secondes qui viennent ; sinon (appelant parti entre-temps, Twilio
+          // qui n'execute pas le <Connect>), l'alerte part quand meme et l'entree est oubliee.
+          entree.minuteurReprise = setTimeout(() => {
+            if (entree.repriseConnectee) return;
+            console.log(`[transfert] la reprise ne s'est pas connectee : alerte envoyee quand meme sid=${sid}`);
+            ecrireCompteRendu(sid, entree, { alerte: texteARappeler({ issue, nom: reglage.nom, motif: entree.motif, langue: entree.langue }) })
+              .finally(() => registreTransferts.retirer(sid));
+          }, 20000);
         }
-        if (issue !== "pris" && !reprendra && pizzeria && entree.profilLocal) {
-          pizzeria.runAsync("transmettre_message", {
-            motif: `Voulait parler à ${reglage.nom || "un humain"}, transfert sans réponse (${libelle})`,
-          }, { callSid: sid || null, from: frPhone(entree.from) });
-        }
+        // Reprise par l'agent : l'alerte partira a la fin de la reprise, avec le message qu'il aura pris.
+        await ecrireCompteRendu(sid, entree, {
+          issue,
+          secondes: duree,
+          alerte: issue !== "pris" && !reprendra
+            ? texteARappeler({ issue, nom: reglage.nom, motif: entree.motif, langue: entree.langue, raccroche: appelantParti })
+            : "",
+        });
         if (!reprendra) registreTransferts.retirer(sid);
-      } else if (issue !== "pris" && pizzeria) {
-        // Pont redemarre pendant le transfert : l'equipe doit quand meme rappeler.
+      } else if (issue !== "pris" && pizzeria && !dalevozActif) {
+        // Pont sans Dale Voz redemarre pendant le transfert : l'equipe doit quand meme rappeler.
         pizzeria.runAsync("transmettre_message", {
           motif: `Voulait parler à ${TRANSFERT_NOM || "un humain"}, transfert sans réponse (${statut || "inconnu"})`,
         }, { callSid: sid || null, from: frPhone(post.From) });
@@ -2085,6 +2135,7 @@ wss.on("connection", (twilio, requete) => {
       console.log(`[call] start sid=${callSid} from=${fromNumber} to=${toNumber}`);
       if (m.start.customParameters?.reprise === "transfert") {
         reprise = registreTransferts.lire(callSid);
+        if (reprise) { reprise.repriseConnectee = true; clearTimeout(reprise.minuteurReprise); }
         console.log(`[transfert] ${reprise ? `l'agent reprend l'appel (${reprise.issue || "?"})` : "reprise demandee mais registre vide"} sid=${callSid}`);
       }
       mesurerRttTwilio();
@@ -2386,6 +2437,7 @@ wss.on("connection", (twilio, requete) => {
     // meme d'avoir repondu a la requete. `ecrit` se resout quand finalize() a ecrit la premiere partie.
     const entree = registreTransferts.poser(callSid, {
       reglage: reglageT,
+      accountSid: identifiantsT.accountSid,
       authToken: identifiantsT.authToken,
       from: fromNumber,
       to: toNumber,
@@ -2416,6 +2468,8 @@ wss.on("connection", (twilio, requete) => {
     const r = await basculerAppel({ accountSid: identifiantsT.accountSid, authToken: identifiantsT.authToken, callSid, twiml });
     if (r.ok) {
       console.log(`[transfert] appel bascule vers ${reglageT.numero} (${pourquoi}, sonnerie ${reglageT.sonnerie} s, confirmation ${reglageT.confirmation ? "oui" : "non"}) ${t()} sid=${callSid}`);
+      // Filet : si Twilio ne rappelle jamais la fin du <Dial>, l'equipe doit quand meme etre prevenue.
+      entree.surveillance = setTimeout(() => surveillerTransfert(callSid), (reglageT.sonnerie + 45) * 1000);
       return;
     }
     console.error(`[transfert] echec ${r.erreur} sid=${callSid}`);
@@ -2524,10 +2578,11 @@ wss.on("connection", (twilio, requete) => {
         userId: frPhone(fromNumber) || undefined,
         locale: canalDV.locale,
         diagnostic: reprise ? `reprise apres transfert, ${endReason}` : endReason,
-        aRappeler: reprise
-          ? `Appel à rappeler : le transfert à ${reprise.reglage?.nom || "un conseiller"} n'a pas abouti (${LIBELLES_ISSUE[reprise.issue] || "appel non pris"}), l'assistant a repris l'appel.${reprise.motif ? ` Motif : ${reprise.motif}.` : ""}${ditApres ? ` Ce que la personne a dit ensuite : « ${ditApres} »` : ""}`
+        aRappeler: reprise && !reprise.alerteEnvoyee
+          ? texteARappeler({ issue: reprise.issue, nom: reprise.reglage?.nom, motif: reprise.motif, langue: reprise.langue, reprise: true, dit: ditApres })
           : undefined,
       });
+      if (reprise) reprise.alerteEnvoyee = true;
       sessionIdDV = ecrit?.sessionId ?? null;
       console.log(`[dalevoz] ${reprise ? "reprise" : "appel"} ${sessionIdDV ? "ecrit " + sessionIdDV : "NON ecrit"} sid=${callSid}`);
     }

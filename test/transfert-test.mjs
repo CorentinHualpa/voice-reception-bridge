@@ -9,6 +9,7 @@ import {
   outilTransfert,
   phraseReprise,
   reglageTransfert,
+  texteARappeler,
   twimlAnnonce,
   twimlApresTransfert,
   twimlReponseAnnonce,
@@ -121,6 +122,16 @@ cas("la phrase de reprise nomme la personne et ne colle pas d'espace avant le po
   assert.ok(p.startsWith("Lorenzo n'est pas disponible"));
   assert.ok(!/\s\?/.test(p));
   assert.ok(phraseReprise({ nom: "", langue: "en" }).startsWith("The advisor"));
+});
+
+cas("l'alerte a rappeler dit pourquoi, dans la langue de l'agent", () => {
+  const fr = texteARappeler({ issue: "refuse", nom: "Lorenzo", motif: "devis", raccroche: true });
+  assert.ok(fr.startsWith("Appel à rappeler : le transfert à Lorenzo n'a pas abouti (appel non pris)"));
+  assert.ok(fr.includes("raccroché pendant la sonnerie"));
+  assert.ok(fr.includes("Motif : devis."));
+  const repris = texteARappeler({ issue: "sans_reponse", reprise: true, dit: "rappelez-moi demain" });
+  assert.ok(repris.includes("un conseiller") && repris.includes("l'assistant a repris l'appel") && repris.includes("« rappelez-moi demain »"));
+  assert.ok(texteARappeler({ issue: "occupe", langue: "es" }).startsWith("Llamada por devolver"));
 });
 
 cas("le numero se lit par paires a la francaise", () => {
