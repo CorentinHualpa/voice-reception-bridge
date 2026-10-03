@@ -1779,7 +1779,7 @@ wss.on("connection", (twilio, requete) => {
     identifiantsT = canalDV
       ? (canalDV.accountSid && canalDV.authToken ? { accountSid: canalDV.accountSid, authToken: canalDV.authToken } : null)
       : TWILIO_LOCAL;
-    if (reglageT) console.log(`[transfert] possible vers ${reglageT.nom || "l'equipe"} (${reglageT.source}, sonnerie ${reglageT.sonnerie} s, confirmation ${reglageT.confirmation ? "oui" : "non"}, sinon ${reglageT.siPasDeReponse})${identifiantsT ? "" : " MAIS sans identifiants Twilio : outil retire"}${reprise ? ", pas en reprise" : ""} sid=${callSid}`);
+    if (reglageT) console.log(`[transfert] possible vers ${reglageT.nom || "l'equipe"} (${reglageT.source}, sonnerie ${reglageT.sonnerie} s, confirmation ${reglageT.confirmation ? "oui" : "non"}, sinon ${reglageT.siPasDeReponse})${identifiantsT ? "" : " MAIS sans identifiants Twilio : outil retire"}${reprise ? ", mais coupe pendant cette reprise" : ""} sid=${callSid}`);
     // L'annonce du transfert, enregistree pendant le decroche (cache du processus : un seul appel a ElevenLabs par phrase).
     if (reglageT && identifiantsT && !reprise && lectureActive()) {
       const texte = phraseAnnonceAppelant({ nom: reglageT.nom, langue: sessionDV?.locale || canalDV?.locale || AGENT_LANG });
