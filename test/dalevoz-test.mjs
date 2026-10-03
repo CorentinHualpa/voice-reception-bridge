@@ -87,6 +87,21 @@ await cas("l'appel écrit porte le canal téléphone et le CallSid", async () =>
   assert.equal(corps.turns.length, 2);
 });
 
+await cas("rendez-vous : l'outil reçoit l'appel, et la demande de rappel part avec son motif « rdv »", async () => {
+  const { OUTILS_RDV } = await import("../lib/dalevoz.js");
+  assert.deepEqual([...OUTILS_RDV].sort(), ["demander_rappel", "proposer_creneaux", "reserver_creneau"]);
+  await executerOutil({ tenantId: "t-1", agentSlug: "garage", outil: "proposer_creneaux", args: {}, appel: { id: "CA9", telephone: "0612345678" } });
+  assert.deepEqual(recus.at(-1).corps.appel, { id: "CA9", telephone: "0612345678" });
+  await enregistrerAppel({
+    tenantId: "t-1", agentSlug: "garage", appelId: "CA9", dureeMs: 30000, turns: [{ role: "user", text: "un rendez-vous" }],
+    aRappeler: "Rendez-vous à fixer.", rappelMotif: "rdv",
+  });
+  assert.equal(recus.at(-1).corps.rappelMotif, "rdv");
+  // Sans alerte, le motif ne part pas seul.
+  await enregistrerAppel({ tenantId: "t-1", agentSlug: "garage", appelId: "CA10", dureeMs: 1000, turns: [], rappelMotif: "rdv" });
+  assert.equal(recus.at(-1).corps.rappelMotif, undefined);
+});
+
 await cas("signature Twilio : le vecteur de la doc passe, une signature modifiée échoue", () => {
   // Vecteur officiel, twilio.com/docs/usage/security (relu le 15/09/2026).
   const url = "https://example.com/myapp.php?foo=1&bar=2";

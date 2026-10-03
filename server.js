@@ -57,6 +57,7 @@ import {
   pousserCarteRestaurant,
   resoudreNumero,
   signatureTwilioValide,
+  OUTILS_RDV,
 } from "./lib/dalevoz.js";
 import {
   basculerAppel,
@@ -802,6 +803,9 @@ wss.on("connection", (twilio, requete) => {
   let relanceOutilDemandee = false, reponseApresOutil = false; // la relance de suite ne vaut qu'apres un outil
   let clotureVerifiee = false; // garde « commande annoncee sans enregistrement » : une seule consigne par appel
   let messageTransmisSansReponse = false; // garde « pas de raccrochage juste apres transmettre_message »
+  // RENDEZ-VOUS A FIXER (02/10/2026) : la demande de rappel prise par l'agent faute de creneau (outil demander_rappel
+  // de Dale Voz). Elle part avec l'ecriture de l'appel, pour que l'alerte porte le lien vers la conversation.
+  let rappelRdv = "";
   // CE QUE L'AGENT A DIT (17/09/2026, demande de la plateforme) : Dale Voz verifie que le recapitulatif DIT couvre la
   // commande avant de l'enregistrer. repliqueEnCours = ce que l'agent a dit en entier depuis la derniere parole du
   // client ; repliqueAvantClient = ce qu'il avait dit juste avant elle, envoye en appel.replique aux outils de commande.
@@ -2357,6 +2361,9 @@ wss.on("connection", (twilio, requete) => {
         catch (err) { out = { ok: false, erreur: err.message }; console.error(`[outil] ${c.name} KO`, err); }
       } else if (canalDV) {
         const commande = OUTILS_DE_COMMANDE.has(c.name);
+        // Le rendez-vous (02/10/2026) a besoin de l'appel lui aussi : le numero a confirmer, et le CallSid qui relie
+        // le rendez-vous a la conversation ecrite au raccrochage.
+        const rdv = OUTILS_RDV.has(c.name);
         if (commande && c.name === "enregistrer_commande") console.log(`[outil] enregistrer_commande : replique envoyee ${repliqueAvantClient ? `(${repliqueAvantClient.length} car) « …${repliqueAvantClient.slice(-160)} »` : "aucune"} ${t()}`);
         const reponse = await executerOutil({
           tenantId: canalDV.tenantId,
@@ -2366,10 +2373,17 @@ wss.on("connection", (twilio, requete) => {
           sessionId: sessionIdDV,
           locale: canalDV.locale,
           ...(commande ? { appel: { id: callSid, telephone: frPhone(fromNumber), recapConfirme: recapTs > 0 && clientApresRecap, ...(repliqueAvantClient ? { replique: repliqueAvantClient.slice(-2000) } : {}) } } : {}),
+          ...(rdv ? { appel: { id: callSid, telephone: frPhone(fromNumber) } } : {}),
         });
         // La plateforme renvoie { output } deja serialise ; null = elle n'a pas repondu.
         out = reponse?.output ?? { ok: false, erreur: "outil indisponible" };
         if (c.name === "enregistrer_commande" && typeof out === "string" && /"ok":\s*true/.test(out)) commandeEnregistreeDV = true;
+        if (c.name === "demander_rappel" && typeof out === "string") {
+          try {
+            const o = JSON.parse(out);
+            if (o && o.ok && typeof o.alerte === "string" && o.alerte.trim()) rappelRdv = o.alerte.trim().slice(0, 600);
+          } catch {}
+        }
       } else {
         out = { ok: false, erreur: `outil inconnu ${c.name}` };
       }
@@ -2578,9 +2592,15 @@ wss.on("connection", (twilio, requete) => {
         userId: frPhone(fromNumber) || undefined,
         locale: canalDV.locale,
         diagnostic: reprise ? `reprise apres transfert, ${endReason}` : endReason,
-        aRappeler: reprise && !reprise.alerteEnvoyee
-          ? texteARappeler({ issue: reprise.issue, nom: reprise.reglage?.nom, motif: reprise.motif, langue: reprise.langue, reprise: true, dit: ditApres })
-          : undefined,
+        aRappeler: [
+          reprise && !reprise.alerteEnvoyee
+            ? texteARappeler({ issue: reprise.issue, nom: reprise.reglage?.nom, motif: reprise.motif, langue: reprise.langue, reprise: true, dit: ditApres })
+            : "",
+          rappelRdv,
+        ].filter(Boolean).join("\n") || undefined,
+        // L'objet du mail quand c'est un rendez-vous a fixer, et pas un transfert sans reponse (Dale Voz l'ecrit
+        // dans la langue de l'agent).
+        rappelMotif: rappelRdv ? "rdv" : undefined,
       });
       if (reprise) reprise.alerteEnvoyee = true;
       sessionIdDV = ecrit?.sessionId ?? null;
