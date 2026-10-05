@@ -268,13 +268,16 @@ const OPENAI_TRANSCRIPTION = process.env.OPENAI_TRANSCRIPTION || "gpt-4o-mini-tr
 // defaut) une transcription en retard fait jeter une vraie reponse. Dany le pose avec REDITE_ATTENTE_MS=0.
 // La consigne n'est envoyee qu'aux modeles qui la prennent en texte libre : gpt-realtime-whisper et
 // gpt-4o-transcribe-diarize la refusent (la session entiere serait rejetee), whisper-1 attend des mots-cles.
+// La consigne PAR DEFAUT ne part qu'avec gpt-4o-transcribe, le seul modele ou elle a ete mesuree : sur mini elle
+// n'apportait rien (0/3 avec ou sans) et n'a pas ete eprouvee face a la garde anti-redite de 600 ms (un « mmm »
+// transcrit en lettres compterait comme une entree). OPENAI_TRANSCRIPTION_PROMPT la force sur tout modele qui l'accepte.
 const TRANSCRIPTION_ACCEPTE_PROMPT = /^gpt-4o(-mini)?-transcribe(-\d{4}-\d{2}-\d{2})?$/.test(OPENAI_TRANSCRIPTION);
-const OPENAI_TRANSCRIPTION_PROMPT = !TRANSCRIPTION_ACCEPTE_PROMPT ? "" : process.env.OPENAI_TRANSCRIPTION_PROMPT ?? (AGENT_LANG === "fr"
+const OPENAI_TRANSCRIPTION_PROMPT = !TRANSCRIPTION_ACCEPTE_PROMPT ? "" : process.env.OPENAI_TRANSCRIPTION_PROMPT ?? (AGENT_LANG === "fr" && /^gpt-4o-transcribe/.test(OPENAI_TRANSCRIPTION)
   ? "Appel téléphonique en français. L'appelant épelle souvent son nom ou son adresse e-mail lettre par lettre (M, A, R, I, E), avec arobase, point, tiret, deux L, et des domaines comme gmail, hotmail, yahoo, orange, free."
   : "");
 const OPENAI_VOIX = process.env.OPENAI_VOIX || "marin";
 if ((process.env.CERVEAU || "").toLowerCase() === "openai" && !CERVEAU_OPENAI) console.error("[cerveau] CERVEAU=openai exige LECTURE=elevenlabs et OPENAI_API_KEY : Grok conserve");
-console.log(`[cerveau] ${CERVEAU_OPENAI ? `OpenAI ${OPENAI_REALTIME_MODEL}, sortie texte, transcription ${OPENAI_TRANSCRIPTION}` : "Grok"}`);
+console.log(`[cerveau] ${CERVEAU_OPENAI ? `OpenAI ${OPENAI_REALTIME_MODEL}, sortie texte, transcription ${OPENAI_TRANSCRIPTION}${OPENAI_TRANSCRIPTION_PROMPT ? " avec consigne" : ""}` : "Grok"}`);
 console.log(`[lecture] ${LECTURE_ELEVEN ? `ElevenLabs voix=${LECTURE_ELEVEN.voix} modele=${LECTURE_ELEVEN.modele} balise=${LECTURE_ELEVEN.balise ? `« ${LECTURE_ELEVEN.balise} »` : "aucune"}` : "voix de Grok"}`);
 // Accueil fixe (ACCUEIL_TEXTE, pont sans Dale Voz comme Dany) : synthetise des le demarrage, pour que le premier
 // appel apres un redeploiement ne paie pas ~2 s de synthese au decroche (mesure au banc de Dany, 01/10/2026).
