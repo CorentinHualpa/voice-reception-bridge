@@ -63,6 +63,8 @@ for (const k of Object.keys(envPont)) if (process.env[k] !== undefined && !/KEY/
 // Transfert d'appel (02/10/2026) : TRANSFERT_NUMERO + identifiants factices font passer le cycle complet
 // (outil, annonce, mark, bascule refusee par Twilio, excuses de l'agent) sans toucher un vrai appel.
 for (const k of ["TRANSFERT_NUMERO", "TRANSFERT_NOM", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"]) if (process.env[k]) envPont[k] = process.env[k];
+// Transcription et fin d'appel (05/10/2026) : le modele de transcription, sa consigne, la phrase d'au revoir.
+for (const k of ["OPENAI_TRANSCRIPTION", "OPENAI_TRANSCRIPTION_PROMPT", "AU_REVOIR_REGEX", "CLOSING_REGEX"]) if (process.env[k] !== undefined) envPont[k] = process.env[k];
 const pont = spawn(process.execPath, ["server.js"], { cwd: RACINE, env: envPont });
 const t0 = Date.now();
 const horo = () => `${((Date.now() - t0) / 1000).toFixed(2)}`.padStart(6);
@@ -117,6 +119,9 @@ setInterval(() => {
   const maintenant = Date.now();
   for (let i = marks.length - 1; i >= 0; i--) if (marks[i].a <= maintenant) { envoyer({ event: "mark", streamSid: "MZbanc", mark: { name: marks[i].nom } }); marks.splice(i, 1); }
 }, 20);
+// Le pont ferme le flux = Twilio raccroche. Le banc continue de jouer le client pour voir si l'agent lui repond encore.
+let raccrocheA = 0;
+ws.onclose = () => { raccrocheA = Date.now(); journal.push(`${horo()} [banc] le pont a RACCROCHÉ`); };
 
 envoyer({ event: "connected" });
 envoyer({ event: "start", start: { streamSid: "MZbanc", callSid: "CAbanc", customParameters: { from: "+33612345678", to: "+33939241266" } } });

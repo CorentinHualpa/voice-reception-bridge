@@ -91,6 +91,12 @@ const BUSINESS_DESC = process.env.BUSINESS_DESC || "";
 const N8N_RECAP_URL = process.env.N8N_RECAP_URL || "";
 const ADMIN_KEY = process.env.ADMIN_KEY || ""; // protege le tableau de bord /admin
 const CLOSING_RE = new RegExp(process.env.CLOSING_REGEX || "remercie pour votre appel", "i");
+// AU REVOIR APRES LA CLOTURE (Motralec, appel du 03/10/2026) : la cloture dite, l'appelante a repondu « Merci »,
+// l'agent a dit au revoir, puis elle a parle a quelqu'un d'autre dans la piece. Le silence de 8 s qui arme le
+// raccrochage n'est jamais venu, et l'agent lui a repondu (« Avez-vous une autre question… »). Desormais, une
+// reponse qui suit une cloture deja dite ET une prise de parole du client, et qui dit au revoir sans rien
+// demander, raccroche des qu'elle a ete jouee. AU_REVOIR_REGEX remplace la liste des formules d'au revoir.
+const AU_REVOIR_RE = new RegExp(process.env.AU_REVOIR_REGEX || "au revoir|[àa] bient[ôo]t|bonne nuit|bon (apr[èe]s-midi|week-end|weekend)|(bonne|belle|excellente) (fin de )?(journ[ée]e|soir[ée]e|semaine|week-end)|adi[oó]s|hasta (luego|pronto)|good ?bye|have a (nice|great|good|lovely) (day|evening|weekend)", "i");
 // Numeros de test (Dany, 17/09/2026) : couper tout le recap pendant une recette ferait perdre les vrais appels du
 // moment ; seuls les numeros listes ici (E.164, separes par des virgules) n'en envoient pas.
 const RECAP_EXCLURE = new Set((process.env.RECAP_EXCLURE || "").split(",").map((n) => n.replace(/[^\d+]/g, "")).filter(Boolean));
@@ -254,6 +260,18 @@ const LECTURE_ELEVEN = configLectureEleven();
 const CERVEAU_OPENAI = (process.env.CERVEAU || "grok").toLowerCase() === "openai" && Boolean(LECTURE_ELEVEN) && Boolean(process.env.OPENAI_API_KEY);
 const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime";
 const OPENAI_TRANSCRIPTION = process.env.OPENAI_TRANSCRIPTION || "gpt-4o-mini-transcribe";
+// Consigne de la transcription (05/10/2026). Sans elle, gpt-4o-mini-transcribe a saute tout un email epele au
+// telephone et ecrit des lettres isolees en cyrillique ou en coreen (« Това », « 오 ») malgre language=fr. Mesure
+// sur le segment epele de l'appel de controle de Dany (01/10, 3 passages) : gpt-4o-transcribe avec consigne 3/3
+// exact, sans consigne 1/3, gpt-4o-mini-transcribe 0/3 avec ou sans. OPENAI_TRANSCRIPTION_PROMPT="" la retire.
+// ⚠ Le modele par defaut reste mini : gpt-4o-transcribe est plus lent, et avec REDITE_ATTENTE_MS (600 ms par
+// defaut) une transcription en retard fait jeter une vraie reponse. Dany le pose avec REDITE_ATTENTE_MS=0.
+// La consigne n'est envoyee qu'aux modeles qui la prennent en texte libre : gpt-realtime-whisper et
+// gpt-4o-transcribe-diarize la refusent (la session entiere serait rejetee), whisper-1 attend des mots-cles.
+const TRANSCRIPTION_ACCEPTE_PROMPT = /^gpt-4o(-mini)?-transcribe(-\d{4}-\d{2}-\d{2})?$/.test(OPENAI_TRANSCRIPTION);
+const OPENAI_TRANSCRIPTION_PROMPT = !TRANSCRIPTION_ACCEPTE_PROMPT ? "" : process.env.OPENAI_TRANSCRIPTION_PROMPT ?? (AGENT_LANG === "fr"
+  ? "Appel téléphonique en français. L'appelant épelle souvent son nom ou son adresse e-mail lettre par lettre (M, A, R, I, E), avec arobase, point, tiret, deux L, et des domaines comme gmail, hotmail, yahoo, orange, free."
+  : "");
 const OPENAI_VOIX = process.env.OPENAI_VOIX || "marin";
 if ((process.env.CERVEAU || "").toLowerCase() === "openai" && !CERVEAU_OPENAI) console.error("[cerveau] CERVEAU=openai exige LECTURE=elevenlabs et OPENAI_API_KEY : Grok conserve");
 console.log(`[cerveau] ${CERVEAU_OPENAI ? `OpenAI ${OPENAI_REALTIME_MODEL}, sortie texte, transcription ${OPENAI_TRANSCRIPTION}` : "Grok"}`);
@@ -793,6 +811,7 @@ wss.on("connection", (twilio, requete) => {
   let endRequested = false;
   let endReason = "raccroche par le client";
   let closingSaid = false;
+  let clientApresCloture = false; // le client a repris la parole depuis la phrase de cloture (voir AU_REVOIR_RE)
   let checkedIn = false;
   let closeTriggered = false;
   let greetRetry = 0;
@@ -920,19 +939,42 @@ wss.on("connection", (twilio, requete) => {
 
   // Raccroche proprement : on laisse jouer l'audio de cloture deja envoye a Twilio (mark),
   // puis on ferme le flux Twilio -> Twilio termine l'appel -> twilio.on("close") -> finalize() -> recap.
+  // La phrase de cloture vient d'etre dite : le client n'a pas encore repris la parole depuis.
+  function noterCloture() { if (!closingSaid) clientApresCloture = false; closingSaid = true; }
+  // Au revoir apres la cloture (voir AU_REVOIR_RE). Appelee a la fin d'une reponse, primaire ou doublure, une fois
+  // toute sa voix livree a Twilio : le mark « hangup » passe derriere l'au revoir, qui est entendu en entier.
+  // `clientAvant` est lu AVANT le validerTour de fin de reponse, sinon la cloture elle-meme raccrocherait quand le
+  // client a parle pendant qu'elle se generait. Une relance apres outil (« C'est ajouté, total 32 euros. Bonne
+  // soirée ! ») ou apres un message transmis garde l'ancien filet de 8 s : le client doit pouvoir corriger.
+  function raccrocherSiAuRevoir(phrase, { clientAvant, attenteClient, coupee, apresOutil, outils, question }) {
+    if (endRequested || finalized || transfert || !closingSaid || !clientAvant) return;
+    if (attenteClient || coupee || apresOutil || outils || question || messageTransmisSansReponse) return;
+    if (!phrase || !AU_REVOIR_RE.test(phrase) || /\?/.test(phrase)) return;
+    console.log(`[call] au revoir apres la cloture : raccrochage a la fin de la lecture ${t()} sid=${callSid}`);
+    requestHangup("au revoir");
+  }
+  let filetRaccrochage = null;
   function requestHangup(reason) {
     if (endRequested || finalized) return;
     endRequested = true;
     endReason = reason;
     console.log(`[call] hangup (${reason}) sid=${callSid}`);
     if (streamSid) { try { twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "hangup" } })); } catch {} }
-    setTimeout(() => { try { twilio.close(); } catch {} }, 7000); // filet si Twilio ne renvoie pas le mark
+    // Filet si Twilio ne renvoie pas le mark, compte depuis la FIN DE LECTURE prevue : un au revoir de 8 s livre
+    // d'un coup a Twilio etait coupe par un filet de 7 s compte depuis la demande.
+    filetRaccrochage = setTimeout(() => { try { twilio.close(); } catch {} }, Math.max(0, finLecture - Date.now()) + 7000);
   }
 
   // Le client parle vraiment par-dessus l'agent : on vide la file Twilio et on jette la suite de la reponse
   // en cours. Plus de response.cancel : la doc xAI le dit non supporte, il ne rendait qu'une erreur.
   function couperAgent(sonMs) {
     if (finalized) return;
+    // Le client coupe l'au revoir (« attendez ! ») : il a encore quelque chose a dire, on ne raccroche plus.
+    // Le mark « hangup » que Twilio rend au clear est ignore tant qu'aucun raccrochage n'est demande.
+    if (endRequested && endReason === "au revoir") {
+      endRequested = false; endReason = "raccroche par le client"; clearTimeout(filetRaccrochage);
+      console.log(`[call] au revoir coupe par le client : raccrochage annule ${t()} sid=${callSid}`);
+    }
     if (streamSid) { try { twilio.send(JSON.stringify({ event: "clear", streamSid })); } catch {} }
     finLecture = Date.now();
     reponseCoupee = respSeq;
@@ -1021,7 +1063,7 @@ wss.on("connection", (twilio, requete) => {
     return !(tour.voixMs < 150 || (agentContinue && (tour.voixMs < voixMinimale || !bargeIn)));
   }
   function lancerAnticipation() {
-    anticipation = { tour, etat: "demandee", annulee: false, annuleeA: 0, voixDepuis: 0, audio: [], pretA: 0, fin: null, items: [], closingAvant: closingSaid, depuis: Date.now() };
+    anticipation = { tour, etat: "demandee", annulee: false, annuleeA: 0, voixDepuis: 0, audio: [], pretA: 0, fin: null, items: [], closingAvant: closingSaid, clientApresClotureAvant: clientApresCloture, depuis: Date.now() };
     console.log(`[tour] anticipe : ${Math.round(tour.voixMs)} ms de voix, dernier son a t+${((tour.derniereVoix - debutAppelMs) / 1000).toFixed(2)}, reponse lancee ${t()}`);
     validerTour();
     demanderReponse();
@@ -1062,7 +1104,7 @@ wss.on("connection", (twilio, requete) => {
     if (grok && grok.readyState === WebSocket.OPEN) {
       for (const id of aEffacer) { suppressionsEnCours++; grok.send(JSON.stringify({ type: "conversation.item.delete", item_id: id })); }
     }
-    pendingCalls = []; agentBuf = ""; closingSaid = a.closingAvant;
+    pendingCalls = []; agentBuf = ""; closingSaid = a.closingAvant; clientApresCloture = a.clientApresClotureAvant;
     reponseCoupee = respSeq; agentSpeaking = false;
     // La ligne du client reservee avec la phrase partielle : la transcription de la phrase entiere la remplacera.
     if (tourClient && tourClient.idx != null && tourClient.idx === dialog.length - 1 && dialog[tourClient.idx].who === "Client") { dialog.pop(); ligneDuTour.delete(tourClient.n); }
@@ -1152,6 +1194,8 @@ wss.on("connection", (twilio, requete) => {
     // pouvait la redire (banc : la reponse sur le gluten dite deux fois).
     if (agentBuf.trim()) consommerEntreeClient();
     const texteReponse = agentBuf;
+    // Lus AVANT tout validerTour de fin de reponse (voir raccrocherSiAuRevoir).
+    const clientAvantFin = clientApresCloture, clientEnAttente = TOURS_PAR_LE_PONT && tourEnAttente && !tour;
     // Surveillance des fins avalees : une transcription de Grok qui finit sans ponctuation a perdu son dernier signe,
     // et sa derniere syllabe avec (voir TYPO_COLLEE). Hors reponse coupee par le client, qui s'arrete forcement net.
     if (texteReponse.trim() && respSeq !== reponseCoupee && !/[.?!…»"')\]]\s*$/.test(texteReponse.trim())) {
@@ -1236,6 +1280,9 @@ wss.on("connection", (twilio, requete) => {
       }
     }
     if (closeTriggered && !endRequested) requestHangup("cloture polie");
+    // terminerReponse n'arrive qu'une fois toute la voix livree a Twilio, ElevenLabs compris.
+    raccrocherSiAuRevoir(phrase, { clientAvant: clientAvantFin, attenteClient: clientEnAttente, coupee: respSeq === reponseCoupee,
+      apresOutil: reponseApresOutil, outils: calls.length > 0, question: estQuestion });
   }
   // Le client attend et rien ne sort encore : « Mmm… » (voir MMM_APRES_MS). Joue une fois par tour du client,
   // par paquets de 100 ms, et compte comme audible pour la fin de lecture.
@@ -1419,7 +1466,7 @@ wss.on("connection", (twilio, requete) => {
         // regle que pour la primaire, cf. terminerReponse).
         if (reponseCoupee !== tourDoublure.marque) {
           repliqueEnCours = `${repliqueEnCours} ${texte}`.trim().slice(-4000);
-          if (CLOSING_RE.test(texte)) closingSaid = true;
+          if (CLOSING_RE.test(texte)) noterCloture();
         }
       }
       console.log(`[doublure] reponse n°${tourDoublure.marque} finie (${statut}), ${texte.length} car${reponseCoupee === tourDoublure.marque ? ", coupee par le client" : ""}${texte ? ` : « ${texte.slice(0, 120)} »` : ""} ${t()} sid=${callSid}`);
@@ -1438,6 +1485,9 @@ wss.on("connection", (twilio, requete) => {
         finLecture = Math.max(finLecture, Date.now()) + 300;
       }
       if (streamSid) twilio.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `agentdone:${tourDoublure.marque}` } }));
+      // L'au revoir dit par la doublure raccroche aussi (terminerReponse, court-circuitee, ne le verrait pas).
+      raccrocherSiAuRevoir(texte, { clientAvant: clientApresCloture, attenteClient: tourEnAttente && !tour, coupee: reponseCoupee === tourDoublure.marque,
+        apresOutil: reponseApresOutil, outils: false, question: false });
       if (tourEnAttente && !tour) { validerTour(); demanderReponse(); }
     }
   }
@@ -1506,6 +1556,7 @@ wss.on("connection", (twilio, requete) => {
   function validerTour() {
     tourEnAttente = false;
     messageTransmisSansReponse = false; // le client a repondu apres le message transmis : raccrocher redevient possible
+    if (closingSaid) clientApresCloture = true;
     // La parole du client clot ce que l'agent venait de dire (une anticipation annulee revalide sans rien effacer).
     if (repliqueEnCours) { repliqueAvantClient = repliqueEnCours; repliqueEnCours = ""; }
     if (!(grok && grok.readyState === WebSocket.OPEN)) return;
@@ -1652,7 +1703,7 @@ wss.on("connection", (twilio, requete) => {
       ...(normes.length ? { tools: normes, tool_choice: "auto" } : {}),
       output_modalities: voix ? ["audio"] : ["text"],
       audio: {
-        input: { format: { type: "audio/pcmu" }, transcription: { model: OPENAI_TRANSCRIPTION, language: AGENT_LANG }, turn_detection: null },
+        input: { format: { type: "audio/pcmu" }, transcription: { model: OPENAI_TRANSCRIPTION, language: AGENT_LANG, ...(OPENAI_TRANSCRIPTION_PROMPT ? { prompt: OPENAI_TRANSCRIPTION_PROMPT } : {}) }, turn_detection: null },
         ...(voix ? { output: { format: { type: "audio/pcmu" }, voice: OPENAI_VOIX } } : {}),
       },
     };
@@ -1975,7 +2026,7 @@ wss.on("connection", (twilio, requete) => {
         case "response.output_text.delta": // OpenAI en sortie texte seule (voir CERVEAU)
         case "response.output_audio_transcript.delta":
           if (respSeq === primaireJetee) break; // reponse doublee : son texte n'est pas dit
-          if (e.delta) { agentBuf += e.delta; if (CLOSING_RE.test(agentBuf)) closingSaid = true; }
+          if (e.delta) { agentBuf += e.delta; if (CLOSING_RE.test(agentBuf)) noterCloture(); }
           if (e.delta && lectureActive() && fluxPrimaire?.marque === respSeq && respSeq !== reponseCoupee && respSeq !== primaireJetee
             && !(DOUBLURE_TEST_MS && doublure && Date.now() - debutReponseMs < DOUBLURE_TEST_MS)) { // banc : la primaire muette
             // La primaire a du texte : c'est elle qui parlera, la doublure n'a plus d'objet (en mode Grok, c'est
@@ -2268,7 +2319,7 @@ wss.on("connection", (twilio, requete) => {
         }
       }
     } else if (m.event === "mark") {
-      if (m.mark && m.mark.name === "hangup") { try { twilio.close(); } catch {} }
+      if (m.mark && m.mark.name === "hangup" && endRequested) { try { twilio.close(); } catch {} }
       else if (m.mark && m.mark.name === "transfert") lancerTransfert("fin de l'annonce");
       else if (m.mark && /^agentdone(:|$)/.test(m.mark.name) && (m.mark.name === "agentdone" || Number(m.mark.name.split(":")[1]) === respSeq)) { agentSpeaking = false; lastCallerMs = Date.now(); console.log(`[turn] lecture finie ${m.mark.name} ${t()} sid=${callSid}`); } // Dany a fini de parler (audio joue) : on rouvre l'ecoute + on relance le compte a rebours du silence. Le mark d'une reponse anterieure (outil suivi d'une relance) est ignore.
     } else if (m.event === "stop") {
