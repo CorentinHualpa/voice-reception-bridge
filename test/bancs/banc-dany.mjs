@@ -65,6 +65,9 @@ for (const k of Object.keys(envPont)) if (process.env[k] !== undefined && !/KEY/
 for (const k of ["TRANSFERT_NUMERO", "TRANSFERT_NOM", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"]) if (process.env[k]) envPont[k] = process.env[k];
 // Transcription et fin d'appel (05/10/2026) : le modele de transcription, sa consigne, la phrase d'au revoir.
 for (const k of ["OPENAI_TRANSCRIPTION", "OPENAI_TRANSCRIPTION_PROMPT", "AU_REVOIR_REGEX", "CLOSING_REGEX"]) if (process.env[k] !== undefined) envPont[k] = process.env[k];
+// Pont relie a DaleVoz (06/10/2026) : DALEVOZ_URL + VOICE_BRIDGE_SECRET fournis par l'appelant (jamais ecrits ici).
+// ⚠ L'appel s'ecrit alors dans la console de PRODUCTION de l'espace du numero appele (BANC_VERS, defaut Dany).
+for (const k of ["DALEVOZ_URL", "VOICE_BRIDGE_SECRET"]) if (process.env[k]) envPont[k] = process.env[k];
 const pont = spawn(process.execPath, ["server.js"], { cwd: RACINE, env: envPont });
 const t0 = Date.now();
 const horo = () => `${((Date.now() - t0) / 1000).toFixed(2)}`.padStart(6);
@@ -124,7 +127,8 @@ let raccrocheA = 0;
 ws.onclose = () => { raccrocheA = Date.now(); journal.push(`${horo()} [banc] le pont a RACCROCHÉ`); };
 
 envoyer({ event: "connected" });
-envoyer({ event: "start", start: { streamSid: "MZbanc", callSid: "CAbanc", customParameters: { from: "+33612345678", to: "+33939241266" } } });
+// CallSid unique par passage : relie a DaleVoz, il sert de cle anti-doublon au fil de la console.
+envoyer({ event: "start", start: { streamSid: "MZbanc", callSid: `CAbanc${Date.now()}`, customParameters: { from: "+33612345678", to: "+33939241266" } } });
 debutFlux = Date.now();
 
 let enCours = null, pos = 0, trame = 0, fini = false;
