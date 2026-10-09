@@ -155,11 +155,24 @@ const RELANCE_SUITE_MS = Number(process.env.RELANCE_SUITE_MS || 2500); // silenc
 // et le second commit valide le MEME message, entier. Effacer ce message puis renvoyer toute la phrase la
 // doublait chez le modele (« Attendez, en fait, attendez, en fait, est-ce que… »). Bancs du 17/09 :
 // test/bancs/banc-anticipation-protocole.mjs et banc-anticipation-ids.mjs (variante B).
+// ⚠ 09/10/2026 : ce n'est plus vrai. xAI ouvre un NOUVEAU message pour la suite, dont la transcription reprend la
+// phrase depuis le debut, et il REPOND DE LUI-MEME a chaque tampon envoye (voir ATTENTE_TEXTE_MS).
 // ANTICIPATION_MS=0 remet l'ancien fonctionnement sans toucher au code.
 // 17/09/2026 (choix de Coq) : descendu de 400 a 250 ms. Le son n'est toujours lache qu'a la fin du tour, donc
 // la fin de phrase n'est pas plus courte ; on gagne 150 ms sur TOUS les tours, pics compris. Le prix est un peu
 // plus d'anticipations annulees sur les pauses d'hesitation, et une annulation se solde en 30 a 210 ms.
 const ANTICIPATION_MS = Number(process.env.ANTICIPATION_MS ?? 250);
+const JOURNAL_GROK = process.env.JOURNAL_GROK === "1";
+// ATTENDRE LE TEXTE DU CLIENT (09/10/2026). Grok repond a partir de la TRANSCRIPTION de la phrase, pas du son, et il
+// REPOND DE LUI-MEME a chaque tampon envoye, meme avec turn_detection a null (banc : aucun response.create, deux
+// reponses justes). Le response.create que le pont envoyait avec le commit arrivait AVANT la transcription finale et
+// declenchait une reponse sur une phrase vide ou coupee : au premier tour d'un appel de Coq, Dany a REDIT tout
+// l'accueil, puis au tour suivant a demande « de quel materiel s'agit-il ? » alors que l'appelant venait de dire
+// « une etaline de chez KSB ». Banc : accueil redit 4 fois sur 4 avant, 0 apres. Le pont retient donc sa demande :
+// elle n'est plus qu'un secours, ATTENTE_SECOURS_MS apres le texte final sans reponse de Grok, ou ATTENTE_TEXTE_MS
+// apres la demande si le texte ne vient pas (0 : ancien fonctionnement, demande avec le commit).
+const ATTENTE_TEXTE_MS = Number(process.env.ATTENTE_TEXTE_MS ?? 800);
+const ATTENTE_SECOURS_MS = Number(process.env.ATTENTE_SECOURS_MS ?? 300);
 const ANNULATION_VOIX_MS = 150; // voix du client apres le lancement qui annule l'anticipation (le seuil d'un son ignore)
 // REPONSE JAMAIS CREEE (17/09/2026, meme testeur, 6,4 s de blanc). Un tour valide sans mot reconnaissable
 // (« euh », « mmm ») ne cree aucun message chez Grok, qui ignore alors response.create EN SILENCE : ni
@@ -864,6 +877,14 @@ wss.on("connection", (twilio, requete) => {
   let tourEnAttente = false;                    // prise de parole finie pendant une generation ou des outils
   let outilsEnCours = false;
   let attenteCreation = false, creationDemandeeA = 0; // response.create envoye apres un commit, response.created pas encore recu
+  // Transcription finale du client pas encore rendue par Grok (voir ATTENTE_TEXTE_MS) : tampons envoyes sans accuse
+  // (input_audio_buffer.committed), puis, par message, le nombre d'envois accuses qui attendent leur texte final.
+  // Un message peut etre envoye deux fois (anticipation annulee, la suite de la phrase s'y ajoute) : ses finales
+  // se comptent, et un doublon (meme texte que la finale precedente du message) ne compte pas.
+  let commitsSansAccuse = 0, reponseDifferee = null;
+  const finalesAttendues = new Map(), derniereFinale = new Map();
+  const attendreLeTexte = () => !CERVEAU_OPENAI && TOURS_PAR_LE_PONT && ATTENTE_TEXTE_MS > 0;
+  const texteClientEnAttente = () => commitsSansAccuse > 0 || finalesAttendues.size > 0;
   // « Mmm » d'attente (voir MMM_APRES_MS) : fin de parole du client dont la reponse n'a encore rien fait entendre,
   // fin de lecture du « Mmm » (pas de coupure de parole dessus), son pret pour la voix de cet appel.
   let attenteDepuis = 0, mmmJusqua = 0, mmmAvantReponse = false;
@@ -1049,7 +1070,55 @@ wss.on("connection", (twilio, requete) => {
     marquerGeneration();
     rappelerFinDeQuestion();
     attenteCreation = true; creationDemandeeA = Date.now();
+    creerReponse();
+  }
+  // La demande de reponse part, ou attend la transcription finale du client (voir ATTENTE_TEXTE_MS). Tout
+  // response.create qui suit un tour du client passe par ici, relance apres outils comprise.
+  function creerReponse() {
+    if (attendreLeTexte() && texteClientEnAttente()) {
+      if (!reponseDifferee) reponseDifferee = { depuis: Date.now(), minuteur: setTimeout(() => envoyerReponseDifferee("plafond"), ATTENTE_TEXTE_MS) };
+      return;
+    }
     grok.send(JSON.stringify({ type: "response.create" }));
+  }
+  // Texte final du client recu. Grok va repondre de lui-meme (voir ATTENTE_TEXTE_MS) : la demande du pont ne part
+  // qu'en secours, ATTENTE_SECOURS_MS plus tard, si response.created n'est pas venu entre-temps. Texte vide : aucun
+  // mot, pas de demande, le chien de garde (REPONSE_IGNOREE_MS depuis la demande) relache la voix comme avant.
+  function texteFinalRecu(texte) {
+    if (!reponseDifferee) return;
+    if (!String(texte || "").trim()) {
+      // Tour du client : le chien de garde soldera. Relance apres outils (pas de chien de garde) : elle part, sinon
+      // le resultat de l'outil ne serait jamais dit.
+      if (attenteCreation) abandonnerReponseDifferee(); else envoyerReponseDifferee("texte vide, relance d'outil");
+      return;
+    }
+    clearTimeout(reponseDifferee.minuteur);
+    reponseDifferee.minuteur = setTimeout(() => envoyerReponseDifferee("secours apres le texte"), ATTENTE_SECOURS_MS);
+  }
+  function envoyerReponseDifferee(pourquoi) {
+    const d = reponseDifferee;
+    if (!d) return;
+    clearTimeout(d.minuteur);
+    reponseDifferee = null;
+    const sansAccuse = commitsSansAccuse > 0;
+    // Plafond atteint : ce qui n'est pas arrive n'arrivera plus (tampon vide refuse, transcription perdue).
+    if (pourquoi === "plafond") abandonnerAttenteTexte();
+    console.log(`[tour] reponse demandee apres ${Date.now() - d.depuis} ms d'attente du texte du client (${pourquoi}${sansAccuse ? ", tampon jamais accuse" : ""}) ${t()} sid=${callSid}`);
+    if (!(grok && grok.readyState === WebSocket.OPEN)) return;
+    // Tampon jamais accuse : sans doute un tour sans parole, que Grok ignorera. Le chien de garde garde alors l'heure
+    // de la demande initiale, sinon la voix du client resterait retenue REPONSE_IGNOREE_MS de plus que le plafond.
+    if (attenteCreation && !sansAccuse) creationDemandeeA = Date.now();
+    grok.send(JSON.stringify({ type: "response.create" }));
+  }
+  function abandonnerAttenteTexte() {
+    commitsSansAccuse = 0; finalesAttendues.clear();
+  }
+  // Une demande retenue qui ne doit plus partir (refus de Grok, anticipation annulee, fin d'appel).
+  function abandonnerReponseDifferee() {
+    if (!reponseDifferee) return false;
+    clearTimeout(reponseDifferee.minuteur);
+    reponseDifferee = null;
+    return true;
   }
   // Grok a ignore la demande (tour sans mot reconnu) : la voix retenue repart, rien n'attend plus.
   function reponseIgnoree() {
@@ -1113,6 +1182,10 @@ wss.on("connection", (twilio, requete) => {
     console.log(`[tour] anticipation annulee : ${pourquoi} ${t()}`);
     fluxPrimaire?.couper(); voixGrokGardee = [];
     if (a.etat === "finie") { finirAnnulation(null); return; }
+    // Demande encore retenue (voir ATTENTE_TEXTE_MS) : elle ne part plus, mais Grok repondra DE LUI-MEME au tampon
+    // envoye. Sa reponse s'annule donc comme une autre (l'annulation envoyee avant response.created s'y applique).
+    // Banc du 09/10 : sans cette annulation, sa reponse etait creee, jamais terminee, et l'agent restait muet.
+    if (abandonnerReponseDifferee()) creationDemandeeA = Date.now();
     // Envoye avant response.created, l'annulation s'applique a la reponse des sa creation (banc du 17/09).
     if (grok && grok.readyState === WebSocket.OPEN) grok.send(JSON.stringify({ type: "response.cancel" }));
   }
@@ -1606,6 +1679,7 @@ wss.on("connection", (twilio, requete) => {
     if (repliqueEnCours) { repliqueAvantClient = repliqueEnCours; repliqueEnCours = ""; }
     if (!(grok && grok.readyState === WebSocket.OPEN)) return;
     grok.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+    if (attendreLeTexte()) commitsSansAccuse++;
     // Un envoi du tampon = un tour du client, sauf la revalidation qui suit une anticipation annulee : c'est la
     // suite de la MEME phrase, ses morceaux doivent finir sur la meme ligne (voir texteDuTour).
     if (memeTourApresAnnulation) memeTourApresAnnulation = false; else tourNo++;
@@ -1637,7 +1711,10 @@ wss.on("connection", (twilio, requete) => {
         return;
       }
       if (generation) retenue = []; // rien d'autre n'est retenu que ce son
-      else if (grok && grok.readyState === WebSocket.OPEN) grok.send(JSON.stringify({ type: "input_audio_buffer.clear" }));
+      else if (grok && grok.readyState === WebSocket.OPEN) {
+        grok.send(JSON.stringify({ type: "input_audio_buffer.clear" }));
+        for (const id of itemsAvantEnvoi) texteDeItem.delete(id); // son efface : son texte provisoire aussi
+      }
       userBuf = "";
       return;
     }
@@ -1683,7 +1760,8 @@ wss.on("connection", (twilio, requete) => {
     entreeNouvelle = false;
   }
   // PHRASE DU CLIENT EN MORCEAUX (01/10/2026, banc de Dany). Chez xAI, la suite d'une phrase coupee par une
-  // anticipation annulee s'ajoute au MEME message, dont la transcription est cumulative. Chez OpenAI, chaque commit
+  // anticipation annulee s'ajoute au MEME message, dont la transcription est cumulative (depuis le 09/10/2026 : un
+  // NOUVEAU message, dont la transcription reprend depuis le debut, voir texteDuTour). Chez OpenAI, chaque commit
   // du tampon cree son PROPRE message : « Oui, bonjour. » | « J'ai une pompe de relevage… » | « Il me faudrait un
   // devis… ». Le modele les voit tous, mais la ligne du dialogue ne gardait que le dernier morceau, et c'est elle
   // qui part dans le mail de recap (« Client : arobase gmail.com » pour un email entierement epele). On rattache
@@ -1697,6 +1775,8 @@ wss.on("connection", (twilio, requete) => {
   const toursACommettre = [];           // tours envoyes, dans l'ordre, en attente de leur input_audio_buffer.committed
   const tourDeItem = new Map();         // item_id du client -> tour
   const texteDeItem = new Map();        // item_id du client -> transcription
+  const itemsAvantEnvoi = new Set();    // messages du client ouverts par Grok, tampon pas encore envoye : tour inconnu
+  let dernierItemAvantEnvoi = null;
   const ligneDuTour = new Map();        // tour -> index de sa ligne dans le dialogue
   function rattacherItem(itemId, n) { if (itemId && !tourDeItem.has(itemId)) tourDeItem.set(itemId, n); }
   function texteDuTour(itemId, texte, cumule) {
@@ -1707,11 +1787,20 @@ wss.on("connection", (twilio, requete) => {
     const morceaux = [...texteDeItem]
       .filter(([id]) => { const m = tourDeItem.get(id); return m === n || (m < n && !ligneDuTour.has(m)); })
       .map(([, s]) => s.trim()).filter(Boolean);
-    return { n, phrase: morceaux.join(" ") };
+    // Apres une anticipation annulee, Grok ouvre un NOUVEAU message dont la transcription reprend la phrase depuis
+    // le debut (09/10/2026) : un morceau que le suivant contient deja ne se repete pas (« Une étaline de chez KSB.
+    // Une étaline de chez KSB, référence zéro quarante »).
+    // Mots entiers, accents neutralises (« Etaline » / « étaline »), et Grok seul : OpenAI ne change pas.
+    const nu = (s) => s.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    const contenu = (m, suite) => nu(suite) === nu(m) || nu(suite).startsWith(nu(m) + " ");
+    const gardes = CERVEAU_OPENAI ? morceaux : morceaux.filter((m, i) => !morceaux.slice(i + 1).some((suite) => contenu(m, suite)));
+    return { n, phrase: gardes.join(" ") };
   }
   function noterTranscription(itemId, texte, cumule) {
     if (typeof texte !== "string") return;
     if (!itemId) { setUser(texte, cumule); return; }
+    // Tour pas encore connu : le texte attend l'envoi du tampon (voir itemsAvantEnvoi).
+    if (itemsAvantEnvoi.has(itemId)) { texteDeItem.set(itemId, cumule ? (texteDeItem.get(itemId) || "") + texte : texte); return; }
     const { n, phrase } = texteDuTour(itemId, texte, cumule);
     const i = ligneDuTour.get(n);
     if (i != null && dialog[i]?.who === "Client") { dialog[i].msg = phrase; return; }
@@ -2009,6 +2098,8 @@ wss.on("connection", (twilio, requete) => {
     grok.on("message", (raw) => {
       let e;
       try { e = JSON.parse(raw.toString()); } catch { return; }
+      // JOURNAL_GROK=1 : chaque evenement du modele (hors morceaux d'audio et de texte), pour les bancs.
+      if (JOURNAL_GROK && !/delta$|^ping$/.test(e.type)) console.log(`[grok:tout] ${e.type}${e.item_id ? " item=" + e.item_id : ""}${e.item ? " " + e.item.type + "/" + (e.item.role || "") + " id=" + e.item.id + " " + JSON.stringify(e.item.content || "").slice(0, 120) : ""}${e.error ? " " + JSON.stringify(e.error).slice(0, 200) : ""} ${t()}`);
       switch (e.type) {
         case "ping":
           grok.send(JSON.stringify({ type: "pong", ...(e.event_id ? { event_id: e.event_id } : {}) }));
@@ -2023,6 +2114,8 @@ wss.on("connection", (twilio, requete) => {
           } // salut une fois
           break;
         case "response.created":
+          // Grok repond de lui-meme a un tampon envoye : la demande retenue du pont n'a plus d'objet.
+          if (abandonnerReponseDifferee()) console.log(`[tour] Grok repond de lui-meme, la demande du pont ne part pas ${t()} sid=${callSid}`);
           if (TOURS_PAR_LE_PONT) { marquerGeneration(); reponseActive = true; }
           attenteCreation = false;
           if (anticipation) anticipation.etat = "creee";
@@ -2105,6 +2198,13 @@ wss.on("connection", (twilio, requete) => {
           if (process.env.JOURNAL_DIALOGUE === "1") console.log(`[transcription] ${e.type.split(".").pop()} item=${e.item_id} ligne=${tourClient ? tourClient.idx : "aucune"} « ${e.transcript} » ${t()}`);
           noterEntreeClient(e.item_id, e.transcript);
           noterTranscription(e.item_id, e.transcript, false); // cumulatif ou final : remplace le morceau
+          // Transcription finale d'un tampon envoye (celles d'avant l'envoi sont provisoires) : la reponse peut partir.
+          if (e.type.endsWith(".completed") && finalesAttendues.has(e.item_id) && e.transcript !== derniereFinale.get(e.item_id)) {
+            derniereFinale.set(e.item_id, e.transcript);
+            const reste = finalesAttendues.get(e.item_id) - 1;
+            if (reste > 0) finalesAttendues.set(e.item_id, reste); else finalesAttendues.delete(e.item_id);
+            if (!texteClientEnAttente()) texteFinalRecu(e.transcript);
+          }
           break;
         case "conversation.item.input_audio_transcription.delta":
           noterEntreeClient(e.item_id, e.delta);
@@ -2112,7 +2212,13 @@ wss.on("connection", (twilio, requete) => {
           break;
         case "conversation.item.added":
           if (e.item?.id) itemsAjoutes.add(e.item.id);
-          if (e.item?.role === "user" && e.item.type === "message" && (e.item.content || []).some((c) => /audio/.test(c?.type || ""))) rattacherItem(e.item.id, tourClient?.n ?? tourNo);
+          if (e.item?.role === "user" && e.item.type === "message" && (e.item.content || []).some((c) => /audio/.test(c?.type || ""))) {
+            // Grok ouvre le message du client des qu'il entend parler, AVANT que le pont envoie le tampon : rattache
+            // ici, la phrase prenait le numero du tour PRECEDENT, et la console decalait les lignes du client d'un tour
+            // (09/10/2026). Le tour se fixe alors a l'envoi (input_audio_buffer.committed).
+            if (TOURS_PAR_LE_PONT && !CERVEAU_OPENAI && !tourDeItem.has(e.item.id)) { itemsAvantEnvoi.add(e.item.id); dernierItemAvantEnvoi = e.item.id; }
+            else rattacherItem(e.item.id, tourClient?.n ?? tourNo);
+          }
           if (reponseActive && e.item?.id && e.item.role !== "user") itemsReponse.push(e.item.id);
           if (process.env.JOURNAL_ELEMENTS === "1") console.log(`[element] ajoute ${e.item?.id} ${e.item?.role || e.item?.type} apres ${e.previous_item_id ?? "-"} (reponse n°${respSeq}${reponseActive ? " active" : ""}) ${t()}`);
           // Ce que la reponse anticipee ajoute (message, appels d'outil) s'effacera avec elle si elle est annulee.
@@ -2127,6 +2233,12 @@ wss.on("connection", (twilio, requete) => {
         case "input_audio_buffer.committed":
           // Le message cree par un envoi du tampon appartient au tour qui l'a envoye (voir texteDuTour).
           if (toursACommettre.length) rattacherItem(e.item_id, toursACommettre.shift());
+          if (attendreLeTexte() && commitsSansAccuse > 0 && e.item_id) {
+            commitsSansAccuse--;
+            finalesAttendues.set(e.item_id, (finalesAttendues.get(e.item_id) || 0) + 1);
+          }
+          // Message ouvert par Grok avant l'envoi (voir itemsAvantEnvoi) : son tour est connu, son texte prend sa ligne.
+          if (itemsAvantEnvoi.delete(e.item_id) && texteDeItem.has(e.item_id)) noterTranscription(e.item_id, texteDeItem.get(e.item_id), false);
           if (!typesVus.has(e.type)) { typesVus.add(e.type); console.log(`[grok] ${e.type} ${t()}`); }
           break;
         case "input_audio_buffer.speech_started": {
@@ -2181,7 +2293,12 @@ wss.on("connection", (twilio, requete) => {
           // Un effacement refuse (anticipation annulee) n'est pas un refus de reponse : rien a relacher.
           if (suppressionsEnCours > 0 && /item/i.test(JSON.stringify(e.error || e))) { suppressionsEnCours--; break; }
           // Une demande de reponse refusee ne doit pas laisser la voix du client retenue pour toujours.
-          if (TOURS_PAR_LE_PONT && generation && !reponseActive && !anticipation) { generation = false; attenteCreation = false; lacherRetenue(); }
+          // Une demande encore retenue (voir ATTENTE_TEXTE_MS) ne part plus : elle partirait apres coup, peut-etre
+          // pendant que le client parle, sans chien de garde.
+          // Pendant la retenue, seule une erreur sur le tampon ou la reponse vaut refus : une autre laisserait venir la
+          // reponse automatique de Grok sur une voix relachee, creee et jamais terminee (agent muet).
+          if (reponseDifferee && !/buffer|audio|response|commit/i.test(JSON.stringify(e.error || e))) break;
+          if (TOURS_PAR_LE_PONT && generation && !reponseActive && !anticipation) { abandonnerReponseDifferee(); abandonnerAttenteTexte(); generation = false; attenteCreation = false; lacherRetenue(); }
           break;
         }
         default:
@@ -2284,7 +2401,7 @@ wss.on("connection", (twilio, requete) => {
       voixFenetre[voixFenetreIdx] = voixMs;
       voixFenetreIdx = (voixFenetreIdx + 1) % voixFenetre.length;
       if (TOURS_PAR_LE_PONT) {
-        if (attenteCreation && maintenant - creationDemandeeA > REPONSE_IGNOREE_MS) reponseIgnoree();
+        if (attenteCreation && !reponseDifferee && maintenant - creationDemandeeA > REPONSE_IGNOREE_MS) reponseIgnoree();
         if (attenteDepuis && MMM_APRES_MS > 0 && !tour && !transfert && !endRequested && maintenant - attenteDepuis >= MMM_APRES_MS
           && maintenant >= finLecture && (generation || outilsEnCours || tourEnAttente)
           && !(reponseActive && maintenant - debutReponseMs < MMM_CREEE_DEPUIS_MS) // son imminent : pas de « Mmm » devant
@@ -2507,10 +2624,12 @@ wss.on("connection", (twilio, requete) => {
     }
     // Ce que le client a dit pendant la reponse ou les outils entre dans la conversation avant la relance.
     const tourPendant = TOURS_PAR_LE_PONT && tourEnAttente && !tour;
-    if (tourPendant) validerTour();
     // L'au revoir est deja dit dans la reponse qui raccroche : la relancer faisait partir un second « À tout à
     // l'heure ! » pendant le raccrochage (repetition de demo du 17/09). Sans au revoir dit, la relance le fait dire.
-    if (raccroche && audioDeLaReponse > 0 && calls.every((c) => c.name === "end_call")) {
+    const auRevoirDit = raccroche && audioDeLaReponse > 0 && calls.every((c) => c.name === "end_call");
+    // Grok repond de lui-meme a tout tampon envoye (voir ATTENTE_TEXTE_MS) : sans relance, on n'envoie rien.
+    if (tourPendant && !(auRevoirDit && !CERVEAU_OPENAI)) validerTour();
+    if (auRevoirDit) {
       console.log(`[outil] end_call : pas de relance, l'au revoir est deja dit ${t()} sid=${callSid}`);
       return;
     }
@@ -2519,7 +2638,7 @@ wss.on("connection", (twilio, requete) => {
       relanceOutilDemandee = true;
       if (TOURS_PAR_LE_PONT) marquerGeneration();
       rappelerFinDeQuestion();
-      grok.send(JSON.stringify({ type: "response.create" }));
+      creerReponse(); // un tour dit pendant les outils attend son texte, comme les autres
     } else {
       console.log(`[outil] plafond de relances atteint sid=${callSid}`);
       if (transfert && transfert.etat === "annonce") preparerTransfert(); // pas de phrase d'annonce a attendre
@@ -2636,6 +2755,11 @@ wss.on("connection", (twilio, requete) => {
     finalized = true;
     clearInterval(inactivityTimer);
     fluxPrimaire?.couper(); fluxDoublure?.couper();
+    abandonnerReponseDifferee();
+    // Derniers mots du client, jamais envoyes (il a raccroche en parlant) : une ligne a eux plutot que perdus. Le
+    // seul dernier message ouvert, et seulement si un tour etait en cours : les sons ignores restent hors du dialogue.
+    const reste = (tour || tourEnAttente) && itemsAvantEnvoi.has(dernierItemAvantEnvoi) ? (texteDeItem.get(dernierItemAvantEnvoi) || "").trim() : "";
+    if (reste) userBuf = userBuf.trim() ? `${userBuf.trim()} ${reste}` : reste;
     pushUser();
     pushAgent();
     try { if (grok && grok.readyState === WebSocket.OPEN) grok.close(); } catch {}

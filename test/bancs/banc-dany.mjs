@@ -44,7 +44,10 @@ async function synthese(texte) {
 const MORCEAUX = [];
 for (const t of REPLIQUES) MORCEAUX.push({ texte: t, buf: await synthese(t) });
 // VOILA=1 : « Voilà. » 400 ms apres l'email epele, avant que sa transcription arrive (cas qui perdait la ligne).
-const VOILA = process.env.VOILA === "1" ? { texte: "Voilà.", buf: await synthese("Voilà.") } : null;
+// VOILA_TEXTE / VOILA_SUR : une autre suite, apres une autre replique (phrase hesitante qui fait annuler l'anticipation).
+const VOILA_TEXTE = process.env.VOILA_TEXTE || "Voilà.";
+const VOILA_SUR = new RegExp(process.env.VOILA_SUR || "arobase");
+const VOILA = process.env.VOILA === "1" ? { texte: VOILA_TEXTE, buf: await synthese(VOILA_TEXTE) } : null;
 
 const journal = [];
 const envPont = {
@@ -64,7 +67,7 @@ for (const k of Object.keys(envPont)) if (process.env[k] !== undefined && !/KEY/
 // (outil, annonce, mark, bascule refusee par Twilio, excuses de l'agent) sans toucher un vrai appel.
 for (const k of ["TRANSFERT_NUMERO", "TRANSFERT_NOM", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"]) if (process.env[k]) envPont[k] = process.env[k];
 // Transcription et fin d'appel (05/10/2026) : le modele de transcription, sa consigne, la phrase d'au revoir.
-for (const k of ["OPENAI_TRANSCRIPTION", "OPENAI_TRANSCRIPTION_PROMPT", "AU_REVOIR_REGEX", "CLOSING_REGEX"]) if (process.env[k] !== undefined) envPont[k] = process.env[k];
+for (const k of ["OPENAI_TRANSCRIPTION", "OPENAI_TRANSCRIPTION_PROMPT", "AU_REVOIR_REGEX", "CLOSING_REGEX", "JOURNAL_GROK", "ATTENTE_TEXTE_MS", "ATTENTE_SECOURS_MS"]) if (process.env[k] !== undefined) envPont[k] = process.env[k];
 // Pont relie a DaleVoz (06/10/2026) : DALEVOZ_URL + VOICE_BRIDGE_SECRET fournis par l'appelant (jamais ecrits ici).
 // ⚠ L'appel s'ecrit alors dans la console de PRODUCTION de l'espace du numero appele (BANC_VERS, defaut Dany).
 for (const k of ["DALEVOZ_URL", "VOICE_BRIDGE_SECRET"]) if (process.env[k]) envPont[k] = process.env[k];
@@ -158,7 +161,7 @@ const silenceAgent = (ms) => () => sonsAgent > 0 && !agentParle() && Date.now() 
 await jusqua(silenceAgent(1200), 40000); // accueil fini
 for (const m of MORCEAUX) {
   await jouer(m);
-  if (VOILA && /arobase/.test(m.texte)) { await attendre(Number(process.env.VOILA_MS || 400)); await jouer(VOILA); }
+  if (VOILA && VOILA_SUR.test(m.texte)) { await attendre(Number(process.env.VOILA_MS || 400)); await jouer(VOILA); }
   const n = sonsAgent;
   await jusqua(() => sonsAgent > n, 15000);
   await jusqua(silenceAgent(1500), 45000);
@@ -179,7 +182,7 @@ execFileSync("ffmpeg", ["-y", "-loglevel", "error", "-f", "s16le", "-ar", "8000"
 fs.unlinkSync(`${S}/${NOM}.pcm`);
 fs.writeFileSync(`${S}/${NOM}.log`, journal.join("\n"));
 const tri = [...latences].sort((a, b) => a - b);
-console.log(journal.filter((l) => /\[banc\]|\[lecture\] n°|\[session\]|\[cerveau\]|\[accueil\]|erreur|error|Error|\[dialogue\]|^\s*[\d.]+\s+(Client|Agent) :/.test(l)).map((l) => l.replace(/ sid=CA\w+/, "").slice(0, 260)).join("\n"));
+console.log(journal.filter((l) => process.env.BANC_TOUT || /\[banc\]|\[lecture\] n°|\[session\]|\[cerveau\]|\[accueil\]|erreur|error|Error|\[dialogue\]|^\s*[\d.]+\s+(Client|Agent) :/.test(l)).map((l) => l.replace(/ sid=CA\w+/, "").slice(0, 260)).join("\n"));
 console.log(`\nlatences (ms) : ${latences.join(", ")} | mediane ${tri[Math.floor(tri.length / 2)] ?? "-"} | accueil ${premierSonAppel} ms`);
 console.log(`enregistrement : ${path.resolve(S, NOM + ".wav")}`);
 process.exit(0);
