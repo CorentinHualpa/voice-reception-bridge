@@ -173,6 +173,7 @@ const JOURNAL_GROK = process.env.JOURNAL_GROK === "1";
 // apres la demande si le texte ne vient pas (0 : ancien fonctionnement, demande avec le commit).
 const ATTENTE_TEXTE_MS = Number(process.env.ATTENTE_TEXTE_MS ?? 800);
 const ATTENTE_SECOURS_MS = Number(process.env.ATTENTE_SECOURS_MS ?? 300);
+const PLANCHER_REPONSE_MS = Number(process.env.PLANCHER_REPONSE_MS ?? 80); // voir plancherVoix
 const ANNULATION_VOIX_MS = 150; // voix du client apres le lancement qui annule l'anticipation (le seuil d'un son ignore)
 // REPONSE JAMAIS CREEE (17/09/2026, meme testeur, 6,4 s de blanc). Un tour valide sans mot reconnaissable
 // (« euh », « mmm ») ne cree aucun message chez Grok, qui ignore alors response.create EN SILENCE : ni
@@ -1140,6 +1141,12 @@ wss.on("connection", (twilio, requete) => {
     if (tourEnAttente && !tour) { validerTour(); demanderReponse(); }
   }
 
+  // UNE REPONSE BREVE N'EST PAS UN BRUIT (09/10/2026, appel de Coq) : « C'est ça » dit vite et bas au telephone ne
+  // compte que 120 ms au-dessus du bruit de fond, et le plancher de 150 ms le jetait : Dany ne reagissait pas, il a
+  // fallu repeter. Quand le son commence apres la fin de la voix de l'agent (il attend une reponse), le plancher
+  // descend a PLANCHER_REPONSE_MS, et c'est la transcription de Grok qui tranche : un bruit sans mot n'a pas de
+  // reponse (voir texteFinalRecu, puis reponseIgnoree). Grok seul ; OpenAI repond sur le son, un clic le ferait parler.
+  const plancherVoix = (tr) => (!CERVEAU_OPENAI && PLANCHER_REPONSE_MS > 0 && tr.debut >= finLecture ? PLANCHER_REPONSE_MS : 150);
   // ---- Reponse anticipee (voir ANTICIPATION_MS) ----
   const sansMot = (tr) => tr.sansMot !== undefined && tr.voixMs - tr.sansMot < ANNULATION_VOIX_MS;
   let reponseAnticipee = 0, anticipeePreteA = 0; // pour le journal de latence de la reponse confirmee
@@ -1151,7 +1158,7 @@ wss.on("connection", (twilio, requete) => {
     if (maintenant - tour.derniereVoix < ANTICIPATION_MS || maintenant < finLecture) return false;
     const agentContinue = !tour.coupe && finLecture > tour.derniereVoix + 500;
     const voixMinimale = tour.derniereVoix < accueilProtegeJusqua ? PAROLE_ACCUEIL_MS : PAROLE_COUPURE_MS;
-    return !(tour.voixMs < 150 || (agentContinue && (tour.voixMs < voixMinimale || !bargeIn)));
+    return !(tour.voixMs < plancherVoix(tour) || (agentContinue && (tour.voixMs < voixMinimale || !bargeIn)));
   }
   function lancerAnticipation() {
     anticipation = { tour, etat: "demandee", annulee: false, annuleeA: 0, voixDepuis: 0, audio: [], pretA: 0, fin: null, items: [], closingAvant: closingSaid, clientApresClotureAvant: clientApresCloture, depuis: Date.now() };
@@ -1701,7 +1708,7 @@ wss.on("connection", (twilio, requete) => {
     const pendantAccueil = fini.derniereVoix < accueilProtegeJusqua; // l'annonce de l'IA ne se coupe pas
     const voixMinimale = pendantAccueil ? PAROLE_ACCUEIL_MS : PAROLE_COUPURE_MS;
     // sansMot : l'anticipation de ce tour a montre que Grok n'y reconnaissait aucun mot, et rien n'a suivi.
-    if (sansMot(fini) || fini.voixMs < 150 || (agentContinue && (fini.voixMs < voixMinimale || !bargeIn))) {
+    if (sansMot(fini) || fini.voixMs < plancherVoix(fini) || (agentContinue && (fini.voixMs < voixMinimale || !bargeIn))) {
       toursIgnores++;
       console.log(`[tour] son ignore : ${Math.round(fini.voixMs)} ms de voix${sansMot(fini) ? " sans mot reconnu" : ""}${agentContinue ? " pendant que l'agent parle" : ""} ${t()}`);
       if (tourEnAttente) {

@@ -8,7 +8,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { spawn, execFileSync } from "node:child_process";
-import { ulawDecodeSample } from "../../lib/audio.js";
+import { ulawDecodeSample, ulawEncodeSample } from "../../lib/audio.js";
 const ICI = path.dirname(fileURLToPath(import.meta.url));
 const RACINE = path.join(ICI, "../..");
 const S = process.env.BANC_SORTIE || path.join(ICI, ".sorties");
@@ -41,8 +41,25 @@ async function synthese(texte) {
   fs.writeFileSync(f, b);
   return b;
 }
+// Repliques speciales (09/10/2026) : « [gain=0.2] C'est ça. » joue la phrase plus bas (un « c'est ça » bref et
+// faible au telephone ne compte que ~120 ms de voix), « [bruit=100] » joue un bruit blanc de 100 ms (un clic).
+async function morceau(t) {
+  const bruit = t.match(/^\[bruit=(\d+)\]/);
+  if (bruit) {
+    const n = Number(bruit[1]) * 8, b = Buffer.alloc(n);
+    for (let i = 0; i < n; i++) b[i] = ulawEncodeSample(Math.round((Math.random() * 2 - 1) * 6000));
+    return { texte: t, buf: b };
+  }
+  const gain = t.match(/^\[gain=([\d.]+)\]\s*/);
+  const texte = gain ? t.slice(gain[0].length) : t;
+  const buf = await synthese(texte);
+  if (!gain) return { texte: t, buf };
+  const g = Number(gain[1]), b = Buffer.alloc(buf.length);
+  for (let i = 0; i < buf.length; i++) b[i] = ulawEncodeSample(Math.round(ulawDecodeSample(buf[i]) * g));
+  return { texte: t, buf: b };
+}
 const MORCEAUX = [];
-for (const t of REPLIQUES) MORCEAUX.push({ texte: t, buf: await synthese(t) });
+for (const t of REPLIQUES) MORCEAUX.push(await morceau(t));
 // VOILA=1 : « Voilà. » 400 ms apres l'email epele, avant que sa transcription arrive (cas qui perdait la ligne).
 // VOILA_TEXTE / VOILA_SUR : une autre suite, apres une autre replique (phrase hesitante qui fait annuler l'anticipation).
 const VOILA_TEXTE = process.env.VOILA_TEXTE || "Voilà.";
