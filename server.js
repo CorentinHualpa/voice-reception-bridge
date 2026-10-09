@@ -1146,7 +1146,11 @@ wss.on("connection", (twilio, requete) => {
   // fallu repeter. Quand le son commence apres la fin de la voix de l'agent (il attend une reponse), le plancher
   // descend a PLANCHER_REPONSE_MS, et c'est la transcription de Grok qui tranche : un bruit sans mot n'a pas de
   // reponse (voir texteFinalRecu, puis reponseIgnoree). Grok seul ; OpenAI repond sur le son, un clic le ferait parler.
-  const plancherVoix = (tr) => (!CERVEAU_OPENAI && PLANCHER_REPONSE_MS > 0 && tr.debut >= finLecture ? PLANCHER_REPONSE_MS : 150);
+  // Seulement quand l'agent ATTEND : il a deja parle (avant l'accueil, finLecture vaut 0 et un clic au decroche
+  // passerait), il a fini, et rien ne se prepare (pendant une generation ou des outils, un « hm » ferait une
+  // seconde reponse et bloquerait le raccroche).
+  const plancherVoix = (tr) => (!CERVEAU_OPENAI && PLANCHER_REPONSE_MS > 0 && respSeq > 0 && finLecture > 0 && tr.debut >= finLecture
+    && !generation && !outilsEnCours && !tourEnAttente ? PLANCHER_REPONSE_MS : 150);
   // ---- Reponse anticipee (voir ANTICIPATION_MS) ----
   const sansMot = (tr) => tr.sansMot !== undefined && tr.voixMs - tr.sansMot < ANNULATION_VOIX_MS;
   let reponseAnticipee = 0, anticipeePreteA = 0; // pour le journal de latence de la reponse confirmee
