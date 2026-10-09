@@ -42,6 +42,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { ulaw8kToPcm16, pcm16ToUlaw8k, ulawDecodeSample, ulawEncodeSample } from "./lib/audio.js";
 import { creerAmbiance, listerAmbiances, telechargerWav } from "./lib/ambiance.js";
 import { creerDoublure } from "./lib/doublure.js";
+import { PARASITE_RE, peutEtreParasite } from "./lib/parasite.js";
 import { configLectureEleven, creerLectureEleven } from "./lib/lecture-eleven.js";
 import { saluerSelonHeure } from "./lib/accueil.js";
 import { creerFinDeTour } from "./lib/fin-de-tour.mjs";
@@ -942,6 +943,24 @@ wss.on("connection", (twilio, requete) => {
 
   // Raccroche proprement : on laisse jouer l'audio de cloture deja envoye a Twilio (mark),
   // puis on ferme le flux Twilio -> Twilio termine l'appel -> twilio.on("close") -> finalize() -> recap.
+  // Le debut de chaque reponse est RETENU tant qu'il peut encore etre un mot parasite (voir PARASITE_RE), un ou deux
+  // jetons, puis part a la lecture d'un bloc : une reponse qui n'est QUE ce mot n'est jamais dite (terminerReponse).
+  let tamponParasite = { seq: -1, texte: "", libere: true };
+  let parasitesDeSuite = 0;
+  function envoyerTexteLecture(delta) {
+    if (tamponParasite.seq !== respSeq) tamponParasite = { seq: respSeq, texte: "", libere: false };
+    if (tamponParasite.libere) { fluxPrimaire.texte(delta); return; }
+    tamponParasite.texte += delta;
+    if (peutEtreParasite(tamponParasite.texte)) return;
+    tamponParasite.libere = true;
+    fluxPrimaire.texte(tamponParasite.texte);
+  }
+  function libererTamponLecture() {
+    if (tamponParasite.seq !== respSeq || tamponParasite.libere) return;
+    tamponParasite.libere = true;
+    const t = tamponParasite.texte;
+    if (t.trim() && !PARASITE_RE.test(t.trim()) && fluxPrimaire?.marque === respSeq && !fluxPrimaire.fini) fluxPrimaire.texte(t);
+  }
   // La phrase de cloture vient d'etre dite : le client n'a pas encore repris la parole depuis.
   function noterCloture() { if (!closingSaid) clientApresCloture = false; closingSaid = true; }
   // Au revoir apres la cloture (voir AU_REVOIR_RE). Appelee a la fin d'une reponse, primaire ou doublure, une fois
@@ -1215,7 +1234,7 @@ wss.on("connection", (twilio, requete) => {
     if (doublureGagnante) { reponseActive = false; return; }
     if (TOURS_PAR_LE_PONT) { reponseActive = false; generation = false; lacherRetenue(); } // Grok peut de nouveau entendre le client
     // Une reponse coupee par le client n'a pas ete entendue en entier : elle ne compte pas comme dite.
-    if (texteReponse.trim() && respSeq !== reponseCoupee) repliqueEnCours = `${repliqueEnCours} ${texteReponse.trim()}`.trim().slice(-4000);
+    if (texteReponse.trim() && respSeq !== reponseCoupee && !PARASITE_RE.test(texteReponse.trim())) repliqueEnCours = `${repliqueEnCours} ${texteReponse.trim()}`.trim().slice(-4000);
     // Etat du dialogue avant cette reponse : si elle n'a jamais ete dite (secours ci-dessous), on le restaure tel quel
     // (pushLine peut l'avoir fusionnee avec la ligne precedente de l'agent, une comparaison de texte la manquerait).
     const dialogueAvant = { n: dialog.length, msg: dialog[dialog.length - 1]?.msg };
@@ -1252,6 +1271,28 @@ wss.on("connection", (twilio, requete) => {
     // dans le blanc (banc de panne forcee de Dany, 01/10/2026 : accueil entendu a 15,7 s au lieu de 2 s).
     // ⚠ Une consigne « redis exactement : … » se lit chez OpenAI comme une demande de l'utilisateur (« D'accord, je
     // vais le dire exactement… ») : on efface la reponse muette et on la fait REGENERER, en audio cette fois.
+    // RÉPONSE PARASITE (voir lib/parasite.js) : jamais dite (son texte a été retenu), effacée, et redemandée. Deux
+    // fois de suite au plus : au-delà, on ne boucle pas ; un tour du client en attente est alors traité, sinon
+    // l'appel resterait muet, sans relance ni raccroché de secours (contrôle de sortie du 09/10/2026).
+    if (PARASITE_RE.test(phrase) && respSeq !== reponseCoupee && grok?.readyState === WebSocket.OPEN) {
+      dialog.length = dialogueAvant.n;
+      if (dialogueAvant.n && dialog[dialogueAvant.n - 1]) dialog[dialogueAvant.n - 1].msg = dialogueAvant.msg;
+      if (calls.length) {
+        // Avec des appels d'outil : seul le message parasite s'efface (ni le récap ni l'historique ne le gardent),
+        // les outils s'exécutent normalement et leur relance fera la vraie réponse.
+        const messages = (e.response?.output || []).filter((o) => o?.type === "message" && itemsAjoutes.has(o.id)).map((o) => o.id);
+        for (const id of messages) supprimerElement(id);
+        console.log(`[parasite] reponse n°${respSeq} a outils : message « ${phrase} » efface ${t()} sid=${callSid}`);
+      } else {
+        const ids = [...new Set([...itemsReponse, ...(e.response?.output || []).map((o) => o?.id)].filter((id) => id && itemsAjoutes.has(id)))];
+        for (const id of ids) supprimerElement(id);
+        parasitesDeSuite++;
+        console.log(`[parasite] reponse n°${respSeq} reduite a « ${phrase} », jamais dite${parasitesDeSuite <= 2 ? " : redemandee" : " : abandonnee"} ${t()} sid=${callSid}`);
+        if (parasitesDeSuite <= 2) { entreeNouvelle = true; demanderReponse(); }
+        else if (TOURS_PAR_LE_PONT && tourEnAttente && !tour) { validerTour(); demanderReponse(); }
+        return;
+      }
+    } else if (phrase) parasitesDeSuite = 0;
     if (redireApresEchec === respSeq && !calls.length && phrase && audioReponseOctets === 0 && respSeq !== reponseCoupee && grok?.readyState === WebSocket.OPEN) {
       redireApresEchec = 0;
       const ids = [...new Set([...itemsReponse, ...(e.response?.output || []).map((o) => o?.id)].filter((id) => id && itemsAjoutes.has(id)))];
@@ -1560,6 +1601,7 @@ wss.on("connection", (twilio, requete) => {
     tourEnAttente = false;
     messageTransmisSansReponse = false; // le client a repondu apres le message transmis : raccrocher redevient possible
     if (closingSaid) clientApresCloture = true;
+    parasitesDeSuite = 0; // un nouveau tour du client redonne ses deux nouveaux essais (voir lib/parasite.js)
     // La parole du client clot ce que l'agent venait de dire (une anticipation annulee revalide sans rien effacer).
     if (repliqueEnCours) { repliqueAvantClient = repliqueEnCours; repliqueEnCours = ""; }
     if (!(grok && grok.readyState === WebSocket.OPEN)) return;
@@ -2035,11 +2077,12 @@ wss.on("connection", (twilio, requete) => {
             // La primaire a du texte : c'est elle qui parlera, la doublure n'a plus d'objet (en mode Grok, c'est
             // son premier son qui la congedie, dans envoyerSonAgent).
             if (!doublureGagnante && doublure?.occupee && !fluxPrimaire.texteRecu) doublure.abandonner("la primaire a du texte");
-            fluxPrimaire.texte(e.delta);
+            envoyerTexteLecture(e.delta);
           }
           break;
         case "response.done": {
           if (primaireASolder && respSeq === primaireASolder) { solderPrimaire(e); break; }
+          libererTamponLecture(); // un début retenu qui n'était pas un mot parasite part à la lecture avant sa fin
           // Lecture ElevenLabs : Grok a fini d'ECRIRE, mais la synthese de la fin de son texte est peut-etre encore en
           // route. Tout ce qui clot la reponse (queue de silence, mark de fin de lecture, outils, relance, au
           // revoir) attend qu'elle soit livree, sinon il partirait AVANT la voix.
