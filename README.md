@@ -23,7 +23,7 @@ Appel → Twilio <Connect><Stream url="wss://<railway>/twilio"> → ce serveur
 3. Générer un domaine Railway → mettre `wss://<domaine>/twilio` dans le TwiML du numéro Twilio.
 
 ## Tours de parole (17/09/2026)
-Par défaut le pont décide lui-même de la fin des tours (`TOURS=pont`, `FIN_DE_TOUR_MS=1000`) et retient la voix du client pendant que Grok génère : Grok arrête net une réponse dès qu'il entend l'appelant. Sans `BARGE_IN=1`, le demi-duplex anti-écho reste : rien n'est écouté tant que l'agent est audible. `TOURS=grok` remet l'ancien détecteur sans toucher au code. `RECAP_EXCLURE` liste les numéros de test qui n'envoient pas de récap. Mesures et bancs : `test/bancs/README.md`.
+Par défaut le pont décide lui-même de la fin des tours (`TOURS=pont`, `FIN_DE_TOUR_MS=1000`) et retient la voix du client pendant que Grok génère : Grok arrête net une réponse dès qu'il entend l'appelant. Sans `BARGE_IN=1`, le demi-duplex anti-écho reste : rien n'est écouté tant que l'agent est audible. `TOURS=grok` remet l'ancien détecteur sans toucher au code. `RECAP_EXCLURE` liste les numéros de test qui n'envoient pas de récap. `RELECTURE_UNIQUE` (une phrase) interdit une deuxième relecture épelée de l'email : cette phrase est lue à sa place (lecture ElevenLabs requise, voir `lib/relecture.js`). Mesures et bancs : `test/bancs/README.md`.
 
 ## À dérisquer en premier
 **Le sample rate Grok** : Twilio = mu-law 8kHz, Grok = PCM16 à `GROK_RATE`. Tester `GROK_RATE=8000` (pas de resampling). Si l'agent reste muet (le VAD Grok ne déclenche pas), passer à `GROK_RATE=24000` (resampling activé automatiquement).

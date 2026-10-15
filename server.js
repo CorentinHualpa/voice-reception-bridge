@@ -43,6 +43,7 @@ import { ulaw8kToPcm16, pcm16ToUlaw8k, ulawDecodeSample, ulawEncodeSample } from
 import { creerAmbiance, listerAmbiances, telechargerWav } from "./lib/ambiance.js";
 import { creerDoublure } from "./lib/doublure.js";
 import { PARASITE_RE, peutEtreParasite } from "./lib/parasite.js";
+import { estRelecture, estRelectureEmail, partSure, parleDeLaVille } from "./lib/relecture.js";
 import { configLectureEleven, creerLectureEleven } from "./lib/lecture-eleven.js";
 import { saluerSelonHeure } from "./lib/accueil.js";
 import { creerFinDeTour } from "./lib/fin-de-tour.mjs";
@@ -265,6 +266,10 @@ const HEDGE_APRES_MS = Number(process.env.HEDGE_APRES_MS ?? 0);
 // Retour arriere sans code : LECTURE=grok.
 // Si ElevenLabs tombe pendant un appel (cle, quota, reseau), l'appel repasse sur la voix de Grok jusqu'a la fin.
 const LECTURE_ELEVEN = configLectureEleven();
+// RELECTURE_UNIQUE (15/10/2026) : la phrase dite a la place d'une deuxieme relecture de l'email (voir
+// lib/relecture.js). Vide : garde coupee. Exige la lecture ElevenLabs.
+const RELECTURE_UNIQUE = (process.env.RELECTURE_UNIQUE || "").trim();
+if (RELECTURE_UNIQUE) console.log(`[relecture] une seule relecture de l'email${LECTURE_ELEVEN ? "" : " (INACTIVE : exige LECTURE=elevenlabs)"}, remplacement « ${RELECTURE_UNIQUE} »`);
 
 // CERVEAU (01/10/2026) : « grok » (defaut) ou « openai ». Avec la voix lue par ElevenLabs, seul le TEXTE du
 // modele sert. OpenAI Realtime en sortie texte seule rend son premier jeton en ~0,42 s (mediane, consigne de
@@ -969,8 +974,31 @@ wss.on("connection", (twilio, requete) => {
   // jetons, puis part a la lecture d'un bloc : une reponse qui n'est QUE ce mot n'est jamais dite (terminerReponse).
   let tamponParasite = { seq: -1, texte: "", libere: true };
   let parasitesDeSuite = 0;
+  // RELECTURE UNIQUE (voir lib/relecture.js) : une premiere relecture de l'email a ete DITE. Tant que la fenetre est
+  // ouverte, chaque reponse part a la lecture avec un temps de retard (partSure) et une deuxieme relecture n'est
+  // jamais lue : RELECTURE_UNIQUE part a sa place (remplacerRelecture), et terminerReponse remplace l'historique.
+  let relecture = { dite: false, ouverte: false };
+  let relectureRemplacee = 0, texteRemplace = ""; // reponse remplacee, et ce qui a reellement ete lu pour elle
+  function remplacerRelecture() {
+    const b = tamponParasite;
+    relectureRemplacee = respSeq;
+    const deja = b.texte.slice(0, b.envoye).trim(); // « D'accord. » deja lu avant l'annonce
+    texteRemplace = `${deja} ${RELECTURE_UNIQUE}`.trim();
+    if (fluxPrimaire?.marque === respSeq && !fluxPrimaire.fini) fluxPrimaire.texte((deja ? " " : "") + RELECTURE_UNIQUE);
+    console.log(`[relecture] reponse n°${respSeq} : deuxieme relecture de l'email jamais lue, « ${RELECTURE_UNIQUE} » a la place ${t()} sid=${callSid}`);
+  }
   function envoyerTexteLecture(delta) {
-    if (tamponParasite.seq !== respSeq) tamponParasite = { seq: respSeq, texte: "", libere: false };
+    if (tamponParasite.seq !== respSeq) tamponParasite = { seq: respSeq, texte: "", libere: false, envoye: 0, garde: Boolean(RELECTURE_UNIQUE) && relecture.ouverte };
+    if (relectureRemplacee === respSeq) return; // relecture remplacee : la suite de son texte n'est jamais lue
+    if (tamponParasite.garde) {
+      const b = tamponParasite;
+      b.texte += delta;
+      if (estRelecture(b.texte)) { remplacerRelecture(); return; }
+      if (peutEtreParasite(b.texte)) return;
+      const n = partSure(b.texte.slice(b.envoye));
+      if (n > 0) { fluxPrimaire.texte(b.texte.slice(b.envoye, b.envoye + n)); b.envoye += n; }
+      return;
+    }
     if (tamponParasite.libere) { fluxPrimaire.texte(delta); return; }
     tamponParasite.texte += delta;
     if (peutEtreParasite(tamponParasite.texte)) return;
@@ -978,7 +1006,16 @@ wss.on("connection", (twilio, requete) => {
     fluxPrimaire.texte(tamponParasite.texte);
   }
   function libererTamponLecture() {
-    if (tamponParasite.seq !== respSeq || tamponParasite.libere) return;
+    if (tamponParasite.seq !== respSeq || relectureRemplacee === respSeq) return;
+    if (tamponParasite.garde) { // fenetre de la relecture unique : le reste retenu part, ou la reponse est remplacee
+      const b = tamponParasite;
+      if (estRelecture(b.texte)) { remplacerRelecture(); return; }
+      const reste = b.texte.slice(b.envoye);
+      b.envoye = b.texte.length;
+      if (reste.trim() && !PARASITE_RE.test(b.texte.trim()) && fluxPrimaire?.marque === respSeq && !fluxPrimaire.fini) fluxPrimaire.texte(reste);
+      return;
+    }
+    if (tamponParasite.libere) return;
     tamponParasite.libere = true;
     const t = tamponParasite.texte;
     if (t.trim() && !PARASITE_RE.test(t.trim()) && fluxPrimaire?.marque === respSeq && !fluxPrimaire.fini) fluxPrimaire.texte(t);
@@ -1283,7 +1320,8 @@ wss.on("connection", (twilio, requete) => {
         if (CERVEAU_OPENAI && !octetsLivres && marque === respSeq) redireApresEchec = marque; // et redira celle-ci
         const garde = voixGrokGardee; voixGrokGardee = [];
         console.log(`[lecture] ElevenLabs en echec (${erreur}) : voix de Grok jusqu'a la fin de l'appel${octetsLivres ? "" : `, ${(garde.reduce((n, u) => n + u.length, 0) / 8000).toFixed(1)} s de la reponse n°${marque} rejouees`} ${t()} sid=${callSid}`);
-        if (!octetsLivres && marque === respSeq) for (const u of garde) livrerSonPrimaire(u, marque);
+        // Jamais la voix de Grok d'une relecture remplacee : c'est la relecture elle-meme.
+        if (!octetsLivres && marque === respSeq && relectureRemplacee !== marque) for (const u of garde) livrerSonPrimaire(u, marque);
       },
     });
   }
@@ -1298,6 +1336,10 @@ wss.on("connection", (twilio, requete) => {
     // Consommee meme si le client a coupe : il a coupe pour dire autre chose, la prochaine reponse repondra
     // a CETTE nouvelle parole. Sans cela, une reponse coupee laissait son entree disponible et la suivante
     // pouvait la redire (banc : la reponse sur le gluten dite deux fois).
+    // RELECTURE UNIQUE : la deuxieme relecture n'a jamais ete lue, sa phrase de remplacement l'a ete. C'est elle que
+    // gardent le dialogue (console, recap) et, plus bas, l'historique du modele.
+    const relectureJetee = relectureRemplacee === respSeq ? agentBuf.trim() : "";
+    if (relectureJetee) agentBuf = texteRemplace;
     if (agentBuf.trim()) consommerEntreeClient();
     const texteReponse = agentBuf;
     // Lus AVANT tout validerTour de fin de reponse (voir raccrocherSiAuRevoir).
@@ -1319,6 +1361,22 @@ wss.on("connection", (twilio, requete) => {
     if (TOURS_PAR_LE_PONT) { reponseActive = false; generation = false; lacherRetenue(); } // Grok peut de nouveau entendre le client
     // Une reponse coupee par le client n'a pas ete entendue en entier : elle ne compte pas comme dite.
     if (texteReponse.trim() && respSeq !== reponseCoupee && !PARASITE_RE.test(texteReponse.trim())) repliqueEnCours = `${repliqueEnCours} ${texteReponse.trim()}`.trim().slice(-4000);
+    // Fenetre de la relecture unique : ouverte par la premiere relecture de l'EMAIL entendue, meme en partie (le
+    // client qui dit « non » sur la fin de « c'est bien ça » la coupe), fermee par la question de la ville, par un
+    // remplacement ou par la cloture. Pas armee si la ville a deja ete demandee : le remplacement la redemanderait.
+    if (RELECTURE_UNIQUE && lectureActive() && texteReponse.trim() && !PARASITE_RE.test(texteReponse.trim())) {
+      const entendue = respSeq !== reponseCoupee || audioReponseOctets > 0;
+      if (relecture.ouverte) {
+        if (relectureJetee || closingSaid || (respSeq !== reponseCoupee && parleDeLaVille(texteReponse))) {
+          relecture.ouverte = false;
+          console.log(`[relecture] fenetre fermee apres la reponse n°${respSeq} ${t()} sid=${callSid}`);
+        }
+      } else if (!relecture.dite && entendue && estRelectureEmail(texteReponse)) {
+        const villeDemandee = dialog.some((l) => l.who === "Agent" && parleDeLaVille(l.msg));
+        relecture = { dite: true, ouverte: !villeDemandee };
+        console.log(`[relecture] premiere relecture de l'email entendue (reponse n°${respSeq}${respSeq === reponseCoupee ? ", coupee" : ""}) : ${villeDemandee ? "ville deja demandee, garde non armee" : "une deuxieme sera remplacee"} ${t()} sid=${callSid}`);
+      }
+    }
     // Etat du dialogue avant cette reponse : si elle n'a jamais ete dite (secours ci-dessous), on le restaure tel quel
     // (pushLine peut l'avoir fusionnee avec la ligne precedente de l'agent, une comparaison de texte la manquerait).
     const dialogueAvant = { n: dialog.length, msg: dialog[dialog.length - 1]?.msg };
@@ -1377,7 +1435,8 @@ wss.on("connection", (twilio, requete) => {
         return;
       }
     } else if (phrase) parasitesDeSuite = 0;
-    if (redireApresEchec === respSeq && !calls.length && phrase && audioReponseOctets === 0 && respSeq !== reponseCoupee && grok?.readyState === WebSocket.OPEN) {
+    // Une relecture remplacee n'est jamais regeneree : ce serait la relecture, dite cette fois par la voix d'OpenAI.
+    if (redireApresEchec === respSeq && relectureRemplacee !== respSeq && !calls.length && phrase && audioReponseOctets === 0 && respSeq !== reponseCoupee && grok?.readyState === WebSocket.OPEN) {
       redireApresEchec = 0;
       const ids = [...new Set([...itemsReponse, ...(e.response?.output || []).map((o) => o?.id)].filter((id) => id && itemsAjoutes.has(id)))];
       for (const id of ids) supprimerElement(id); // avec nouvel essai sur « Item not found »
@@ -1393,6 +1452,22 @@ wss.on("connection", (twilio, requete) => {
     // La phrase d'annonce du transfert vient d'etre DITE : on attend que Twilio l'ait jouee, puis on bascule.
     // Apres le secours ci-dessus, et pas avant (02/10/2026) : une annonce qu'ElevenLabs n'a jamais lue est
     // regeneree, et basculer sur sa fin muette aurait coupe l'appel avant que le client l'entende.
+    // RELECTURE UNIQUE : l'historique du modele doit dire ce qui a ete DIT, pas la relecture jetee. Sinon il croirait
+    // avoir relu l'adresse, attendrait un oui, et prendrait la ville du client pour une correction de l'email.
+    // L'effacement de la relecture n'est pas garanti (xAI repond parfois « Item not found » quatre fois de suite,
+    // banc du 15/10 sur une reponse anticipee) : une note systeme dit ce qui s'est passe, que l'effacement ait pris
+    // ou non, puis la phrase reellement lue entre comme sa reponse. Les effacements reussis sont journalises a part
+    // (« conversation.item.deleted »).
+    if (relectureJetee && grok?.readyState === WebSocket.OPEN) {
+      const ids = [...new Set([...itemsReponse, ...(e.response?.output || []).filter((o) => o?.type === "message").map((o) => o.id)].filter((id) => id && itemsAjoutes.has(id)))];
+      for (const id of ids) supprimerElement(id);
+      const note = `Note du standard : ta dernière réponse (une deuxième relecture épelée de l'adresse mail) n'a PAS été prononcée. L'appelant a seulement entendu : « ${texteRemplace} ». L'adresse est notée telle que tu l'as comprise : ne la relis plus, ne la fais plus épeler et ne la redemande plus. Continue à partir de la réponse de l'appelant.`;
+      try {
+        grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "system", content: [{ type: "input_text", text: note }] } }));
+        grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "assistant", content: [{ type: "output_text", text: texteRemplace }] } }));
+      } catch {}
+      console.log(`[relecture] reponse n°${respSeq} : « ${relectureJetee.slice(0, 200)} » jetee, effacement demande pour ${ids.length} element${ids.length > 1 ? "s" : ""}, note et phrase lue injectees ${t()} sid=${callSid}`);
+    }
     if (!calls.length && transfert && transfert.etat === "annonce") preparerTransfert();
     if (calls.length) runTools(calls).catch((err) => console.error("[outil] echec du cycle", err));
     else if (TOURS_PAR_LE_PONT && tourEnAttente && !tour) { validerTour(); demanderReponse(); } // le client a parle pendant la generation
