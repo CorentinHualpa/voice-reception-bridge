@@ -43,7 +43,7 @@ import { ulaw8kToPcm16, pcm16ToUlaw8k, ulawDecodeSample, ulawEncodeSample } from
 import { creerAmbiance, listerAmbiances, telechargerWav } from "./lib/ambiance.js";
 import { creerDoublure } from "./lib/doublure.js";
 import { PARASITE_RE, peutEtreParasite } from "./lib/parasite.js";
-import { estRelecture, estRelectureEmail, partSure, parleDeLaVille } from "./lib/relecture.js";
+import { estRelecture, estQuestionEmail, partSure, parleDeLaVille } from "./lib/relecture.js";
 import { configLectureEleven, creerLectureEleven } from "./lib/lecture-eleven.js";
 import { saluerSelonHeure } from "./lib/accueil.js";
 import { creerFinDeTour } from "./lib/fin-de-tour.mjs";
@@ -174,6 +174,16 @@ const JOURNAL_GROK = process.env.JOURNAL_GROK === "1";
 // apres la demande si le texte ne vient pas (0 : ancien fonctionnement, demande avec le commit).
 const ATTENTE_TEXTE_MS = Number(process.env.ATTENTE_TEXTE_MS ?? 800);
 const ATTENTE_SECOURS_MS = Number(process.env.ATTENTE_SECOURS_MS ?? 300);
+// REPONSE SUR LE TEXTE, cerveau OpenAI (16/10/2026, vocal 9 de Damien). gpt-realtime repond a partir du SON, et la
+// console comme le recap affichent la transcription d'un AUTRE modele (OPENAI_TRANSCRIPTION) : appel du 16/10,
+// « Danica Guillot » ecrit, « C'est noté Dominique Guillou » dit dans la foulee. Deux oreilles, deux versions. Avec
+// REPONSE_SUR_TEXTE=1, le pont attend la transcription finale de la phrase (comme pour Grok), REMPLACE le son du
+// client par ce texte dans la conversation, puis demande la reponse : Dany repond a ce qui est ecrit, une seule
+// oreille, celle qui avait deja les bons mots sur le son telephonique reel le 09/10. Si la transcription n'arrive
+// pas en ATTENTE_TEXTE_OPENAI_MS, la reponse part sur le son, comme avant.
+const REPONSE_SUR_TEXTE = process.env.REPONSE_SUR_TEXTE === "1";
+const ATTENTE_TEXTE_OPENAI_MS = Number(process.env.ATTENTE_TEXTE_OPENAI_MS ?? 2500);
+const VOIX_SANS_TEXTE_MS = Number(process.env.VOIX_SANS_TEXTE_MS ?? 400); // voix d'une vraie phrase a transcription vide
 const PLANCHER_REPONSE_MS = Number(process.env.PLANCHER_REPONSE_MS ?? 80); // voir plancherVoix
 const ANNULATION_VOIX_MS = 150; // voix du client apres le lancement qui annule l'anticipation (le seuil d'un son ignore)
 // REPONSE JAMAIS CREEE (17/09/2026, meme testeur, 6,4 s de blanc). Un tour valide sans mot reconnaissable
@@ -889,7 +899,22 @@ wss.on("connection", (twilio, requete) => {
   // se comptent, et un doublon (meme texte que la finale precedente du message) ne compte pas.
   let commitsSansAccuse = 0, reponseDifferee = null;
   const finalesAttendues = new Map(), derniereFinale = new Map();
-  const attendreLeTexte = () => !CERVEAU_OPENAI && TOURS_PAR_LE_PONT && ATTENTE_TEXTE_MS > 0;
+  const surTexte = () => CERVEAU_OPENAI && REPONSE_SUR_TEXTE && TOURS_PAR_LE_PONT; // voir REPONSE_SUR_TEXTE
+  const attendreLeTexte = () => surTexte() || (!CERVEAU_OPENAI && TOURS_PAR_LE_PONT && ATTENTE_TEXTE_MS > 0);
+  // Reponse sur le texte : les messages du client (son) envoyes depuis la derniere reponse, et leur transcription
+  // finale. Ils sont remplaces par UN message texte juste avant la demande de reponse.
+  let sonsClient = [];
+  const textesClient = new Map();
+  let voixDuTour = 0; // voix du tour envoye en dernier (voir texteFinalRecu)
+  function remplacerSonParTexte() {
+    const ids = sonsClient.filter((id) => itemsAjoutes.has(id));
+    const texte = ids.map((id) => (textesClient.get(id) || "").trim()).filter(Boolean).join(" ");
+    sonsClient = [];
+    if (!ids.length || !texte || !(grok && grok.readyState === WebSocket.OPEN)) return;
+    for (const id of ids) supprimerElement(id);
+    grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text: texte }] } }));
+    console.log(`[texte] la reponse part sur la transcription (${ids.length} son${ids.length > 1 ? "s" : ""} remplace${ids.length > 1 ? "s" : ""}) : « ${texte.slice(0, 160)} » ${t()} sid=${callSid}`);
+  }
   const texteClientEnAttente = () => commitsSansAccuse > 0 || finalesAttendues.size > 0;
   // « Mmm » d'attente (voir MMM_APRES_MS) : fin de parole du client dont la reponse n'a encore rien fait entendre,
   // fin de lecture du « Mmm » (pas de coupure de parole dessus), son pret pour la voix de cet appel.
@@ -977,7 +1002,7 @@ wss.on("connection", (twilio, requete) => {
   // RELECTURE UNIQUE (voir lib/relecture.js) : une premiere relecture de l'email a ete DITE. Tant que la fenetre est
   // ouverte, chaque reponse part a la lecture avec un temps de retard (partSure) et une deuxieme relecture n'est
   // jamais lue : RELECTURE_UNIQUE part a sa place (remplacerRelecture), et terminerReponse remplace l'historique.
-  let relecture = { dite: false, ouverte: false };
+  let relecture = { dite: false, ouverte: false, questions: 0 }; // questions sur l'email deja entendues
   let relectureRemplacee = 0, texteRemplace = ""; // reponse remplacee, et ce qui a reellement ete lu pour elle
   function remplacerRelecture() {
     const b = tamponParasite;
@@ -985,7 +1010,7 @@ wss.on("connection", (twilio, requete) => {
     const deja = b.texte.slice(0, b.envoye).trim(); // « D'accord. » deja lu avant l'annonce
     texteRemplace = `${deja} ${RELECTURE_UNIQUE}`.trim();
     if (fluxPrimaire?.marque === respSeq && !fluxPrimaire.fini) fluxPrimaire.texte((deja ? " " : "") + RELECTURE_UNIQUE);
-    console.log(`[relecture] reponse n°${respSeq} : deuxieme relecture de l'email jamais lue, « ${RELECTURE_UNIQUE} » a la place ${t()} sid=${callSid}`);
+    console.log(`[relecture] reponse n°${respSeq} : nouvelle question ou relecture sur l'email jamais lue, « ${RELECTURE_UNIQUE} » a la place ${t()} sid=${callSid}`);
   }
   function envoyerTexteLecture(delta) {
     if (tamponParasite.seq !== respSeq) tamponParasite = { seq: respSeq, texte: "", libere: false, envoye: 0, garde: Boolean(RELECTURE_UNIQUE) && relecture.ouverte };
@@ -993,7 +1018,7 @@ wss.on("connection", (twilio, requete) => {
     if (tamponParasite.garde) {
       const b = tamponParasite;
       b.texte += delta;
-      if (estRelecture(b.texte)) { remplacerRelecture(); return; }
+      if (estRelecture(b.texte) || estQuestionEmail(b.texte)) { remplacerRelecture(); return; }
       if (peutEtreParasite(b.texte)) return;
       const n = partSure(b.texte.slice(b.envoye));
       if (n > 0) { fluxPrimaire.texte(b.texte.slice(b.envoye, b.envoye + n)); b.envoye += n; }
@@ -1009,7 +1034,7 @@ wss.on("connection", (twilio, requete) => {
     if (tamponParasite.seq !== respSeq || relectureRemplacee === respSeq) return;
     if (tamponParasite.garde) { // fenetre de la relecture unique : le reste retenu part, ou la reponse est remplacee
       const b = tamponParasite;
-      if (estRelecture(b.texte)) { remplacerRelecture(); return; }
+      if (estRelecture(b.texte) || estQuestionEmail(b.texte)) { remplacerRelecture(); return; }
       const reste = b.texte.slice(b.envoye);
       b.envoye = b.texte.length;
       if (reste.trim() && !PARASITE_RE.test(b.texte.trim()) && fluxPrimaire?.marque === respSeq && !fluxPrimaire.fini) fluxPrimaire.texte(reste);
@@ -1114,9 +1139,10 @@ wss.on("connection", (twilio, requete) => {
   // response.create qui suit un tour du client passe par ici, relance apres outils comprise.
   function creerReponse() {
     if (attendreLeTexte() && texteClientEnAttente()) {
-      if (!reponseDifferee) reponseDifferee = { depuis: Date.now(), minuteur: setTimeout(() => envoyerReponseDifferee("plafond"), ATTENTE_TEXTE_MS) };
+      if (!reponseDifferee) reponseDifferee = { depuis: Date.now(), minuteur: setTimeout(() => envoyerReponseDifferee("plafond"), surTexte() ? ATTENTE_TEXTE_OPENAI_MS : ATTENTE_TEXTE_MS) };
       return;
     }
+    if (surTexte()) remplacerSonParTexte(); // transcription deja la (ou relance apres outil : rien a remplacer)
     grok.send(JSON.stringify({ type: "response.create" }));
   }
   // Texte final du client recu. Grok va repondre de lui-meme (voir ATTENTE_TEXTE_MS) : la demande du pont ne part
@@ -1124,6 +1150,15 @@ wss.on("connection", (twilio, requete) => {
   // mot, pas de demande, le chien de garde (REPONSE_IGNOREE_MS depuis la demande) relache la voix comme avant.
   function texteFinalRecu(texte) {
     if (!reponseDifferee) return;
+    // Reponse sur le texte : tout le texte du tour compte (une phrase reprise apres une anticipation annulee fait deux
+    // messages), et OpenAI ne repond jamais de lui-meme : la demande part tout de suite, sur le texte.
+    if (surTexte()) {
+      texte = sonsClient.map((id) => (textesClient.get(id) || "").trim()).filter(Boolean).join(" ");
+      if (texte) { envoyerReponseDifferee("texte final"); return; }
+      // Transcription VIDE d'une vraie phrase (assez de voix) : elle recoit quand meme une reponse, sur le son comme
+      // avant, plutot qu'un blanc jusqu'a la relance. Un clic ou un souffle (peu de voix) reste sans reponse.
+      if (attenteCreation && voixDuTour >= VOIX_SANS_TEXTE_MS) { envoyerReponseDifferee(`sur le son, transcription vide pour ${Math.round(voixDuTour)} ms de voix`); return; }
+    }
     if (!String(texte || "").trim()) {
       // Tour du client : le chien de garde soldera. Relance apres outils (pas de chien de garde) : elle part, sinon
       // le resultat de l'outil ne serait jamais dit.
@@ -1146,6 +1181,8 @@ wss.on("connection", (twilio, requete) => {
     // Tampon jamais accuse : sans doute un tour sans parole, que Grok ignorera. Le chien de garde garde alors l'heure
     // de la demande initiale, sinon la voix du client resterait retenue REPONSE_IGNOREE_MS de plus que le plafond.
     if (attenteCreation && !sansAccuse) creationDemandeeA = Date.now();
+    // Reponse sur le texte : au plafond, la transcription n'est pas venue, la reponse part sur le son (comme avant).
+    if (surTexte()) { if (pourquoi === "plafond" || pourquoi.startsWith("sur le son")) sonsClient = []; else remplacerSonParTexte(); }
     grok.send(JSON.stringify({ type: "response.create" }));
   }
   function abandonnerAttenteTexte() {
@@ -1233,7 +1270,12 @@ wss.on("connection", (twilio, requete) => {
     // Demande encore retenue (voir ATTENTE_TEXTE_MS) : elle ne part plus, mais Grok repondra DE LUI-MEME au tampon
     // envoye. Sa reponse s'annule donc comme une autre (l'annulation envoyee avant response.created s'y applique).
     // Banc du 09/10 : sans cette annulation, sa reponse etait creee, jamais terminee, et l'agent restait muet.
-    if (abandonnerReponseDifferee()) creationDemandeeA = Date.now();
+    if (abandonnerReponseDifferee()) {
+      // Reponse sur le texte : la demande n'est jamais partie et OpenAI ne repond pas de lui-meme, rien ne sera cree.
+      // On solde tout de suite, sinon la suite de la phrase resterait retenue jusqu'au chien de garde.
+      if (surTexte()) { finirAnnulation(null); return; }
+      creationDemandeeA = Date.now();
+    }
     // Envoye avant response.created, l'annulation s'applique a la reponse des sa creation (banc du 17/09).
     if (grok && grok.readyState === WebSocket.OPEN) grok.send(JSON.stringify({ type: "response.cancel" }));
   }
@@ -1371,10 +1413,11 @@ wss.on("connection", (twilio, requete) => {
           relecture.ouverte = false;
           console.log(`[relecture] fenetre fermee apres la reponse n°${respSeq} ${t()} sid=${callSid}`);
         }
-      } else if (!relecture.dite && entendue && estRelectureEmail(texteReponse)) {
+      } else if (!relecture.dite && entendue && estQuestionEmail(texteReponse) && ++relecture.questions >= 2) {
+        // Au plus DEUX questions sur l'email (la demande, puis une relecture ou une relance) : la suivante est remplacee.
         const villeDemandee = dialog.some((l) => l.who === "Agent" && parleDeLaVille(l.msg));
-        relecture = { dite: true, ouverte: !villeDemandee };
-        console.log(`[relecture] premiere relecture de l'email entendue (reponse n°${respSeq}${respSeq === reponseCoupee ? ", coupee" : ""}) : ${villeDemandee ? "ville deja demandee, garde non armee" : "une deuxieme sera remplacee"} ${t()} sid=${callSid}`);
+        relecture = { dite: true, ouverte: !villeDemandee, questions: relecture.questions };
+        console.log(`[relecture] deuxieme question sur l'email entendue (reponse n°${respSeq}${respSeq === reponseCoupee ? ", coupee" : ""}) : ${villeDemandee ? "ville deja demandee, garde non armee" : "la suivante sera remplacee"} ${t()} sid=${callSid}`);
       }
     }
     // Etat du dialogue avant cette reponse : si elle n'a jamais ete dite (secours ci-dessous), on le restaure tel quel
@@ -1461,7 +1504,7 @@ wss.on("connection", (twilio, requete) => {
     if (relectureJetee && grok?.readyState === WebSocket.OPEN) {
       const ids = [...new Set([...itemsReponse, ...(e.response?.output || []).filter((o) => o?.type === "message").map((o) => o.id)].filter((id) => id && itemsAjoutes.has(id)))];
       for (const id of ids) supprimerElement(id);
-      const note = `Note du standard : ta dernière réponse (une deuxième relecture épelée de l'adresse mail) n'a PAS été prononcée. L'appelant a seulement entendu : « ${texteRemplace} ». L'adresse est notée telle que tu l'as comprise : ne la relis plus, ne la fais plus épeler et ne la redemande plus. Continue à partir de la réponse de l'appelant.`;
+      const note = `Note du standard : ta dernière réponse (une nouvelle question ou relecture sur l'adresse mail) n'a PAS été prononcée. L'appelant a seulement entendu : « ${texteRemplace} ». L'adresse est notée telle que tu l'as comprise : ne la relis plus, ne la fais plus épeler et ne la redemande plus. Continue à partir de la réponse de l'appelant.`;
       try {
         grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "system", content: [{ type: "input_text", text: note }] } }));
         grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "assistant", content: [{ type: "output_text", text: texteRemplace }] } }));
@@ -1766,6 +1809,7 @@ wss.on("connection", (twilio, requete) => {
     if (!(grok && grok.readyState === WebSocket.OPEN)) return;
     grok.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
     if (attendreLeTexte()) commitsSansAccuse++;
+    if (tour) voixDuTour = tour.voixMs;
     // Un envoi du tampon = un tour du client, sauf la revalidation qui suit une anticipation annulee : c'est la
     // suite de la MEME phrase, ses morceaux doivent finir sur la meme ligne (voir texteDuTour).
     if (memeTourApresAnnulation) memeTourApresAnnulation = false; else tourNo++;
@@ -1780,6 +1824,7 @@ wss.on("connection", (twilio, requete) => {
   function finDuTour() {
     const fini = tour;
     tour = null;
+    if (fini) voixDuTour = fini.voixMs; // voir texteFinalRecu (reponse sur le texte)
     if (anticipation && anticipation.tour === fini && !anticipation.annulee) { confirmerAnticipation(fini); return; }
     // L'agent parle encore bien apres ce son : « mmm », « oui », un souffle. Sans coupure possible (demi-duplex),
     // tout ce qui est dit par-dessus l'agent est ignore, comme quand l'audio ne partait pas a Grok.
@@ -2284,12 +2329,22 @@ wss.on("connection", (twilio, requete) => {
           if (process.env.JOURNAL_DIALOGUE === "1") console.log(`[transcription] ${e.type.split(".").pop()} item=${e.item_id} ligne=${tourClient ? tourClient.idx : "aucune"} « ${e.transcript} » ${t()}`);
           noterEntreeClient(e.item_id, e.transcript);
           noterTranscription(e.item_id, e.transcript, false); // cumulatif ou final : remplace le morceau
+          if (e.type.endsWith(".completed") && surTexte()) textesClient.set(e.item_id, e.transcript || "");
           // Transcription finale d'un tampon envoye (celles d'avant l'envoi sont provisoires) : la reponse peut partir.
           if (e.type.endsWith(".completed") && finalesAttendues.has(e.item_id) && e.transcript !== derniereFinale.get(e.item_id)) {
             derniereFinale.set(e.item_id, e.transcript);
             const reste = finalesAttendues.get(e.item_id) - 1;
             if (reste > 0) finalesAttendues.set(e.item_id, reste); else finalesAttendues.delete(e.item_id);
             if (!texteClientEnAttente()) texteFinalRecu(e.transcript);
+          }
+          break;
+        case "conversation.item.input_audio_transcription.failed":
+          // Reponse sur le texte : une transcription en echec ne viendra plus, la reponse part tout de suite sur le
+          // son au lieu d'attendre le plafond.
+          console.log(`[texte] transcription en echec item=${e.item_id} ${String(e.error?.message || "").slice(0, 120)} ${t()} sid=${callSid}`);
+          if (surTexte() && finalesAttendues.has(e.item_id)) {
+            finalesAttendues.delete(e.item_id);
+            if (!texteClientEnAttente() && reponseDifferee) envoyerReponseDifferee("sur le son, transcription en echec");
           }
           break;
         case "conversation.item.input_audio_transcription.delta":
@@ -2323,6 +2378,7 @@ wss.on("connection", (twilio, requete) => {
             commitsSansAccuse--;
             finalesAttendues.set(e.item_id, (finalesAttendues.get(e.item_id) || 0) + 1);
           }
+          if (surTexte() && e.item_id && !sonsClient.includes(e.item_id)) sonsClient.push(e.item_id);
           // Message ouvert par Grok avant l'envoi (voir itemsAvantEnvoi) : son tour est connu, son texte prend sa ligne.
           if (itemsAvantEnvoi.delete(e.item_id) && texteDeItem.has(e.item_id)) noterTranscription(e.item_id, texteDeItem.get(e.item_id), false);
           if (!typesVus.has(e.type)) { typesVus.add(e.type); console.log(`[grok] ${e.type} ${t()}`); }
@@ -2365,6 +2421,14 @@ wss.on("connection", (twilio, requete) => {
           }
           // OpenAI signale une annulation sans reponse active (anticipation deja soldee), xAI l'ignorait : rien a faire.
           if (e.error?.code === "response_cancel_not_active") break;
+          // Reponse sur le texte : un tampon vide refuse n'aura jamais de transcription, il ne doit pas faire attendre
+          // la reponse jusqu'au plafond.
+          if (surTexte() && e.error?.code === "input_audio_buffer_commit_empty") {
+            commitsSansAccuse = Math.max(0, commitsSansAccuse - 1);
+            console.log(`[texte] tampon vide refuse, aucune transcription a attendre ${t()} sid=${callSid}`);
+            if (!texteClientEnAttente()) texteFinalRecu("");
+            break;
+          }
           // Configuration de session refusee par OpenAI : sans elle, l'agent parle sans consigne et OpenAI decoupe
           // les tours lui-meme. On la renvoie une fois SANS les outils, la consigne et le decoupage par le pont
           // valant mieux que rien, et on le crie dans le journal.

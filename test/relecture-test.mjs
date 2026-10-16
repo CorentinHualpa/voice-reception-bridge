@@ -1,7 +1,7 @@
 // Banc de la garde « relecture unique de l'email » (lib/relecture.js), sans reseau.
 // node test/relecture-test.mjs
 import assert from "assert";
-import { estRelecture, estRelectureEmail, partSure, parleDeLaVille } from "../lib/relecture.js";
+import { estRelecture, estRelectureEmail, estQuestionEmail, partSure, parleDeLaVille } from "../lib/relecture.js";
 
 let n = 0;
 const ok = (cond, msg) => { assert.ok(cond, msg); n++; console.log("ok - " + msg); };
@@ -72,6 +72,21 @@ for (const g of [1, 7, 42, 99]) {
 ok(partSure("Très bien, monsieur Mbaye. Je note tout ") === "Très bien, monsieur Mbaye. ".length, "une phrase finie part, la suivante attend sa fin");
 ok(partSure("Merci. Je vous épelle pour vérifier : ") === "Merci. ".length, "tout part sauf l'annonce");
 ok(partSure("C'est corrigé, merci") === 0, "une phrase pas finie attend");
+
+// Questions sur l'email (au plus deux par appel)
+for (const t of [
+  "Quelle est votre adresse mail pour qu'on vous envoie le devis, s'il vous plaît?",
+  "Et après l'arobase, s'il vous plaît ?",
+  "Pardon, je n'ai pas bien saisi. Pourriez-vous me redire votre adresse mail clairement, s'il vous plaît ?",
+  "Je comprends, merci. Pour qu'on puisse vous envoyer les informations, pourriez-vous me donner votre adresse mail complète, en précisant ce qu'il y a après l'arobase ?",
+  R1,
+]) ok(estQuestionEmail(t), `question sur l'email : « ${t.slice(0, 50)} »`);
+for (const t of [
+  "C'est noté, merci. Vous êtes dans quelle ville, s'il vous plaît ?",
+  "Désolé, je ne parle que français. Vous pouvez nous écrire à service tiret commercial arobase motralec point com. Très bonne journée.",
+  "Un conseiller vérifiera votre adresse mail en vous rappelant. Vous êtes dans quelle ville ?",
+  "Très bien, monsieur Lemaire. Vous êtes dans quelle ville ?",
+]) ok(!estQuestionEmail(t), `pas une question sur l'email : « ${t.slice(0, 50)} »`);
 
 // Fenetre
 ok(parleDeLaVille("C'est noté, merci. Vous êtes dans quelle ville, s'il vous plaît ?"), "question de la ville reconnue");
