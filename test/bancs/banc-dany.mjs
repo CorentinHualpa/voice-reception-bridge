@@ -86,7 +86,7 @@ for (const k of ["TRANSFERT_NUMERO", "TRANSFERT_NOM", "TWILIO_ACCOUNT_SID", "TWI
 // Transcription et fin d'appel (05/10/2026) : le modele de transcription, sa consigne, la phrase d'au revoir.
 for (const k of ["OPENAI_TRANSCRIPTION", "OPENAI_TRANSCRIPTION_PROMPT", "AU_REVOIR_REGEX", "CLOSING_REGEX", "JOURNAL_GROK", "ATTENTE_TEXTE_MS", "ATTENTE_SECOURS_MS"]) if (process.env[k] !== undefined) envPont[k] = process.env[k];
 // Relecture unique de l'email (15/10/2026) : la phrase dite a la place d'une deuxieme relecture.
-for (const k of ["RELECTURE_UNIQUE", "GROK_MODEL", "GROK_VAD_THRESHOLD"]) if (process.env[k] !== undefined) envPont[k] = process.env[k];
+for (const k of ["RELECTURE_UNIQUE", "GROK_MODEL", "GROK_MODEL_IMPOSE", "GROK_VAD_THRESHOLD"]) if (process.env[k] !== undefined) envPont[k] = process.env[k];
 // Reponse sur le texte, cerveau OpenAI (16/10/2026).
 for (const k of ["REPONSE_SUR_TEXTE", "ATTENTE_TEXTE_OPENAI_MS", "ANTICIPATION_MS"]) if (process.env[k] !== undefined) envPont[k] = process.env[k];
 // Pont relie a DaleVoz (06/10/2026) : DALEVOZ_URL + VOICE_BRIDGE_SECRET fournis par l'appelant (jamais ecrits ici).

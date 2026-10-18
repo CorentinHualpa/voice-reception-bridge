@@ -81,6 +81,10 @@ import {
 const PORT = process.env.PORT || 8080;
 const XAI_API_KEY = process.env.XAI_API_KEY;
 const GROK_MODEL = process.env.GROK_MODEL || "grok-voice-latest";
+// GROK_MODEL_IMPOSE (17/10/2026, Dany) : le modele que DaleVoz sert passe d'habitude avant GROK_MODEL, et son catalogue
+// ne propose que `grok-voice-latest` (= 3.0 depuis le 14/10). Au banc, la 2.0 repond ~150 ms plus vite a la mediane et
+// a un p90 plus bas : cette variable l'impose sur un service, DaleVoz ou non. Vide = comportement d'avant.
+const GROK_MODEL_IMPOSE = (process.env.GROK_MODEL_IMPOSE || "").trim();
 const GROK_VOICE = process.env.GROK_VOICE || "eve";
 const GROK_RATE = Number(process.env.GROK_RATE || 8000);
 const GROK_SPEED = Number(process.env.GROK_SPEED || 1.0);          // vitesse de parole (0.7..1.5)
@@ -2123,7 +2127,7 @@ wss.on("connection", (twilio, requete) => {
     }
 
     // Le modele, la vitesse et le seuil VAD viennent de l'onglet Voix de l'agent Dale Voz quand il y en a un.
-    const modele = CERVEAU_OPENAI ? OPENAI_REALTIME_MODEL : sessionDV?.model || GROK_MODEL;
+    const modele = CERVEAU_OPENAI ? OPENAI_REALTIME_MODEL : GROK_MODEL_IMPOSE || sessionDV?.model || GROK_MODEL;
     const vitesse = Number(sessionDV?.speed) || GROK_SPEED;
     const seuilVad = Number(sessionDV?.threshold) || GROK_VAD_THRESHOLD;
     if (Number(sessionDV?.silenceMs) > 0) finDeTourMs = Math.min(1500, Math.max(500, Number(sessionDV.silenceMs)));
