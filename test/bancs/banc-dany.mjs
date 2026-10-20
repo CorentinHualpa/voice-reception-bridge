@@ -17,6 +17,20 @@ const NOM = process.argv[2] || "banc-dany";
 const PORT = 8891 + Math.floor(Math.random() * 100);
 const vault = fs.readFileSync(process.env.VAULT || "C:/Users/msi/.secrets/api-keys.env", "utf8");
 const cle = (n) => (vault.match(new RegExp(`^${n}=(.*)$`, "m"))?.[1] ?? "").trim().replace(/^["']|["']$/g, "");
+// LIGNE=degradee (20/10/2026) : le client parle sur une mauvaise ligne. Voix a 60 % du niveau, bruit gaussien continu de ~350 (rms,
+// sur une voix qui monte a 2000-4000), et 4 % des trames de 20 ms qui tombent a plat (paquets perdus). Sans cette variable, la ligne
+// est parfaite (synthese propre, silence numerique entre les phrases).
+const LIGNE_DEGRADEE = process.env.LIGNE === "degradee";
+const gauss = () => Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random());
+function degraderTrame(trame) {
+  const b = Buffer.alloc(trame.length);
+  for (let i = 0; i < trame.length; i++) {
+    const s = (trame[i] === 0xff ? 0 : ulawDecodeSample(trame[i]) * 0.6) + gauss() * 350;
+    b[i] = ulawEncodeSample(Math.max(-32000, Math.min(32000, Math.round(s))));
+  }
+  if (trame.some((x) => x !== 0xff) && Math.random() < 0.04) b.fill(0xff); // paquet perdu : silence net
+  return b;
+}
 const ACCUEIL = "Bonjour, bienvenue chez Motralec. Je suis Dany. Notre standard est actuellement fermé, mais je peux prendre votre message pour qu'un conseiller vous rappelle. Vous appelez pour quel sujet ?";
 
 // Repliques du client, synthetisees une fois (cache dans .sorties) par une autre voix qu'agent.
@@ -163,12 +177,13 @@ const jouer = (m) => new Promise((ok) => { enCours = { ...m, ok }; pos = 0; jour
   while (!fini) {
     const due = Math.floor((Date.now() - debutFlux) / 20);
     while (trame <= due) {
-      const f = Buffer.alloc(160, 0xff);
+      let f = Buffer.alloc(160, 0xff);
       if (enCours) {
         enCours.buf.copy(f, 0, pos, Math.min(pos + 160, enCours.buf.length));
         pos += 160;
         if (pos >= enCours.buf.length) { const k = enCours; enCours = null; premierSonApres = Date.now(); k.ok(); }
       }
+      if (LIGNE_DEGRADEE) f = degraderTrame(f);
       const i0 = trame * 160;
       for (let i = 0; i < 160 && i0 + i < client.length; i++) client[i0 + i] = f[i] === 0xff ? 0 : ulawDecodeSample(f[i]);
       envoyer({ event: "media", streamSid: "MZbanc", media: { payload: f.toString("base64") } });
