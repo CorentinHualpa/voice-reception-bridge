@@ -42,6 +42,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { ulaw8kToPcm16, pcm16ToUlaw8k, ulawDecodeSample, ulawEncodeSample } from "./lib/audio.js";
 import { creerAmbiance, listerAmbiances, telechargerWav } from "./lib/ambiance.js";
 import { creerDoublure } from "./lib/doublure.js";
+import { jetonEleven, urlRealtimeEleven, sansBalisesEleven, creerPartNouvelle } from "./lib/eleven-realtime.js";
 import { PARASITE_RE, peutEtreParasite } from "./lib/parasite.js";
 import { estRelecture, estQuestionEmail, partSure, parleDeLaVille } from "./lib/relecture.js";
 import { configLectureEleven, creerLectureEleven } from "./lib/lecture-eleven.js";
@@ -166,7 +167,10 @@ const RELANCE_SUITE_MS = Number(process.env.RELANCE_SUITE_MS || 2500); // silenc
 // 17/09/2026 (choix de Coq) : descendu de 400 a 250 ms. Le son n'est toujours lache qu'a la fin du tour, donc
 // la fin de phrase n'est pas plus courte ; on gagne 150 ms sur TOUS les tours, pics compris. Le prix est un peu
 // plus d'anticipations annulees sur les pauses d'hesitation, et une annulation se solde en 30 a 210 ms.
-const ANTICIPATION_MS = Number(process.env.ANTICIPATION_MS ?? 250);
+// ⚠ CERVEAU=eleven : anticipation COUPEE par defaut (20/10/2026). Eleven Realtime ne sait pas effacer un element
+// (conversation.item.delete : not_implemented) et, apres un response.cancel en vol, relance de lui-meme une reponse
+// qui reste ouverte (« Conversation already has an active response »). ANTICIPATION_MS=250 reste possible pour mesurer.
+const ANTICIPATION_MS = Number(process.env.ANTICIPATION_MS ?? ((process.env.CERVEAU || "").toLowerCase() === "eleven" ? 0 : 250));
 const JOURNAL_GROK = process.env.JOURNAL_GROK === "1";
 // ATTENDRE LE TEXTE DU CLIENT (09/10/2026). Grok repond a partir de la TRANSCRIPTION de la phrase, pas du son, et il
 // REPOND DE LUI-MEME a chaque tampon envoye, meme avec turn_detection a null (banc : aucun response.create, deux
@@ -195,7 +199,9 @@ const ANNULATION_VOIX_MS = 150; // voix du client apres le lancement qui annule 
 // response.created ni erreur (banc : un « mmm » de 0,8 s, rien en 20 s). Le filet attendait 8 s, pendant lesquelles
 // la vraie question du client restait retenue. En mode manuel, response.created arrive 90 a 180 ms apres le commit
 // (51 tours mesures) : au-dela de REPONSE_IGNOREE_MS, la demande est perdue.
-const REPONSE_IGNOREE_MS = Number(process.env.REPONSE_IGNOREE_MS || 1000);
+// ⚠ CERVEAU=eleven : response.created n'arrive qu'APRES la transcription de la phrase (cascade), 0,3 a 1,5 s apres le commit
+// (email epele de 6 s : au-dela de 1 s au banc du 20/10, le pont croyait la demande perdue et relachait la voix). 4 s.
+const REPONSE_IGNOREE_MS = Number(process.env.REPONSE_IGNOREE_MS || ((process.env.CERVEAU || "").toLowerCase() === "eleven" ? 4000 : 1000));
 // « MMM » D'ATTENTE (17/09/2026, choix de Coq). Une reponse sur cinq, Grok met 2,7 a 3,7 s a parler (cote xAI,
 // hors de portee du pont) : le client entend un blanc. Quand rien n'est encore joue MMM_APRES_MS apres la fin de sa
 // phrase et qu'une reponse est en route, l'agent fait « Mmm… » dans sa propre voix (Grok TTS, rendu en mu-law 8 kHz,
@@ -310,8 +316,42 @@ const OPENAI_TRANSCRIPTION_PROMPT = !TRANSCRIPTION_ACCEPTE_PROMPT ? "" : process
   ? "Appel téléphonique en français. L'appelant épelle souvent son nom ou son adresse e-mail lettre par lettre (M, A, R, I, E), avec arobase, point, tiret, deux L, et des domaines comme gmail, hotmail, yahoo, orange, free."
   : "");
 const OPENAI_VOIX = process.env.OPENAI_VOIX || "marin";
+// CERVEAU=eleven (20/10/2026, essai local) : Eleven Realtime (eleven_realtime_v1_max | _mini), API WebSocket compatible
+// OpenAI Realtime (wss://api.elevenlabs.io/v1/convai/realtime), architecture en CASCADE (STT, LLM, TTS d'ElevenLabs).
+// Le modele parle lui-meme : pas de LECTURE externe. Jeton ephemere (POST /v1/convai/realtime/client_secrets) puis
+// session.update pour la consigne et les outils. Audio mu-law 8 kHz (audio/pcmu) de bout en bout, rien a convertir.
+// Tours decides par le pont (turn_detection null : server_vad n'existe pas chez Eleven). Reglages : ELEVEN_REALTIME_MODEL,
+// ELEVEN_REALTIME_VOIX (id de voix de la bibliotheque ou d'un clone), ELEVEN_REALTIME_DUREE_S (600 par defaut chez Eleven).
+// Retour arriere sans code : CERVEAU=grok. N'est PAS le defaut.
+const CERVEAU_ELEVEN = (process.env.CERVEAU || "grok").toLowerCase() === "eleven" && Boolean(process.env.ELEVENLABS_API_KEY);
+const ELEVEN_REALTIME_MODEL = process.env.ELEVEN_REALTIME_MODEL || "eleven_realtime_v1_max";
+const ELEVEN_REALTIME_VOIX = process.env.ELEVEN_REALTIME_VOIX || "brian";
+const ELEVEN_REALTIME_DUREE_S = Number(process.env.ELEVEN_REALTIME_DUREE_S || 1800);
+const ELEVEN_REALTIME_URL = process.env.ELEVEN_REALTIME_URL || "https://api.elevenlabs.io";
+if ((process.env.CERVEAU || "").toLowerCase() === "eleven" && !CERVEAU_ELEVEN) console.error("[cerveau] CERVEAU=eleven exige ELEVENLABS_API_KEY : Grok conserve");
+// Les deux moteurs a protocole OpenAI (OpenAI Realtime, Eleven Realtime) partagent leurs reglages : audio mu-law en entree
+// comme en sortie, message du client cree au commit, reponse demandee par le pont sans attendre de texte.
+const MOTEUR_COMPAT = CERVEAU_OPENAI || CERVEAU_ELEVEN;
+// Session Eleven : `tools` DEJA a la forme OpenAI (type function). `complet` = avec la consigne et les outils (jeton de la
+// doublure, qui n'a pas de session.update a faire), sinon le strict necessaire pour obtenir un jeton.
+function configSessionEleven({ instructions = "", tools = [], modele = ELEVEN_REALTIME_MODEL, jeton = false } = {}) {
+  return {
+    type: "realtime",
+    ...(jeton ? { model: modele, max_duration_seconds: ELEVEN_REALTIME_DUREE_S } : {}),
+    ...(instructions ? { instructions } : {}),
+    ...(tools.length ? { tools, tool_choice: "auto" } : {}),
+    output_modalities: ["audio"],
+    audio: {
+      input: { format: { type: "audio/pcmu", rate: 8000 }, transcription: { language: AGENT_LANG }, turn_detection: null },
+      output: { format: { type: "audio/pcmu" }, voice: ELEVEN_REALTIME_VOIX },
+    },
+  };
+}
+// Eleven Realtime glisse des balises de jeu dans le texte de ses reponses (« [friendly] Pourriez-vous... ») : elles
+// n'appartiennent ni au dialogue, ni au recap, ni aux detecteurs de phrase.
+const sansBalises = (s) => (CERVEAU_ELEVEN ? sansBalisesEleven(s) : s);
 if ((process.env.CERVEAU || "").toLowerCase() === "openai" && !CERVEAU_OPENAI) console.error("[cerveau] CERVEAU=openai exige LECTURE=elevenlabs et OPENAI_API_KEY : Grok conserve");
-console.log(`[cerveau] ${CERVEAU_OPENAI ? `OpenAI ${OPENAI_REALTIME_MODEL}, sortie texte, transcription ${OPENAI_TRANSCRIPTION}${OPENAI_TRANSCRIPTION_PROMPT ? " avec consigne" : ""}` : "Grok"}`);
+console.log(`[cerveau] ${CERVEAU_ELEVEN ? `Eleven Realtime ${ELEVEN_REALTIME_MODEL}, voix ${ELEVEN_REALTIME_VOIX}, audio mu-law de bout en bout` : CERVEAU_OPENAI ? `OpenAI ${OPENAI_REALTIME_MODEL}, sortie texte, transcription ${OPENAI_TRANSCRIPTION}${OPENAI_TRANSCRIPTION_PROMPT ? " avec consigne" : ""}` : "Grok"}`);
 console.log(`[lecture] ${LECTURE_ELEVEN ? `ElevenLabs voix=${LECTURE_ELEVEN.voix} modele=${LECTURE_ELEVEN.modele} balise=${LECTURE_ELEVEN.balise ? `« ${LECTURE_ELEVEN.balise} »` : "aucune"}` : "voix de Grok"}`);
 // Accueil fixe (ACCUEIL_TEXTE, pont sans Dale Voz comme Dany) : synthetise des le demarrage, pour que le premier
 // appel apres un redeploiement ne paie pas ~2 s de synthese au decroche (mesure au banc de Dany, 01/10/2026).
@@ -904,7 +944,7 @@ wss.on("connection", (twilio, requete) => {
   let commitsSansAccuse = 0, reponseDifferee = null;
   const finalesAttendues = new Map(), derniereFinale = new Map();
   const surTexte = () => CERVEAU_OPENAI && REPONSE_SUR_TEXTE && TOURS_PAR_LE_PONT; // voir REPONSE_SUR_TEXTE
-  const attendreLeTexte = () => surTexte() || (!CERVEAU_OPENAI && TOURS_PAR_LE_PONT && ATTENTE_TEXTE_MS > 0);
+  const attendreLeTexte = () => surTexte() || (!MOTEUR_COMPAT && TOURS_PAR_LE_PONT && ATTENTE_TEXTE_MS > 0);
   // Reponse sur le texte : les messages du client (son) envoyes depuis la derniere reponse, et leur transcription
   // finale. Ils sont remplaces par UN message texte juste avant la demande de reponse.
   let sonsClient = [];
@@ -937,7 +977,10 @@ wss.on("connection", (twilio, requete) => {
   let finDoublureEnAttente = null;          // fin du tour de la doublure, en attente de la primaire soldee
   // Lecture ElevenLabs (voir LECTURE_ELEVEN) : un flux par reponse, pour la primaire et pour la doublure. La voix
   // de Grok est gardee de cote pendant la reponse en cours, pour le secours (`lectureEnEchec`).
-  const lecture = LECTURE_ELEVEN ? creerLectureEleven(LECTURE_ELEVEN, { log: (m) => console.log(`${m.trimEnd()} ${t()} sid=${callSid}`) }) : null;
+  const lecture = LECTURE_ELEVEN && !CERVEAU_ELEVEN ? creerLectureEleven(LECTURE_ELEVEN, { log: (m) => console.log(`${m.trimEnd()} ${t()} sid=${callSid}`) }) : null;
+  // CERVEAU=eleven : le modele parle lui-meme, mais sa session met ~5 s a etre prete (session.update de la consigne). Avec
+  // LECTURE=elevenlabs, la synthese ElevenLabs ne sert QU'A L'ACCUEIL (pre-enregistre, voir lancerAccueilEnregistre).
+  const lectureAccueil = CERVEAU_ELEVEN && LECTURE_ELEVEN ? creerLectureEleven(LECTURE_ELEVEN, { log: (m) => console.log(`${m.trimEnd()} ${t()} sid=${callSid}`) }) : null;
   let redireApresEchec = 0;                 // reponse ecrite par OpenAI dont ElevenLabs n'a rien dit (voir terminerReponse)
   let lectureEnEchec = false;              // ElevenLabs a lache sur cet appel : voix de Grok jusqu'a la fin
   let fluxPrimaire = null, fluxDoublure = null;
@@ -1118,7 +1161,7 @@ wss.on("connection", (twilio, requete) => {
     for (const p of paquets) {
       if (generation) { retenue.push(p); continue; } // Grok abandonnerait la reponse qu'il genere
       // OpenAI recoit du mu-law (audio/pcmu), Grok du PCM : le pont travaille en PCM 8 kHz, on reconvertit.
-      const charge = CERVEAU_OPENAI ? pcm16ToUlaw8k(p, GROK_RATE) : p;
+      const charge = MOTEUR_COMPAT ? pcm16ToUlaw8k(p, GROK_RATE) : p;
       grok.send(JSON.stringify({ type: "input_audio_buffer.append", audio: charge.toString("base64") }));
       audioEnvoyeMs += (p.length / 2 / GROK_RATE) * 1000;
     }
@@ -1227,7 +1270,7 @@ wss.on("connection", (twilio, requete) => {
   // Seulement quand l'agent ATTEND : il a deja parle (avant l'accueil, finLecture vaut 0 et un clic au decroche
   // passerait), il a fini, et rien ne se prepare (pendant une generation ou des outils, un « hm » ferait une
   // seconde reponse et bloquerait le raccroche).
-  const plancherVoix = (tr) => (!CERVEAU_OPENAI && PLANCHER_REPONSE_MS > 0 && respSeq > 0 && finLecture > 0 && tr.debut >= finLecture
+  const plancherVoix = (tr) => (!MOTEUR_COMPAT && PLANCHER_REPONSE_MS > 0 && respSeq > 0 && finLecture > 0 && tr.debut >= finLecture
     && !generation && !outilsEnCours && !tourEnAttente ? PLANCHER_REPONSE_MS : 150);
   // ---- Reponse anticipee (voir ANTICIPATION_MS) ----
   const sansMot = (tr) => tr.sansMot !== undefined && tr.voixMs - tr.sansMot < ANNULATION_VOIX_MS;
@@ -1628,7 +1671,8 @@ wss.on("connection", (twilio, requete) => {
       cle: XAI_API_KEY,
       modele,
       etiquette: `sid=${callSid}`,
-      config: {
+      eleven: CERVEAU_ELEVEN ? { cle: process.env.ELEVENLABS_API_KEY, base: ELEVEN_REALTIME_URL, session: configSessionEleven({ jeton: true }) } : null,
+      config: CERVEAU_ELEVEN ? configSessionEleven({ instructions: sessionInstructions, tools: outilsPourOpenAI(outils) }) : {
         instructions: sessionInstructions,
         ...(outils.length ? { tools: outils, tool_choice: "auto" } : {}),
         voice: sessionDV?.voice || GROK_VOICE,
@@ -1661,6 +1705,7 @@ wss.on("connection", (twilio, requete) => {
           if (tourDoublure.marque !== respSeq || tourDoublure.outil) return;
           if (reponseCoupee === respSeq) return; // le client a coupe : la suite ne part plus, comme pour la primaire
           if (!doublurePrendLaMain()) return;
+          if (MOTEUR_COMPAT) { envoyerSonAgent(pcm); return; } // deja en mu-law 8 kHz (audio/pcmu)
           const brut = Buffer.concat([resteAudioDoublure, pcm]);
           const pair = brut.length - (brut.length % 2);
           resteAudioDoublure = Buffer.from(brut.subarray(pair));
@@ -1928,7 +1973,7 @@ wss.on("connection", (twilio, requete) => {
     // Mots entiers, accents neutralises (« Etaline » / « étaline »), et Grok seul : OpenAI ne change pas.
     const nu = (s) => s.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
     const contenu = (m, suite) => nu(suite) === nu(m) || nu(suite).startsWith(nu(m) + " ");
-    const gardes = CERVEAU_OPENAI ? morceaux : morceaux.filter((m, i) => !morceaux.slice(i + 1).some((suite) => contenu(m, suite)));
+    const gardes = MOTEUR_COMPAT ? morceaux : morceaux.filter((m, i) => !morceaux.slice(i + 1).some((suite) => contenu(m, suite)));
     return { n, phrase: gardes.join(" ") };
   }
   function noterTranscription(itemId, texte, cumule) {
@@ -1950,6 +1995,9 @@ wss.on("connection", (twilio, requete) => {
     } else userBuf = cumule ? userBuf + texte : texte;
   }
   function pushAgent() { pushLine("Agent", agentBuf); agentBuf = ""; }
+
+  // ---- Cerveau Eleven : transcription cumulative (voir lib/eleven-realtime.js) ----
+  const partNouvelleEleven = creerPartNouvelle();
 
   // ---- Cerveau OpenAI (voir CERVEAU) ----
   // `voix` : OpenAI parle lui-meme (secours quand ElevenLabs tombe), en mu-law 8 kHz pour Twilio.
@@ -2008,21 +2056,29 @@ wss.on("connection", (twilio, requete) => {
     // ⚠ Chez OpenAI, `instructions` d'une reponse REMPLACE celles de la session : avec la seule consigne, le modele
     // repondait a la consigne (« D'accord, je vais le dire exactement comme vous l'avez demandé. », banc de Dany du
     // 01/10/2026). On lui redonne donc sa consigne entiere, suivie de la phrase a dire.
-    const instructions = CERVEAU_OPENAI && sessionOpenAI?.instructions
+    const instructions = MOTEUR_COMPAT && sessionOpenAI?.instructions
       ? `${sessionOpenAI.instructions}\n\n# Ta toute premiere replique\n${consigne}`
       : consigne;
+    if (CERVEAU_ELEVEN) {
+      // Eleven Realtime ne cree AUCUNE reponse sur un response.create sans message du client, et ignore `response.instructions`
+      // (banc du 20/10 : « reponse jamais terminee », l'accueil n'est jamais venu). La consigne entre donc comme un message.
+      grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text: `(SYSTEME : l'appel vient de commencer, le client n'a encore rien dit. ${consigne})` }] } }));
+      entreeNouvelle = true;
+      grok.send(JSON.stringify({ type: "response.create" }));
+      return;
+    }
     grok.send(JSON.stringify(accueil
       // Laisse au modele, il perdait contre un prompt qui imposait sa propre premiere phrase.
       ? { type: "response.create", response: { instructions } }
       : { type: "response.create" }));
   }
   function lancerAccueilEnregistre() {
-    if (!lectureActive() || !streamSid) return;
+    if (!(lectureActive() || lectureAccueil) || !streamSid) return;
     accueilTexte = texteAccueil();
     if (!accueilTexte) return;
     accueilEtat = "attente";
     const t0 = Date.now();
-    lecture.accueil(accueilTexte).then(({ ulaw, cache }) => {
+    (lecture || lectureAccueil).accueil(accueilTexte).then(({ ulaw, cache }) => {
       if (finalized || accueilEtat !== "attente") return;
       accueilEtat = "joue";
       console.log(`[accueil] pre-enregistre (${cache ? "cache" : `synthetise en ${Date.now() - t0} ms`}), ${(ulaw.length / 8000).toFixed(1)} s ${t()} sid=${callSid}`);
@@ -2111,7 +2167,14 @@ wss.on("connection", (twilio, requete) => {
     }
     lancerAccueilEnregistre(); // sans attendre Grok
     let token;
-    if (!CERVEAU_OPENAI) { // OpenAI s'ouvre cote serveur avec la cle, sans jeton ephemere
+    if (CERVEAU_ELEVEN) { // jeton ephemere contre la cle ElevenLabs ; la consigne et les outils suivent par session.update
+      try {
+        token = await jetonEleven({ cle: process.env.ELEVENLABS_API_KEY, base: ELEVEN_REALTIME_URL, session: configSessionEleven({ jeton: true }) });
+      } catch (e) {
+        console.error(`[eleven] ${e.message} sid=${callSid}`);
+        return;
+      }
+    } else if (!CERVEAU_OPENAI) { // OpenAI s'ouvre cote serveur avec la cle, sans jeton ephemere
       try {
         const tok = await fetch("https://api.x.ai/v1/realtime/client_secrets", {
           method: "POST",
@@ -2127,7 +2190,7 @@ wss.on("connection", (twilio, requete) => {
     }
 
     // Le modele, la vitesse et le seuil VAD viennent de l'onglet Voix de l'agent Dale Voz quand il y en a un.
-    const modele = CERVEAU_OPENAI ? OPENAI_REALTIME_MODEL : GROK_MODEL_IMPOSE || sessionDV?.model || GROK_MODEL;
+    const modele = CERVEAU_ELEVEN ? ELEVEN_REALTIME_MODEL : CERVEAU_OPENAI ? OPENAI_REALTIME_MODEL : GROK_MODEL_IMPOSE || sessionDV?.model || GROK_MODEL;
     const vitesse = Number(sessionDV?.speed) || GROK_SPEED;
     const seuilVad = Number(sessionDV?.threshold) || GROK_VAD_THRESHOLD;
     if (Number(sessionDV?.silenceMs) > 0) finDeTourMs = Math.min(1500, Math.max(500, Number(sessionDV.silenceMs)));
@@ -2149,7 +2212,9 @@ wss.on("connection", (twilio, requete) => {
       console.log(`[lecture] ElevenLabs injoignable a l'ouverture (${ok}) : voix de ${CERVEAU_OPENAI ? "secours d'OpenAI" : "Grok"} pour cet appel ${t()} sid=${callSid}`);
     });
     if (TOURS_PAR_LE_PONT && MMM_APRES_MS > 0) sonDAttente(sessionDV?.voice || GROK_VOICE, vitesse).then((s) => { sonMmm = s; });
-    grok = CERVEAU_OPENAI
+    grok = CERVEAU_ELEVEN
+      ? new WebSocket(urlRealtimeEleven(modele, ELEVEN_REALTIME_URL), { headers: { Authorization: `Bearer ${token}` } })
+      : CERVEAU_OPENAI
       ? new WebSocket(`wss://api.openai.com/v1/realtime?model=${modele}`, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } })
       : new WebSocket(`wss://api.x.ai/v1/realtime?model=${modele}`, [`xai-client-secret.${token}`]);
 
@@ -2197,7 +2262,15 @@ wss.on("connection", (twilio, requete) => {
       // envoyait toujours GROK_REASONING (defaut "high") : un agent regle sur « Rapide » dans l'onglet
       // Voix (Palazzo) reflechissait quand meme avant chaque reponse, d'ou la latence remontee par Jacky.
       const effort = sessionDV?.reasoning === "none" || sessionDV?.reasoning === "high" ? sessionDV.reasoning : GROK_REASONING;
-      console.log(`[session] cerveau=${CERVEAU_OPENAI ? "openai" : "grok"} modele=${modele} reflexion=${effort} tours=${TOURS_PAR_LE_PONT ? "pont fin_de_tour=" + finDeTourMs + "ms" : "grok seuil=" + seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} carte=${carteAjoutee ? "ajoutee" : "non"} anticipation=${ANTICIPATION_MS}ms doublure=${HEDGE_APRES_MS ? HEDGE_APRES_MS + "ms" : "non"} ambiance=${ambiance ? ambiance.libelle : "non"} lecture=${lectureActive() ? "elevenlabs" : "grok"} fin_de_tour=${eot ? "modele seuil=" + EOT_SEUIL + " delai=" + EOT_DELAI_MS + "ms filet=" + finDeTourMs + "ms" : "silence seul"} ${t()} sid=${callSid}`);
+      console.log(`[session] cerveau=${CERVEAU_ELEVEN ? "eleven" : CERVEAU_OPENAI ? "openai" : "grok"} modele=${modele} reflexion=${effort} tours=${TOURS_PAR_LE_PONT ? "pont fin_de_tour=" + finDeTourMs + "ms" : "grok seuil=" + seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} carte=${carteAjoutee ? "ajoutee" : "non"} anticipation=${ANTICIPATION_MS}ms doublure=${HEDGE_APRES_MS ? HEDGE_APRES_MS + "ms" : "non"} ambiance=${ambiance ? ambiance.libelle : "non"} lecture=${lectureActive() ? "elevenlabs" : "grok"} fin_de_tour=${eot ? "modele seuil=" + EOT_SEUIL + " delai=" + EOT_DELAI_MS + "ms filet=" + finDeTourMs + "ms" : "silence seul"} ${t()} sid=${callSid}`);
+      if (CERVEAU_ELEVEN) {
+        // Le modele parle lui-meme (mu-law 8 kHz). Consigne et outils par session.update, accepte des l'ouverture.
+        sessionOpenAI = { instructions: sessionInstructions, outils };
+        grok.send(JSON.stringify({ type: "session.update", session: configSessionEleven({ instructions: sessionInstructions, tools: outilsPourOpenAI(outils) }) }));
+        // Doublure : une seconde session Eleven, meme consigne, qui n'entend jamais le client (historique en texte).
+        if (TOURS_PAR_LE_PONT && HEDGE_APRES_MS > 0) ouvrirDoublure({ modele, vitesse, effort, sessionInstructions, outils });
+        return;
+      }
       if (CERVEAU_OPENAI) {
         // Sortie TEXTE seule (ElevenLabs lit) ; l'audio du client arrive en mu-law tel que Twilio le donne.
         // ElevenLabs deja injoignable a l'ouverture : OpenAI parle lui-meme, avec sa voix (voir voixDeSecours).
@@ -2283,7 +2356,7 @@ wss.on("connection", (twilio, requete) => {
           if (respSeq === primaireJetee) break; // la doublure joue ce tour a sa place
           if (DOUBLURE_TEST_MS && doublure && Date.now() - debutReponseMs < DOUBLURE_TEST_MS) break; // banc
           // Voix de secours d'OpenAI : deja en mu-law 8 kHz (audio/pcmu), rien a convertir.
-          if (CERVEAU_OPENAI) { livrerSonPrimaire(Buffer.from(e.delta, "base64")); break; }
+          if (MOTEUR_COMPAT) { livrerSonPrimaire(Buffer.from(e.delta, "base64")); break; }
           const brut = Buffer.concat([resteAudio, Buffer.from(e.delta, "base64")]);
           const pair = brut.length - (brut.length % 2);
           resteAudio = Buffer.from(brut.subarray(pair)); // 0 ou 1 octet
@@ -2299,7 +2372,7 @@ wss.on("connection", (twilio, requete) => {
         case "response.output_text.delta": // OpenAI en sortie texte seule (voir CERVEAU)
         case "response.output_audio_transcript.delta":
           if (respSeq === primaireJetee) break; // reponse doublee : son texte n'est pas dit
-          if (e.delta) { agentBuf += e.delta; if (CLOSING_RE.test(agentBuf)) noterCloture(); }
+          if (e.delta) { agentBuf += sansBalises(e.delta); if (CLOSING_RE.test(agentBuf)) noterCloture(); }
           if (e.delta && lectureActive() && fluxPrimaire?.marque === respSeq && respSeq !== reponseCoupee && respSeq !== primaireJetee
             && !(DOUBLURE_TEST_MS && doublure && Date.now() - debutReponseMs < DOUBLURE_TEST_MS)) { // banc : la primaire muette
             // La primaire a du texte : c'est elle qui parlera, la doublure n'a plus d'objet (en mode Grok, c'est
@@ -2330,6 +2403,8 @@ wss.on("connection", (twilio, requete) => {
         }
         case "conversation.item.input_audio_transcription.updated":
         case "conversation.item.input_audio_transcription.completed":
+          // Eleven ne consomme pas son tampon d'entree : la transcription reprend TOUT l'appel. On ne garde que le neuf.
+          if (CERVEAU_ELEVEN && typeof e.transcript === "string") e = { ...e, transcript: partNouvelleEleven(e.transcript) };
           if (process.env.JOURNAL_DIALOGUE === "1") console.log(`[transcription] ${e.type.split(".").pop()} item=${e.item_id} ligne=${tourClient ? tourClient.idx : "aucune"} « ${e.transcript} » ${t()}`);
           noterEntreeClient(e.item_id, e.transcript);
           noterTranscription(e.item_id, e.transcript, false); // cumulatif ou final : remplace le morceau
@@ -2361,7 +2436,7 @@ wss.on("connection", (twilio, requete) => {
             // Grok ouvre le message du client des qu'il entend parler, AVANT que le pont envoie le tampon : rattache
             // ici, la phrase prenait le numero du tour PRECEDENT, et la console decalait les lignes du client d'un tour
             // (09/10/2026). Le tour se fixe alors a l'envoi (input_audio_buffer.committed).
-            if (TOURS_PAR_LE_PONT && !CERVEAU_OPENAI && !tourDeItem.has(e.item.id)) { itemsAvantEnvoi.add(e.item.id); dernierItemAvantEnvoi = e.item.id; }
+            if (TOURS_PAR_LE_PONT && !MOTEUR_COMPAT && !tourDeItem.has(e.item.id)) { itemsAvantEnvoi.add(e.item.id); dernierItemAvantEnvoi = e.item.id; }
             else rattacherItem(e.item.id, tourClient?.n ?? tourNo);
           }
           if (reponseActive && e.item?.id && e.item.role !== "user") itemsReponse.push(e.item.id);
@@ -2436,10 +2511,10 @@ wss.on("connection", (twilio, requete) => {
           // Configuration de session refusee par OpenAI : sans elle, l'agent parle sans consigne et OpenAI decoupe
           // les tours lui-meme. On la renvoie une fois SANS les outils, la consigne et le decoupage par le pont
           // valant mieux que rien, et on le crie dans le journal.
-          if (CERVEAU_OPENAI && !grokReady && /^session/.test(e.error?.param || "") && sessionOpenAI && !sessionOpenAIReessayee) {
+          if (MOTEUR_COMPAT && !grokReady && /^session/.test(e.error?.param || "") && sessionOpenAI && !sessionOpenAIReessayee) {
             sessionOpenAIReessayee = true;
             console.error(`[cerveau] session refusee par OpenAI (${e.error?.message}) : renvoyee SANS outils ${t()} sid=${callSid}`);
-            grok.send(JSON.stringify({ type: "session.update", session: configSessionOpenAI(sessionOpenAI.instructions, [], !lectureActive()) }));
+            grok.send(JSON.stringify({ type: "session.update", session: CERVEAU_ELEVEN ? configSessionEleven({ instructions: sessionOpenAI.instructions }) : configSessionOpenAI(sessionOpenAI.instructions, [], !lectureActive()) }));
             break;
           }
           // Ignorees en silence jusqu'au 16/09/2026 : une erreur de Grok ne laissait aucune trace.
@@ -2782,7 +2857,7 @@ wss.on("connection", (twilio, requete) => {
     // l'heure ! » pendant le raccrochage (repetition de demo du 17/09). Sans au revoir dit, la relance le fait dire.
     const auRevoirDit = raccroche && audioDeLaReponse > 0 && calls.every((c) => c.name === "end_call");
     // Grok repond de lui-meme a tout tampon envoye (voir ATTENTE_TEXTE_MS) : sans relance, on n'envoie rien.
-    if (tourPendant && !(auRevoirDit && !CERVEAU_OPENAI)) validerTour();
+    if (tourPendant && !(auRevoirDit && !MOTEUR_COMPAT)) validerTour();
     if (auRevoirDit) {
       console.log(`[outil] end_call : pas de relance, l'au revoir est deja dit ${t()} sid=${callSid}`);
       return;

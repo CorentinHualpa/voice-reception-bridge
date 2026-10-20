@@ -89,6 +89,8 @@ for (const k of ["OPENAI_TRANSCRIPTION", "OPENAI_TRANSCRIPTION_PROMPT", "AU_REVO
 for (const k of ["RELECTURE_UNIQUE", "GROK_MODEL", "GROK_MODEL_IMPOSE", "GROK_VAD_THRESHOLD"]) if (process.env[k] !== undefined) envPont[k] = process.env[k];
 // Reponse sur le texte, cerveau OpenAI (16/10/2026).
 for (const k of ["REPONSE_SUR_TEXTE", "ATTENTE_TEXTE_OPENAI_MS", "ANTICIPATION_MS"]) if (process.env[k] !== undefined) envPont[k] = process.env[k];
+// Eleven Realtime (20/10/2026) : CERVEAU=eleven, le modele parle lui-meme.
+for (const k of ["ELEVEN_REALTIME_MODEL", "ELEVEN_REALTIME_VOIX", "ELEVEN_REALTIME_DUREE_S", "ELEVEN_REALTIME_URL", "FIN_DE_TOUR_MS", "HEDGE_APRES_MS", "LECTURE"]) if (process.env[k] !== undefined) envPont[k] = process.env[k];
 // Pont relie a DaleVoz (06/10/2026) : DALEVOZ_URL + VOICE_BRIDGE_SECRET fournis par l'appelant (jamais ecrits ici).
 // ⚠ L'appel s'ecrit alors dans la console de PRODUCTION de l'espace du numero appele (BANC_VERS, defaut Dany).
 for (const k of ["DALEVOZ_URL", "VOICE_BRIDGE_SECRET"]) if (process.env[k]) envPont[k] = process.env[k];
