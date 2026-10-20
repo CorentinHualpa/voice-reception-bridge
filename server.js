@@ -1136,6 +1136,15 @@ wss.on("connection", (twilio, requete) => {
     pushAgent();
     agentSpeaking = false;
     console.log(`[turn] client coupe l'agent (reponse n°${respSeq}, ${Math.round(sonMs)} ms de voix) ${t()} sid=${callSid}`);
+    // Eleven cadence sa voix en temps reel : sans arret, la reponse coupee dure encore plusieurs secondes cote modele, la voix du
+    // client reste retenue d'autant (banc du 20/10 : audio total 33 s) et le response.create suivant est refuse.
+    if (CERVEAU_ELEVEN) arreterReponseModele();
+  }
+  // Arrete la reponse que le modele est en train de dire. Eleven Realtime : `response.cancel` relance une reponse qui reste
+  // ouverte, `output_audio_buffer.clear` arrete celle-ci en ~200 ms (response.done « cancelled ») sans rien relancer.
+  function arreterReponseModele() {
+    if (!(grok && grok.readyState === WebSocket.OPEN)) return;
+    grok.send(JSON.stringify({ type: CERVEAU_ELEVEN ? "output_audio_buffer.clear" : "response.cancel" }));
   }
 
   // Appele a chaque paquet du client (et, en mode grok, au debut de parole signale par Grok). En mode pont, le
@@ -1324,7 +1333,7 @@ wss.on("connection", (twilio, requete) => {
       creationDemandeeA = Date.now();
     }
     // Envoye avant response.created, l'annulation s'applique a la reponse des sa creation (banc du 17/09).
-    if (grok && grok.readyState === WebSocket.OPEN) grok.send(JSON.stringify({ type: "response.cancel" }));
+    arreterReponseModele();
   }
   function finirAnnulation(e) {
     const a = anticipation;
@@ -1742,7 +1751,7 @@ wss.on("connection", (twilio, requete) => {
         setTimeout(() => {
           if (primaireASolder !== marque || !finDoublureEnAttente) return;
           console.log(`[doublure] la primaire n'a pas fini la reponse n°${marque} en 6 s : annulee ${t()} sid=${callSid}`);
-          try { grok.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+          try { arreterReponseModele(); } catch {}
           primaireASolder = 0;
           const suite = finDoublureEnAttente; finDoublureEnAttente = null;
           suite();
@@ -1804,7 +1813,7 @@ wss.on("connection", (twilio, requete) => {
     fluxPrimaire?.couper(); voixGrokGardee = [];
     const debut = agentBuf.trim();
     agentBuf = "";
-    try { grok.send(JSON.stringify({ type: "response.cancel" })); } catch {}
+    try { arreterReponseModele(); } catch {}
     console.log(`[redite] reponse n°${respSeq} jetee : le tour ne portait aucun mot, elle disait « ${debut.slice(0, 70)}… » ${t()} sid=${callSid}`);
     return false;
   }

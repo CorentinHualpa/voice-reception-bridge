@@ -58,6 +58,9 @@ async function synthese(texte) {
 // Repliques speciales (09/10/2026) : « [gain=0.2] C'est ça. » joue la phrase plus bas (un « c'est ça » bref et
 // faible au telephone ne compte que ~120 ms de voix), « [bruit=100] » joue un bruit blanc de 100 ms (un clic).
 async function morceau(t) {
+  // « [coupe=1800] Non attendez... » : le client parle PAR-DESSUS l'agent, 1800 ms apres que celui-ci a commence sa reponse.
+  const coupe = t.match(/^\[coupe=(\d+)\]\s*/);
+  if (coupe) return { ...(await morceau(t.slice(coupe[0].length))), coupe: Number(coupe[1]) };
   const bruit = t.match(/^\[bruit=(\d+)\]/);
   if (bruit) {
     const n = Number(bruit[1]) * 8, b = Buffer.alloc(n);
@@ -84,7 +87,7 @@ const journal = [];
 const envPont = {
   SystemRoot: process.env.SystemRoot, PATH: process.env.PATH, PORT: String(PORT),
   XAI_API_KEY: cle("XAI_API_KEY"), OPENAI_API_KEY: cle("OPENAI_API_KEY"), ELEVENLABS_API_KEY: cle("ELEVENLABS_API_KEY"),
-  RECEPTION_PROMPT: fs.readFileSync(path.join(RACINE, "prompt.motralec.txt"), "utf8"),
+  RECEPTION_PROMPT: fs.readFileSync(process.env.BANC_PROMPT_FILE || path.join(RACINE, "prompt.motralec.txt"), "utf8"),
   AGENT_NAME: "Dany", BUSINESS_NAME: "Motralec", AGENT_LANG: "fr", GROK_VOICE: "leo", GROK_REASONING: "none", GROK_SPEED: "1.15", GROK_RATE: "8000",
   // Reglages cibles de Dany (ceux qui seront poses sur le service bridge).
   CERVEAU: "openai", OPENAI_REALTIME_MODEL: "gpt-realtime-1.5",
@@ -103,6 +106,8 @@ for (const k of ["OPENAI_TRANSCRIPTION", "OPENAI_TRANSCRIPTION_PROMPT", "AU_REVO
 for (const k of ["RELECTURE_UNIQUE", "GROK_MODEL", "GROK_MODEL_IMPOSE", "GROK_VAD_THRESHOLD"]) if (process.env[k] !== undefined) envPont[k] = process.env[k];
 // Reponse sur le texte, cerveau OpenAI (16/10/2026).
 for (const k of ["REPONSE_SUR_TEXTE", "ATTENTE_TEXTE_OPENAI_MS", "ANTICIPATION_MS"]) if (process.env[k] !== undefined) envPont[k] = process.env[k];
+// Profil de Chiara (Palazzo, 21/10/2026) : prise de commande par outils, consigne de DaleVoz (BANC_PROMPT_FILE), coupure de parole.
+for (const k of ["AGENT_TOOLS", "MENU_FILE", "DATA_FILE", "BARGE_IN", "EOT_MODELE", "TIME_ZONE", "SERVICES", "CAPACITE_PAR_QUART", "RESERVE_PAR_QUART", "DELAI_MIN_MINUTES", "MAX_PIZZAS", "AGENT_SPEAKING_MAX_MS", "MMM_APRES_MS", "ELEVEN_LANGUE", "PLANCHER_REPONSE_MS"]) if (process.env[k] !== undefined) envPont[k] = process.env[k];
 // Eleven Realtime (20/10/2026) : CERVEAU=eleven, le modele parle lui-meme.
 for (const k of ["ELEVEN_REALTIME_MODEL", "ELEVEN_REALTIME_VOIX", "ELEVEN_REALTIME_DUREE_S", "ELEVEN_REALTIME_URL", "FIN_DE_TOUR_MS", "HEDGE_APRES_MS", "LECTURE"]) if (process.env[k] !== undefined) envPont[k] = process.env[k];
 // Pont relie a DaleVoz (06/10/2026) : DALEVOZ_URL + VOICE_BRIDGE_SECRET fournis par l'appelant (jamais ecrits ici).
@@ -197,11 +202,14 @@ const jusqua = async (cond, maxMs) => { const d = Date.now(); while (!cond() && 
 const silenceAgent = (ms) => () => sonsAgent > 0 && !agentParle() && Date.now() - dernierSonAgent > ms;
 
 await jusqua(silenceAgent(1200), 40000); // accueil fini
-for (const m of MORCEAUX) {
+for (let i = 0; i < MORCEAUX.length; i++) {
+  const m = MORCEAUX[i];
   await jouer(m);
   if (VOILA && VOILA_SUR.test(m.texte)) { await attendre(Number(process.env.VOILA_MS || 400)); await jouer(VOILA); }
   const n = sonsAgent;
   await jusqua(() => sonsAgent > n, 15000);
+  // La replique suivante coupe l'agent : on la joue pendant qu'il parle, sans attendre son silence.
+  if (MORCEAUX[i + 1]?.coupe) { await attendre(MORCEAUX[i + 1].coupe); continue; }
   await jusqua(silenceAgent(1500), 45000);
 }
 await attendre(4000);
