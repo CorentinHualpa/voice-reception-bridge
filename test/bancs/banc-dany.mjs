@@ -61,6 +61,13 @@ async function morceau(t) {
   // « [coupe=1800] Non attendez... » : le client parle PAR-DESSUS l'agent, 1800 ms apres que celui-ci a commence sa reponse.
   const coupe = t.match(/^\[coupe=(\d+)\]\s*/);
   if (coupe) return { ...(await morceau(t.slice(coupe[0].length))), coupe: Number(coupe[1]) };
+  // « [duree=110] Oui. » : ne garde que 110 ms de VOIX (a partir du premier son), un « oui » de telephone tres bref.
+  const duree = t.match(/^\[duree=(\d+)\]\s*/);
+  if (duree) {
+    const r = await morceau(t.slice(duree[0].length));
+    let d = 0; while (d < r.buf.length && Math.abs(ulawDecodeSample(r.buf[d])) < 600) d++;
+    return { ...r, buf: Buffer.from(r.buf.subarray(d, d + Number(duree[1]) * 8)) };
+  }
   const bruit = t.match(/^\[bruit=(\d+)\]/);
   if (bruit) {
     const n = Number(bruit[1]) * 8, b = Buffer.alloc(n);

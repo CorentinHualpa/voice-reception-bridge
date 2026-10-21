@@ -104,6 +104,8 @@ const CLOSING_RE = new RegExp(process.env.CLOSING_REGEX || "remercie pour votre 
 // reponse qui suit une cloture deja dite ET une prise de parole du client, et qui dit au revoir sans rien
 // demander, raccroche des qu'elle a ete jouee. AU_REVOIR_REGEX remplace la liste des formules d'au revoir.
 const AU_REVOIR_RE = new RegExp(process.env.AU_REVOIR_REGEX || "au revoir|[àa] bient[ôo]t|bonne nuit|bon (apr[èe]s-midi|week-end|weekend)|(bonne|belle|excellente) (fin de )?(journ[ée]e|soir[ée]e|semaine|week-end)|adi[oó]s|hasta (luego|pronto)|good ?bye|have a (nice|great|good|lovely) (day|evening|weekend)", "i");
+// Formules d'au revoir de Chiara en plus des vôtres : « à tout à l'heure », « grazie mille », « merci pour votre commande ».
+const AU_REVOIR_ETENDU_RE = new RegExp(AU_REVOIR_RE.source + "|à tout à l'heure|a tout a l'heure|[àa] tr[èe]s vite|[àa] tout de suite|grazie|ciao|bonne (soir[ée]e|journ[ée]e|fin de journ[ée]e)|merci pour votre (commande|appel)", "i");
 // Numeros de test (Dany, 17/09/2026) : couper tout le recap pendant une recette ferait perdre les vrais appels du
 // moment ; seuls les numeros listes ici (E.164, separes par des virgules) n'en envoient pas.
 const RECAP_EXCLURE = new Set((process.env.RECAP_EXCLURE || "").split(",").map((n) => n.replace(/[^\d+]/g, "")).filter(Boolean));
@@ -910,6 +912,11 @@ wss.on("connection", (twilio, requete) => {
   let audioReponseOctets = 0, debutReponseMs = 0; // audio mu-law envoye a Twilio pour la reponse en cours (8000 octets = 1 s)
   let premierSon = false, finParoleClientMs = 0; // mesure de la latence percue par l'appelant
   let reponseCoupee = 0;                        // reponse dont l'audio restant est jete
+  // Eleven (21/10/2026, appel de Coq chez Chiara) : apres une coupure de parole il cree parfois, tout seul, des reponses que
+  // le pont n'a pas demandees ; l'une d'elles a appele end_call sans un mot et raccroche au nez du client.
+  let derniereCoupureMs = 0, reponseSpontanee = false;
+  let auRevoirComplet = false;                  // le dernier mot entendu de l'agent etait un au revoir ENTIER, et le client n'a rien dit depuis
+  let endCallRefuse = false;
   let parleSelonGrok = false;                   // entre speech_started et speech_stopped
   let entenduSurAgent = false, voixMaxTour = 0, coupeCeTour = false; // pour le journal « son bref ignore »
   let accueilProtegeJusqua = Infinity;          // rien ne se coupe avant le premier son, puis l'annonce de l'IA
@@ -1136,6 +1143,7 @@ wss.on("connection", (twilio, requete) => {
     pushAgent();
     agentSpeaking = false;
     console.log(`[turn] client coupe l'agent (reponse n°${respSeq}, ${Math.round(sonMs)} ms de voix) ${t()} sid=${callSid}`);
+    derniereCoupureMs = Date.now();
     // Eleven cadence sa voix en temps reel : sans arret, la reponse coupee dure encore plusieurs secondes cote modele, la voix du
     // client reste retenue d'autant (banc du 20/10 : audio total 33 s) et le response.create suivant est refuse.
     if (CERVEAU_ELEVEN) arreterReponseModele();
@@ -1279,7 +1287,9 @@ wss.on("connection", (twilio, requete) => {
   // Seulement quand l'agent ATTEND : il a deja parle (avant l'accueil, finLecture vaut 0 et un clic au decroche
   // passerait), il a fini, et rien ne se prepare (pendant une generation ou des outils, un « hm » ferait une
   // seconde reponse et bloquerait le raccroche).
-  const plancherVoix = (tr) => (!MOTEUR_COMPAT && PLANCHER_REPONSE_MS > 0 && respSeq > 0 && finLecture > 0 && tr.debut >= finLecture
+  // Eleven decide comme Grok sur la transcription (un tour sans mot n'a pas de reponse, voir REDITE_ATTENTE_MS) : meme plancher bas.
+  // Chez Chiara un « oui » de 120 ms de voix etait jete (plancher de 150 ms) et le client a du le repeter apres 7 s de silence.
+  const plancherVoix = (tr) => (!CERVEAU_OPENAI && PLANCHER_REPONSE_MS > 0 && respSeq > 0 && finLecture > 0 && tr.debut >= finLecture
     && !generation && !outilsEnCours && !tourEnAttente ? PLANCHER_REPONSE_MS : 150);
   // ---- Reponse anticipee (voir ANTICIPATION_MS) ----
   const sansMot = (tr) => tr.sansMot !== undefined && tr.voixMs - tr.sansMot < ANNULATION_VOIX_MS;
@@ -1440,6 +1450,8 @@ wss.on("connection", (twilio, requete) => {
     if (relectureJetee) agentBuf = texteRemplace;
     if (agentBuf.trim()) consommerEntreeClient();
     const texteReponse = agentBuf;
+    // Eleven : l'au revoir a-t-il ete dit en ENTIER (voir end_call dans executerOutils) ? Un au revoir coupe par le client ne compte pas.
+    if (texteReponse.trim()) auRevoirComplet = respSeq !== reponseCoupee && AU_REVOIR_ETENDU_RE.test(texteReponse);
     // Lus AVANT tout validerTour de fin de reponse (voir raccrocherSiAuRevoir).
     const clientAvantFin = clientApresCloture, clientEnAttente = TOURS_PAR_LE_PONT && tourEnAttente && !tour;
     // Surveillance des fins avalees : une transcription de Grok qui finit sans ponctuation a perdu son dernier signe,
@@ -1860,6 +1872,7 @@ wss.on("connection", (twilio, requete) => {
   function validerTour() {
     tourEnAttente = false;
     messageTransmisSansReponse = false; // le client a repondu apres le message transmis : raccrocher redevient possible
+    auRevoirComplet = false; endCallRefuse = false; // le client a parle : l'au revoir d'avant ne vaut plus
     if (closingSaid) clientApresCloture = true;
     parasitesDeSuite = 0; // un nouveau tour du client redonne ses deux nouveaux essais (voir lib/parasite.js)
     // La parole du client clot ce que l'agent venait de dire (une anticipation annulee revalide sans rien effacer).
@@ -2331,6 +2344,15 @@ wss.on("connection", (twilio, requete) => {
           } // salut une fois
           break;
         case "response.created":
+          // Eleven : une reponse que le pont n'a pas demandee, creee juste apres une coupure de parole (banc du 21/10 : elle reste
+          // ouverte et bloque le tour suivant, ou parle par-dessus le client). On l'arrete et on ignore tout ce qu'elle produit.
+          if (CERVEAU_ELEVEN && !attenteCreation && !relanceOutilDemandee && !anticipation && Date.now() - derniereCoupureMs < 5000) {
+            reponseSpontanee = true;
+            setTimeout(() => { reponseSpontanee = false; }, 4000); // filet : si son response.done ne vient jamais, l'agent ne reste pas muet
+            console.log(`[eleven] reponse creee d'elle-meme apres la coupure de parole, arretee et ignoree ${t()} sid=${callSid}`);
+            arreterReponseModele();
+            break;
+          }
           // Grok repond de lui-meme a un tampon envoye : la demande retenue du pont n'a plus d'objet.
           if (abandonnerReponseDifferee()) console.log(`[tour] Grok repond de lui-meme, la demande du pont ne part pas ${t()} sid=${callSid}`);
           if (TOURS_PAR_LE_PONT) { marquerGeneration(); reponseActive = true; }
@@ -2354,11 +2376,13 @@ wss.on("connection", (twilio, requete) => {
           console.log(`[turn] Dany n°${respSeq}${anticipation || reponseAnticipee === respSeq ? " (anticipee)" : ""} ${t()}`);
           break;
         case "response.function_call_arguments.done":
+          if (reponseSpontanee) break; // reponse creee d'elle-meme apres une coupure : ses outils (end_call !) ne s'executent pas
           if (respSeq === primaireJetee) break; // reponse doublee : ses outils ne s'executent pas, elle sera effacee
           pendingCalls.push({ name: e.name, callId: e.call_id, args: e.arguments });
           break;
         case "response.output_audio.delta": {
           if (!e.delta || !streamSid || twilio.readyState !== WebSocket.OPEN) break;
+          if (reponseSpontanee) break;
           // Reponse coupee par le client : xAI ne sait pas annuler une reponse (response.cancel est
           // « Unsupported » dans sa doc), donc la suite qu'il genere encore est jetee ici.
           if (respSeq === reponseCoupee) break;
@@ -2380,6 +2404,7 @@ wss.on("connection", (twilio, requete) => {
         }
         case "response.output_text.delta": // OpenAI en sortie texte seule (voir CERVEAU)
         case "response.output_audio_transcript.delta":
+          if (reponseSpontanee) break;
           if (respSeq === primaireJetee) break; // reponse doublee : son texte n'est pas dit
           if (e.delta) { agentBuf += sansBalises(e.delta); if (CLOSING_RE.test(agentBuf)) noterCloture(); }
           if (e.delta && lectureActive() && fluxPrimaire?.marque === respSeq && respSeq !== reponseCoupee && respSeq !== primaireJetee
@@ -2391,6 +2416,7 @@ wss.on("connection", (twilio, requete) => {
           }
           break;
         case "response.done": {
+          if (reponseSpontanee) { reponseSpontanee = false; break; } // fin de la reponse ignoree ci-dessus
           if (primaireASolder && respSeq === primaireASolder) { solderPrimaire(e); break; }
           libererTamponLecture(); // un début retenu qui n'était pas un mot parasite part à la lecture avant sa fin
           // Lecture ElevenLabs : Grok a fini d'ECRIRE, mais la synthese de la fin de son texte est peut-etre encore en
@@ -2772,6 +2798,13 @@ wss.on("connection", (twilio, requete) => {
         messageTransmisSansReponse = false;
         out = { ok: false, erreur: "raccrochage refusé", consigne: "Ne raccroche pas maintenant : tu viens de transmettre un message et le client n'a pas encore répondu. Demande-lui en une phrase courte s'il y a autre chose pour lui, puis attends sa réponse." };
         console.log(`[garde] raccrochage refuse juste apres un message transmis ${t()} sid=${callSid}`);
+      } else if (c.name === "end_call" && CERVEAU_ELEVEN && audioDeLaReponse === 0 && !auRevoirComplet && !endCallRefuse) {
+        // GARDE (21/10/2026, appel de Coq chez Chiara) : Eleven appelle end_call dans une reponse SANS voix, apres une coupure de
+        // parole qui avait avale l'au revoir : le pont raccrochait au nez du client, qui parlait encore. Refuse une fois : l'agent
+        // dit d'abord au revoir, puis rappelle end_call (le second essai passe, ou l'au revoir entier a deja ete entendu).
+        endCallRefuse = true;
+        out = { ok: false, erreur: "raccrochage refusé", consigne: "Ne raccroche pas maintenant : le client n'a pas entendu ton au revoir en entier. Dis-lui au revoir en une phrase courte, puis appelle end_call." };
+        console.log(`[garde] end_call sans voix ni au revoir entendu : refuse, l'agent dira au revoir d'abord ${t()} sid=${callSid}`);
       } else if (c.name === "end_call") {
         // Outil de Dale Voz : cote web la surface raccroche, ici c'est Twilio.
         out = { ok: true };
