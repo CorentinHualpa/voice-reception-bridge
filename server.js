@@ -47,6 +47,7 @@ import { PARASITE_RE, peutEtreParasite } from "./lib/parasite.js";
 import { estRelecture, estQuestionEmail, partSure, parleDeLaVille } from "./lib/relecture.js";
 import { configLectureEleven, creerLectureEleven } from "./lib/lecture-eleven.js";
 import { saluerSelonHeure } from "./lib/accueil.js";
+import { creerGardeCredits } from "./lib/garde-credits.js";
 import { creerFinDeTour } from "./lib/fin-de-tour.mjs";
 import { OUTILS_DE_COMMANDE, consigneClotureCommande, createPizzeria } from "./lib/pizzeria.js";
 import {
@@ -3121,3 +3122,7 @@ wss.on("connection", (twilio, requete) => {
 });
 
 server.listen(PORT, () => console.log(`[boot] voice-reception-bridge sur :${PORT} (rate Grok ${GROK_RATE})`));
+
+// Garde-fou des credits ElevenLabs (26/10/2026) : sous le seuil, repasse le service sur Grok et previent par mail.
+// Inactif sans GARDE_CREDITS_SEUIL ou hors CERVEAU=eleven. Voir lib/garde-credits.js.
+creerGardeCredits({ appelsEnCours: () => wss.clients.size }).demarrer();
