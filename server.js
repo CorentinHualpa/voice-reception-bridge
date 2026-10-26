@@ -3125,4 +3125,5 @@ server.listen(PORT, () => console.log(`[boot] voice-reception-bridge sur :${PORT
 
 // Garde-fou des credits ElevenLabs (26/10/2026) : sous le seuil, repasse le service sur Grok et previent par mail.
 // Inactif sans GARDE_CREDITS_SEUIL ou hors CERVEAU=eleven. Voir lib/garde-credits.js.
-creerGardeCredits({ appelsEnCours: () => wss.clients.size }).demarrer();
+// Un transfert en cours ferme le flux Twilio mais vit dans registreTransferts : il compte comme un appel.
+creerGardeCredits({ appelsEnCours: () => wss.clients.size + registreTransferts.taille() }).demarrer();
