@@ -48,6 +48,7 @@ import { estRelecture, estQuestionEmail, partSure, parleDeLaVille } from "./lib/
 import { configLectureEleven, creerLectureEleven } from "./lib/lecture-eleven.js";
 import { saluerSelonHeure } from "./lib/accueil.js";
 import { creerGardeCredits } from "./lib/garde-credits.js";
+import { noteDeTour } from "./lib/note-de-tour.js";
 import { creerFinDeTour } from "./lib/fin-de-tour.mjs";
 import { OUTILS_DE_COMMANDE, consigneClotureCommande, createPizzeria } from "./lib/pizzeria.js";
 import {
@@ -331,6 +332,12 @@ const ELEVEN_REALTIME_MODEL = process.env.ELEVEN_REALTIME_MODEL || "eleven_realt
 const ELEVEN_REALTIME_VOIX = process.env.ELEVEN_REALTIME_VOIX || "brian";
 const ELEVEN_REALTIME_DUREE_S = Number(process.env.ELEVEN_REALTIME_DUREE_S || 1800);
 const ELEVEN_REALTIME_URL = process.env.ELEVEN_REALTIME_URL || "https://api.elevenlabs.io";
+// NOTE_DE_TOUR=1 (27/10/2026, Eleven seulement) : le pont attend la transcription finale du client, puis glisse avant la
+// demande de reponse une note qui dit ce qu'il vient VRAIMENT de dire (le tampon d'Eleven reprend tout l'appel a chaque
+// tour) et ce qui est deja fait. Voir lib/note-de-tour.js. NOTE_ATTENTE_MS : au-dela, la reponse part sans note.
+const NOTE_DE_TOUR = CERVEAU_ELEVEN && process.env.NOTE_DE_TOUR === "1";
+const NOTE_ATTENTE_MS = Number(process.env.NOTE_ATTENTE_MS ?? 1500);
+if (NOTE_DE_TOUR) console.log(`[note] note de tour avant chaque reponse (attente du texte ${NOTE_ATTENTE_MS} ms au plus)`);
 if ((process.env.CERVEAU || "").toLowerCase() === "eleven" && !CERVEAU_ELEVEN) console.error("[cerveau] CERVEAU=eleven exige ELEVENLABS_API_KEY : Grok conserve");
 // Les deux moteurs a protocole OpenAI (OpenAI Realtime, Eleven Realtime) partagent leurs reglages : audio mu-law en entree
 // comme en sortie, message du client cree au commit, reponse demandee par le pont sans attendre de texte.
@@ -952,7 +959,7 @@ wss.on("connection", (twilio, requete) => {
   let commitsSansAccuse = 0, reponseDifferee = null;
   const finalesAttendues = new Map(), derniereFinale = new Map();
   const surTexte = () => CERVEAU_OPENAI && REPONSE_SUR_TEXTE && TOURS_PAR_LE_PONT; // voir REPONSE_SUR_TEXTE
-  const attendreLeTexte = () => surTexte() || (!MOTEUR_COMPAT && TOURS_PAR_LE_PONT && ATTENTE_TEXTE_MS > 0);
+  const attendreLeTexte = () => surTexte() || NOTE_DE_TOUR || (!MOTEUR_COMPAT && TOURS_PAR_LE_PONT && ATTENTE_TEXTE_MS > 0);
   // Reponse sur le texte : les messages du client (son) envoyes depuis la derniere reponse, et leur transcription
   // finale. Ils sont remplaces par UN message texte juste avant la demande de reponse.
   let sonsClient = [];
@@ -1207,7 +1214,7 @@ wss.on("connection", (twilio, requete) => {
   // response.create qui suit un tour du client passe par ici, relance apres outils comprise.
   function creerReponse() {
     if (attendreLeTexte() && texteClientEnAttente()) {
-      if (!reponseDifferee) reponseDifferee = { depuis: Date.now(), minuteur: setTimeout(() => envoyerReponseDifferee("plafond"), surTexte() ? ATTENTE_TEXTE_OPENAI_MS : ATTENTE_TEXTE_MS) };
+      if (!reponseDifferee) reponseDifferee = { depuis: Date.now(), minuteur: setTimeout(() => envoyerReponseDifferee("plafond"), surTexte() ? ATTENTE_TEXTE_OPENAI_MS : NOTE_DE_TOUR ? NOTE_ATTENTE_MS : ATTENTE_TEXTE_MS) };
       return;
     }
     if (surTexte()) remplacerSonParTexte(); // transcription deja la (ou relance apres outil : rien a remplacer)
@@ -1216,8 +1223,11 @@ wss.on("connection", (twilio, requete) => {
   // Texte final du client recu. Grok va repondre de lui-meme (voir ATTENTE_TEXTE_MS) : la demande du pont ne part
   // qu'en secours, ATTENTE_SECOURS_MS plus tard, si response.created n'est pas venu entre-temps. Texte vide : aucun
   // mot, pas de demande, le chien de garde (REPONSE_IGNOREE_MS depuis la demande) relache la voix comme avant.
-  function texteFinalRecu(texte) {
+  function texteFinalRecu(texte, nouveauFinal) {
     if (!reponseDifferee) return;
+    // Note de tour (Eleven) : Eleven ne repond jamais de lui-meme, la demande part des que le texte final est la, avec la
+    // note si le client a dit quelque chose de neuf, sans elle sinon (comme avant).
+    if (NOTE_DE_TOUR) { envoyerReponseDifferee("texte final", nouveauFinal); return; }
     // Reponse sur le texte : tout le texte du tour compte (une phrase reprise apres une anticipation annulee fait deux
     // messages), et OpenAI ne repond jamais de lui-meme : la demande part tout de suite, sur le texte.
     if (surTexte()) {
@@ -1236,7 +1246,7 @@ wss.on("connection", (twilio, requete) => {
     clearTimeout(reponseDifferee.minuteur);
     reponseDifferee.minuteur = setTimeout(() => envoyerReponseDifferee("secours apres le texte"), ATTENTE_SECOURS_MS);
   }
-  function envoyerReponseDifferee(pourquoi) {
+  function envoyerReponseDifferee(pourquoi, nouveau) {
     const d = reponseDifferee;
     if (!d) return;
     clearTimeout(d.minuteur);
@@ -1251,6 +1261,13 @@ wss.on("connection", (twilio, requete) => {
     if (attenteCreation && !sansAccuse) creationDemandeeA = Date.now();
     // Reponse sur le texte : au plafond, la transcription n'est pas venue, la reponse part sur le son (comme avant).
     if (surTexte()) { if (pourquoi === "plafond" || pourquoi.startsWith("sur le son")) sonsClient = []; else remplacerSonParTexte(); }
+    if (NOTE_DE_TOUR && nouveau) {
+      const note = noteDeTour({ nouveau, dialog });
+      if (note) {
+        grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text: note }] } }));
+        console.log(`[note] avant la reponse : ${note.slice(0, 300)} ${t()} sid=${callSid}`);
+      }
+    }
     grok.send(JSON.stringify({ type: "response.create" }));
   }
   function abandonnerAttenteTexte() {
@@ -2026,6 +2043,9 @@ wss.on("connection", (twilio, requete) => {
 
   // ---- Cerveau Eleven : transcription cumulative (voir lib/eleven-realtime.js) ----
   const partNouvelleEleven = creerPartNouvelle();
+  // Meme calcul sur les seules transcriptions FINALES : la note de tour ne doit pas perdre le neuf deja consomme par un
+  // morceau provisoire (« updated ») du meme message.
+  const partNouvelleFinale = creerPartNouvelle();
 
   // ---- Cerveau OpenAI (voir CERVEAU) ----
   // `voix` : OpenAI parle lui-meme (secours quand ElevenLabs tombe), en mu-law 8 kHz pour Twilio.
@@ -2446,6 +2466,7 @@ wss.on("connection", (twilio, requete) => {
         case "conversation.item.input_audio_transcription.updated":
         case "conversation.item.input_audio_transcription.completed":
           // Eleven ne consomme pas son tampon d'entree : la transcription reprend TOUT l'appel. On ne garde que le neuf.
+          if (NOTE_DE_TOUR && e.type.endsWith(".completed") && typeof e.transcript === "string") e = { ...e, nouveauFinal: partNouvelleFinale(e.transcript) };
           if (CERVEAU_ELEVEN && typeof e.transcript === "string") e = { ...e, transcript: partNouvelleEleven(e.transcript) };
           if (process.env.JOURNAL_DIALOGUE === "1") console.log(`[transcription] ${e.type.split(".").pop()} item=${e.item_id} ligne=${tourClient ? tourClient.idx : "aucune"} « ${e.transcript} » ${t()}`);
           noterEntreeClient(e.item_id, e.transcript);
@@ -2456,7 +2477,7 @@ wss.on("connection", (twilio, requete) => {
             derniereFinale.set(e.item_id, e.transcript);
             const reste = finalesAttendues.get(e.item_id) - 1;
             if (reste > 0) finalesAttendues.set(e.item_id, reste); else finalesAttendues.delete(e.item_id);
-            if (!texteClientEnAttente()) texteFinalRecu(e.transcript);
+            if (!texteClientEnAttente()) texteFinalRecu(e.transcript, e.nouveauFinal);
           }
           break;
         case "conversation.item.input_audio_transcription.failed":
