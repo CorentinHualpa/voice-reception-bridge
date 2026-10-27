@@ -87,6 +87,16 @@ await cas("l'appel écrit porte le canal téléphone et le CallSid", async () =>
   assert.equal(corps.turns.length, 2);
 });
 
+await cas("le moteur qui a parlé part avec l'appel, et rien quand il n'est pas connu", async () => {
+  await enregistrerAppel({
+    tenantId: "t-1", agentSlug: "dany", appelId: "CA77", dureeMs: 43000, turns: [],
+    voix: { modele: "eleven_realtime_v1_max", doublure: false, lecture: false },
+  });
+  assert.deepEqual(recus.at(-1).corps.voix, { modele: "eleven_realtime_v1_max", doublure: false, lecture: false });
+  await enregistrerAppel({ tenantId: "t-1", agentSlug: "dany", appelId: "CA78", dureeMs: 1000, turns: [] });
+  assert.equal("voix" in recus.at(-1).corps, false);
+});
+
 await cas("rendez-vous : l'outil reçoit l'appel, et la demande de rappel part avec son motif « rdv »", async () => {
   const { OUTILS_RDV } = await import("../lib/dalevoz.js");
   assert.deepEqual([...OUTILS_RDV].sort(), ["demander_rappel", "proposer_creneaux", "reserver_creneau"]);

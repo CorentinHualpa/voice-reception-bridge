@@ -977,6 +977,9 @@ wss.on("connection", (twilio, requete) => {
   // Doublure (voir HEDGE_APRES_MS) : seconde session Grok, curseur de synchronisation sur `dialog`, tour en
   // cours de doublage, et compteurs pour le compte rendu de fin d'appel.
   let doublure = null, doublureSyncIdx = 0, doublureTour = 0, doublureGagnees = 0, doublureDemandees = 0;
+  // Ce que Dale Voz doit savoir pour payer la minute au prix du moteur qui a parle (26/10/2026) : le modele de la
+  // session et si une doublure a tourne (elle double le cout). Envoye a la fin de l'appel, voir enregistrerAppel.
+  let modeleAppel = null, doublureOuverte = false;
   let doublureGagnante = false; // la reponse en cours est jouee par la doublure, pas par la primaire
   let resteAudioDoublure = Buffer.alloc(0); // octet impair en attente, comme pour la primaire
   let primaireJetee = 0;                    // n° de la reponse de la primaire dont le son ne doit plus partir
@@ -1751,7 +1754,7 @@ wss.on("connection", (twilio, requete) => {
         },
       },
     });
-    doublure.ouvrir().then((ok) => { if (!ok) doublure = null; });
+    doublure.ouvrir().then((ok) => { if (!ok) doublure = null; else doublureOuverte = true; });
     function finDoublure(statut, tourDoublure) {
       resteAudioDoublure = Buffer.alloc(0);
       if (!doublureGagnante || tourDoublure.marque !== respSeq) return;
@@ -2214,6 +2217,7 @@ wss.on("connection", (twilio, requete) => {
 
     // Le modele, la vitesse et le seuil VAD viennent de l'onglet Voix de l'agent Dale Voz quand il y en a un.
     const modele = CERVEAU_ELEVEN ? ELEVEN_REALTIME_MODEL : CERVEAU_OPENAI ? OPENAI_REALTIME_MODEL : GROK_MODEL_IMPOSE || sessionDV?.model || GROK_MODEL;
+    modeleAppel = modele;
     const vitesse = Number(sessionDV?.speed) || GROK_SPEED;
     const seuilVad = Number(sessionDV?.threshold) || GROK_VAD_THRESHOLD;
     if (Number(sessionDV?.silenceMs) > 0) finDeTourMs = Math.min(1500, Math.max(500, Number(sessionDV.silenceMs)));
@@ -3082,6 +3086,13 @@ wss.on("connection", (twilio, requete) => {
         appelId: callSid,
         sessionId: reprise?.sessionId || undefined,
         dureeMs: Date.now() - debutAppelMs,
+        // Le moteur qui a parle : sans lui, Dale Voz comptait toute minute au prix de Grok (26/10/2026). La
+        // lecture ElevenLabs ne s'ajoute qu'a un cerveau Grok (celle d'OpenAI est dans son tarif, Eleven parle seul).
+        voix: {
+          modele: modeleAppel || (CERVEAU_ELEVEN ? ELEVEN_REALTIME_MODEL : CERVEAU_OPENAI ? OPENAI_REALTIME_MODEL : GROK_MODEL_IMPOSE || GROK_MODEL),
+          doublure: doublureOuverte,
+          lecture: !CERVEAU_ELEVEN && !CERVEAU_OPENAI && Boolean(lecture),
+        },
         userId: frPhone(fromNumber) || undefined,
         locale: canalDV.locale,
         diagnostic: reprise ? `reprise apres transfert, ${endReason}` : endReason,
