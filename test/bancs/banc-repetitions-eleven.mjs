@@ -39,9 +39,11 @@ for (let i = 1; i <= N; i++) {
   const agent = log.split(/\r?\n/).filter((l) => /^\s*[\d.]+\s+Agent :/.test(l)).map((l) => l.replace(/^\s*[\d.]+\s+Agent :\s*/, ""));
   const res = {
     appel: nom,
-    relectures: agent.filter((l) => /épelle|epelle/i.test(l)).length,
+    // Motifs larges (relecture critique du 27/10) : toute phrase de l'agent qui dit « arobase » est une relecture ou une
+    // question sur l'email ; toute question qui parle de ville ou de commune compte, quelle que soit sa tournure.
+    relectures: agent.filter((l) => /arobase/i.test(l)).length,
     corrige: agent.filter((l) => /corrig/i.test(l)).length,
-    ville: agent.filter((l) => /quelle ville|dans quelle commune/i.test(l)).length,
+    ville: agent.filter((l) => /\b(ville|commune)\b/i.test(l) && /\?/.test(l)).length,
     numero: agent.some((l) => /rappellera|rappeler au|z[ée]ro six/i.test(l)),
     cloture: agent.some((l) => /remercie pour votre appel/i.test(l)),
   };

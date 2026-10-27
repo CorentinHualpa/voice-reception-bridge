@@ -25,6 +25,7 @@ ok(noteDeTour({ nouveau: "   ", dialog: fil }) === null, "que des espaces : pas 
 const avantRelecture = noteDeTour({ nouveau: "sas.roussel.contact@gmail.com.", dialog: fil.slice(0, 5) });
 ok(/« sas\.roussel\.contact@gmail\.com\. »/.test(avantRelecture), "la note cite la derniere phrase entre guillemets");
 ok(!/Deja fait/.test(avantRelecture), "avant toute relecture : rien n'est annonce comme deja fait");
+ok(/assemble les deux/.test(avantRelecture) && !/uniquement/.test(avantRelecture), "un email dicte en deux tours peut etre assemble (pas de « uniquement »)");
 
 const apresConfirmation = noteDeTour({ nouveau: "Ouais, parfait.", dialog: fil });
 ok(/« Ouais, parfait\. »/.test(apresConfirmation), "apres la relecture : la note cite « Ouais, parfait. »");

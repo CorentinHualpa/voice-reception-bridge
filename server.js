@@ -1261,7 +1261,8 @@ wss.on("connection", (twilio, requete) => {
     if (attenteCreation && !sansAccuse) creationDemandeeA = Date.now();
     // Reponse sur le texte : au plafond, la transcription n'est pas venue, la reponse part sur le son (comme avant).
     if (surTexte()) { if (pourquoi === "plafond" || pourquoi.startsWith("sur le son")) sonsClient = []; else remplacerSonParTexte(); }
-    if (NOTE_DE_TOUR && nouveau) {
+    // Pas de note sur une relance apres outil : elle doit d'abord donner le resultat de l'outil.
+    if (NOTE_DE_TOUR && nouveau && !relanceOutilDemandee) {
       const note = noteDeTour({ nouveau, dialog });
       if (note) {
         grok.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text: note }] } }));
@@ -2466,7 +2467,8 @@ wss.on("connection", (twilio, requete) => {
         case "conversation.item.input_audio_transcription.updated":
         case "conversation.item.input_audio_transcription.completed":
           // Eleven ne consomme pas son tampon d'entree : la transcription reprend TOUT l'appel. On ne garde que le neuf.
-          if (NOTE_DE_TOUR && e.type.endsWith(".completed") && typeof e.transcript === "string") e = { ...e, nouveauFinal: partNouvelleFinale(e.transcript) };
+          // Une finale VIDE ne passe pas : elle remettrait la memoire a zero et la note suivante citerait tout l'appel.
+          if (NOTE_DE_TOUR && e.type.endsWith(".completed") && typeof e.transcript === "string" && e.transcript.trim()) e = { ...e, nouveauFinal: partNouvelleFinale(e.transcript) };
           if (CERVEAU_ELEVEN && typeof e.transcript === "string") e = { ...e, transcript: partNouvelleEleven(e.transcript) };
           if (process.env.JOURNAL_DIALOGUE === "1") console.log(`[transcription] ${e.type.split(".").pop()} item=${e.item_id} ligne=${tourClient ? tourClient.idx : "aucune"} « ${e.transcript} » ${t()}`);
           noterEntreeClient(e.item_id, e.transcript);
