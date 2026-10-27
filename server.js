@@ -979,7 +979,7 @@ wss.on("connection", (twilio, requete) => {
   let doublure = null, doublureSyncIdx = 0, doublureTour = 0, doublureGagnees = 0, doublureDemandees = 0;
   // Ce que Dale Voz doit savoir pour payer la minute au prix du moteur qui a parle (26/10/2026) : le modele de la
   // session et si une doublure a tourne (elle double le cout). Envoye a la fin de l'appel, voir enregistrerAppel.
-  let modeleAppel = null, doublureOuverte = false;
+  let modeleAppel = null, doublureOuverte = false, reponsesLues = 0;
   let doublureGagnante = false; // la reponse en cours est jouee par la doublure, pas par la primaire
   let resteAudioDoublure = Buffer.alloc(0); // octet impair en attente, comme pour la primaire
   let primaireJetee = 0;                    // n° de la reponse de la primaire dont le son ne doit plus partir
@@ -1421,8 +1421,10 @@ wss.on("connection", (twilio, requete) => {
     envoyerSonAgent(ulaw);
   }
   function ouvrirLecturePrimaire(marque) {
+    let compte = false;
     return lecture.flux(marque, {
-      surSon: (u) => livrerSonPrimaire(u, marque),
+      // Une reponse vraiment lue par ElevenLabs (premier son recu) : c'est elle qui coute, pas l'objet de lecture.
+      surSon: (u) => { if (!compte) { compte = true; reponsesLues++; } livrerSonPrimaire(u, marque); },
       // SECOURS : ElevenLabs a lache (cle, quota, reseau, delai). Si rien de cette reponse n'a encore ete joue,
       // la voix de Grok gardee de cote part a sa place ; la suite de l'appel reste sur Grok. Au milieu d'une
       // reponse, on ne rejoue rien (le client entendrait le debut deux fois) : la reponse suivante sera en Grok.
@@ -3091,7 +3093,7 @@ wss.on("connection", (twilio, requete) => {
         voix: {
           modele: modeleAppel || (CERVEAU_ELEVEN ? ELEVEN_REALTIME_MODEL : CERVEAU_OPENAI ? OPENAI_REALTIME_MODEL : GROK_MODEL_IMPOSE || GROK_MODEL),
           doublure: doublureOuverte,
-          lecture: !CERVEAU_ELEVEN && !CERVEAU_OPENAI && Boolean(lecture),
+          lecture: !CERVEAU_ELEVEN && !CERVEAU_OPENAI && reponsesLues > 0,
         },
         userId: frPhone(fromNumber) || undefined,
         locale: canalDV.locale,
