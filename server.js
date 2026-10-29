@@ -49,6 +49,7 @@ import { configLectureEleven, creerLectureEleven } from "./lib/lecture-eleven.js
 import { saluerSelonHeure } from "./lib/accueil.js";
 import { creerGardeCredits } from "./lib/garde-credits.js";
 import { noteDeTour } from "./lib/note-de-tour.js";
+import { lireAgences, agenceDeLigne, consigneAgence, champsAppelee } from "./lib/agences.js";
 import { creerFinDeTour } from "./lib/fin-de-tour.mjs";
 import { OUTILS_DE_COMMANDE, consigneClotureCommande, createPizzeria } from "./lib/pizzeria.js";
 import {
@@ -111,6 +112,10 @@ const AU_REVOIR_ETENDU_RE = new RegExp(AU_REVOIR_RE.source + "|à tout à l'heur
 // Numeros de test (Dany, 17/09/2026) : couper tout le recap pendant une recette ferait perdre les vrais appels du
 // moment ; seuls les numeros listes ici (E.164, separes par des virgules) n'en envoient pas.
 const RECAP_EXCLURE = new Set((process.env.RECAP_EXCLURE || "").split(",").map((n) => n.replace(/[^\d+]/g, "")).filter(Boolean));
+// Une ligne par agence (Motralec : Herblay, Sevres, Etrechy), un seul agent. AGENCES_JSON = {"+33...":{"nom":"Sèvres"}} :
+// le numero appele dit a Dany de quelle agence il s'agit et part au recap (`appele`, `agence`). Absente : comme avant.
+const AGENCES = lireAgences(process.env.AGENCES_JSON);
+if (AGENCES.size) console.log(`[agences] ${AGENCES.size} ligne(s) : ${[...AGENCES].map(([n, a]) => `${a.nom} ${n}`).join(", ")}`);
 // Tout appel doit laisser une trace chez Motralec (demande de Damien, 24/09/2026) : celui qui raccroche sans parler
 // part aussi, en « appel en absence ». Coupe par defaut : Palazzo n'en veut pas.
 const RECAP_APPEL_EN_ABSENCE = process.env.RECAP_APPEL_EN_ABSENCE === "1";
@@ -2285,6 +2290,7 @@ wss.on("connection", (twilio, requete) => {
         : "";
       const contexte = [
         profilLocal ? pizzeria.contexteAppel() : "",
+        consigneAgence(agenceDeLigne(AGENCES, toNumber)),
         callerFr ? `Le client appelle depuis le numéro ${callerFr}. Quand tu lui relis ce numéro à voix, tu prononces EXACTEMENT ceci, mot pour mot, sans le recalculer ni changer un seul groupe : « ${callerSpoken} ». C'est son numéro de rappel par défaut, tu le connais déjà.` : "",
         carteAjoutee,
         "Au téléphone, un silence de ta part laisse le client dans le vide. Ne termine jamais une réponse sur une simple confirmation (« Oui, vingt-deux heures est possible. ») : enchaîne dans la même réponse sur l'étape suivante, par une question. Seul l'au revoir final ne pose pas de question.",
@@ -2312,7 +2318,7 @@ wss.on("connection", (twilio, requete) => {
       // envoyait toujours GROK_REASONING (defaut "high") : un agent regle sur « Rapide » dans l'onglet
       // Voix (Palazzo) reflechissait quand meme avant chaque reponse, d'ou la latence remontee par Jacky.
       const effort = sessionDV?.reasoning === "none" || sessionDV?.reasoning === "high" ? sessionDV.reasoning : GROK_REASONING;
-      console.log(`[session] cerveau=${CERVEAU_ELEVEN ? "eleven" : CERVEAU_OPENAI ? "openai" : "grok"} modele=${modele} reflexion=${effort} tours=${TOURS_PAR_LE_PONT ? "pont fin_de_tour=" + finDeTourMs + "ms" : "grok seuil=" + seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} carte=${carteAjoutee ? "ajoutee" : "non"} anticipation=${ANTICIPATION_MS}ms doublure=${HEDGE_APRES_MS ? HEDGE_APRES_MS + "ms" : "non"} ambiance=${ambiance ? ambiance.libelle : "non"} lecture=${lectureActive() ? "elevenlabs" : "grok"} fin_de_tour=${eot ? "modele seuil=" + EOT_SEUIL + " delai=" + EOT_DELAI_MS + "ms filet=" + finDeTourMs + "ms" : "silence seul"} ${t()} sid=${callSid}`);
+      console.log(`[session] agence=${agenceDeLigne(AGENCES, toNumber)?.nom || "-"} cerveau=${CERVEAU_ELEVEN ? "eleven" : CERVEAU_OPENAI ? "openai" : "grok"} modele=${modele} reflexion=${effort} tours=${TOURS_PAR_LE_PONT ? "pont fin_de_tour=" + finDeTourMs + "ms" : "grok seuil=" + seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} carte=${carteAjoutee ? "ajoutee" : "non"} anticipation=${ANTICIPATION_MS}ms doublure=${HEDGE_APRES_MS ? HEDGE_APRES_MS + "ms" : "non"} ambiance=${ambiance ? ambiance.libelle : "non"} lecture=${lectureActive() ? "elevenlabs" : "grok"} fin_de_tour=${eot ? "modele seuil=" + EOT_SEUIL + " delai=" + EOT_DELAI_MS + "ms filet=" + finDeTourMs + "ms" : "silence seul"} ${t()} sid=${callSid}`);
       if (CERVEAU_ELEVEN) {
         // Le modele parle lui-meme (mu-law 8 kHz). Consigne et outils par session.update, accepte des l'ouverture.
         sessionOpenAI = { instructions: sessionInstructions, outils };
@@ -3147,6 +3153,7 @@ wss.on("connection", (twilio, requete) => {
       // Duree et heure de debut pour TOUS les appels : les deux mails (message laisse, appel en absence) partagent
       // le meme gabarit, avec « Quand » et « Durée » (demande de Damien, 01/10/2026).
       Object.assign(payload, { duree_s: Math.round((Date.now() - debutAppelMs) / 1000), debut: new Date(debutAppelMs).toISOString() });
+      Object.assign(payload, champsAppelee(AGENCES, toNumber)); // quelle ligne a ete appelee : n8n choisit l'intitule et la couleur
       if (!hasClient) payload.sans_parole = true;
       const ok = await postRecap(payload, 4); // essais immediats au raccrochage : 1s, 2s, 4s, 8s
       if (ok) console.log(`[recap] ${hasClient ? "envoye" : "appel en absence envoye"} a n8n sid=${callSid}`);
