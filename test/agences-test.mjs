@@ -47,6 +47,9 @@ const c = consigneAgence({ nom: "Étrechy" });
 ok(/Agence appelée par ce client : Étrechy\./.test(c), "la consigne nomme l'agence appelee");
 ok(/sans nommer d'agence/.test(c) && /tu ne cites les autres que si on te les demande/.test(c), "la consigne regle le cas « l'agence » sans nom et garde les autres agences en retrait");
 ok(/tu restes Dany, de Motralec/.test(c), "la consigne ne change ni le nom ni l'accueil");
+// Le prompt dit « Localisation 92 ou 91 : tu peux mentionner une agence proche, a Sevres ou a Etrechy » : sur la ligne de
+// Sevres, il ne doit jamais proposer Sevres comme « proche » (relecture du 29/10/2026).
+ok(/ne lui présente jamais comme « proche » ou « autre » l'agence qu'il vient d'appeler/.test(c) && /ne lui propose pas d'autre agence de toi-même/.test(c), "la consigne coupe la phrase du prompt « une agence proche, à Sèvres » pour l'agence appelée");
 ok(!/\d\s?h|\bheures?\b/i.test(c), "aucun horaire dans la consigne (ils vivent dans le prompt)");
 ok(!c.includes(CADRATIN), "pas de tiret cadratin");
 ok(consigneAgence(null) === "" && consigneAgence({}) === "", "sans agence : chaine vide, rien n'est ajoute au contexte de l'appel");
@@ -54,7 +57,7 @@ ok(consigneAgence(null) === "" && consigneAgence({}) === "", "sans agence : chai
 // champsAppelee : ce qui part au recap n8n
 ok(JSON.stringify(champsAppelee(table, "+33123456789")) === JSON.stringify({ appele: "+33123456789", agence: "Sèvres" }), "ligne connue : appele et agence");
 ok(JSON.stringify(champsAppelee(table, "+33600000000")) === JSON.stringify({ appele: "+33600000000" }), "ligne inconnue : appele seul (n8n decide, il ne reçoit pas un faux nom)");
-ok(JSON.stringify(champsAppelee(new Map(), "+33939241266")) === JSON.stringify({ appele: "+33939241266" }), "sans table : appele seul, comme avant la variable");
+ok(JSON.stringify(champsAppelee(new Map(), "+33939241266")) === JSON.stringify({ appele: "+33939241266" }), "sans table : appele seul (n8n le lisait deja, repli Herblay), jamais agence");
 ok(JSON.stringify(champsAppelee(table, null)) === "{}" && JSON.stringify(champsAppelee(table, "")) === "{}", "pas de numero appele : aucun champ ajoute");
 
 console.log(`\n${n} verifications`);
