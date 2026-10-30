@@ -781,7 +781,7 @@ const server = http.createServer((req, res) => {
       const sid = query.get("appel") || post.CallSid || "";
       const entree = registreTransferts.lire(sid);
       let authToken = entree?.authToken || null;
-      if (!authToken && dalevozActif && post.To) authToken = (await resoudreNumero(post.To)).canal?.authToken || null;
+      if (!authToken && dalevozActif && post.To) authToken = (await resoudreNumero(post.To, { reprise: true })).canal?.authToken || null;
       if (!authToken && TWILIO_LOCAL) authToken = TWILIO_LOCAL.authToken;
       const signatureOk = authToken
         ? signatureTwilioValide({ authToken, url: `https://${req.headers.host}${req.url}`, params: post, signature: req.headers["x-twilio-signature"] || "" })
@@ -2169,7 +2169,7 @@ wss.on("connection", (twilio, requete) => {
     // sinon le pont garde sa configuration locale (prompt en fichier), ce qui
     // fait tourner Motralec et Palazzo tant que leur numéro n'est pas branché.
     if (dalevozActif && toNumber) {
-      canalDV = (await resoudreNumero(toNumber)).canal ?? null;
+      canalDV = (await resoudreNumero(toNumber, { reprise: true })).canal ?? null; // appel deja admis par /twiml : jamais refuse ici
       if (canalDV) {
         sessionDV = await chargerSession({
           tenantId: canalDV.tenantId,
