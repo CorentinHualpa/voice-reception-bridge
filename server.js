@@ -726,6 +726,15 @@ const server = http.createServer((req, res) => {
           res.end(`<?xml version="1.0" encoding="UTF-8"?><Response><Say language="fr-FR">Ce numéro n'est pas configuré.</Say><Hangup/></Response>`);
           return;
         }
+        // Espace sans credits : une phrase, puis on raccroche, sans ouvrir de session vocale.
+        if (r.refus) {
+          const langue = { fr: "fr-FR", es: "es-ES", en: "en-US" }[r.refus.locale] || "fr-FR";
+          const phrase = r.refus.message || "Ce service n'est pas disponible pour le moment. Merci de rappeler plus tard.";
+          console.error(`[twiml] credits epuises, appel refuse sid=${callSid} to=${to}`);
+          res.writeHead(200, { "Content-Type": "text/xml" });
+          res.end(`<?xml version="1.0" encoding="UTF-8"?><Response><Say language="${langue}">${escHtml(phrase)}</Say><Hangup/></Response>`);
+          return;
+        }
         // Plateforme injoignable : on decroche quand meme, sur la config locale.
         // Une panne de la console ne doit pas faire taire les numeros branches.
         if (r.canal) {
