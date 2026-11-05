@@ -41,6 +41,8 @@ ok(sansBalisesEleven("Je note. [friendly] Pourriez-vous me donner votre adresse 
 ok(sansBalisesEleven("Bonjour ! Je suis Dany. [happy] Je peux") === "Bonjour ! Je suis Dany. Je peux", "balise [happy] retiree");
 ok(sansBalisesEleven("L, A, [deux] L") === "L, A, L", "crochets d'un seul mot retires aussi (aucune epellation ne les utilise)");
 ok(sansBalisesEleven("Le tableau [1] suffit") === "Le tableau [1] suffit", "crochets avec un chiffre conserves");
+ok(sansBalisesEleven("[Désolé] Je suis bien là.").trim() === "Je suis bien là.", "balise accentuee retiree (appel du 05/11/2026)");
+ok(sansBalisesEleven("Très bien. [d'un ton posé] Votre nom ?") === "Très bien. Votre nom ?", "balise francaise avec apostrophe retiree");
 ok(sansBalisesEleven("Je vais chiffrer votre commande. [chiffrer_commande]") === "Je vais chiffrer votre commande. ", "nom d'outil ecrit entre crochets retire");
 ok(sansBalisesEleven("[heure_souhaitee]\nJe note deux Regina.").trim() === "Je note deux Regina.", "argument d'outil ecrit entre crochets retire");
 

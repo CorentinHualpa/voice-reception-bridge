@@ -1477,6 +1477,9 @@ wss.on("connection", (twilio, requete) => {
     // gardent le dialogue (console, recap) et, plus bas, l'historique du modele.
     const relectureJetee = relectureRemplacee === respSeq ? agentBuf.trim() : "";
     if (relectureJetee) agentBuf = texteRemplace;
+    // Le filtre des balises passe aussi sur la reponse ENTIERE : une balise coupee entre deux morceaux du flux
+    // (« [Dés » puis « olé] ») echappe au filtre applique morceau par morceau.
+    agentBuf = sansBalises(agentBuf).replace(/^\s+/, "");
     if (agentBuf.trim()) consommerEntreeClient();
     const texteReponse = agentBuf;
     // Eleven : l'au revoir a-t-il ete dit en ENTIER (voir end_call dans executerOutils) ? Un au revoir coupe par le client ne compte pas.
