@@ -50,7 +50,15 @@ ok(/tu restes Dany, de Motralec/.test(c), "la consigne ne change ni le nom ni l'
 // Le prompt dit « Localisation 92 ou 91 : tu peux mentionner une agence proche, a Sevres ou a Etrechy » : sur la ligne de
 // Sevres, il ne doit jamais proposer Sevres comme « proche » (relecture du 29/10/2026).
 ok(/ne lui présente jamais comme « proche » ou « autre » l'agence qu'il vient d'appeler/.test(c) && /ne lui propose pas d'autre agence de toi-même/.test(c), "la consigne coupe la phrase du prompt « une agence proche, à Sèvres » pour l'agence appelée");
-ok(!/\d\s?h|\bheures?\b/i.test(c), "aucun horaire dans la consigne (ils vivent dans le prompt)");
+ok(!/\d\s?h|\bheures?\b/i.test(c), "sans horaires dans la table : aucun horaire dans la consigne");
+
+// Horaires dans la table (05/11/2026 : sur la ligne d'Etrechy, Dany donnait ceux d'Herblay)
+const tableH = lireAgences(JSON.stringify({ "+33198765432": { nom: "Étrechy", horaires: "du lundi au vendredi, 8h-12h et 13h30-17h" } }), muet);
+const ch = consigneAgence(agenceDeLigne(tableH, "+33198765432"));
+ok(ch.includes("Horaires de cette agence : du lundi au vendredi, 8h-12h et 13h30-17h.") && /SEULS horaires/.test(ch), "horaires de la table ecrits dans la consigne");
+ok(lireAgences(JSON.stringify({ "+33198765432": { nom: "Étrechy", horaires: 42 } }), muet).get("+33198765432").horaires === undefined, "horaires qui ne sont pas du texte : ignores");
+ok(JSON.stringify(champsAppelee(tableH, "+33198765432")) === JSON.stringify({ appele: "+33198765432", agence: "Étrechy" }), "les horaires ne partent pas au recap");
+ok(!ch.includes(CADRATIN), "consigne avec horaires : pas de tiret cadratin");
 ok(!c.includes(CADRATIN), "pas de tiret cadratin");
 ok(consigneAgence(null) === "" && consigneAgence({}) === "", "sans agence : chaine vide, rien n'est ajoute au contexte de l'appel");
 
