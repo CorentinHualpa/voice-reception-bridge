@@ -66,7 +66,8 @@ for (const [service, attendu] of [[eleven, "eleven"], [grokService, "grok"], [op
 // Lecture de l'appel.
 {
   const ligne = envLectureDeLAppel(env, null, "es");
-  ok(ligne.ELEVEN_VOIX === env.ELEVEN_VOIX && ligne.ELEVEN_BALISE === "[warm]" && ligne.ELEVEN_LANGUE === "es", "voix de la ligne : celle du service, sa balise, la langue de l'agent");
+  ok(ligne.ELEVEN_VOIX === env.ELEVEN_VOIX && ligne.ELEVEN_BALISE === "[warm]" && ligne.ELEVEN_LANGUE === undefined, "voix de la ligne : celle du service, sa balise ; service sans langue imposee : on n'en ajoute pas");
+  ok(envLectureDeLAppel({ ...env, ELEVEN_LANGUE: "fr" }, null, "es").ELEVEN_LANGUE === "es", "service qui impose une langue : celle de l'agent la remplace");
   const meme = envLectureDeLAppel(env, env.ELEVEN_VOIX);
   ok(meme.ELEVEN_BALISE === "[warm]" && meme.LECTURE === "elevenlabs", "meme voix que le service : la balise reste");
   const autre = envLectureDeLAppel(env, JADE);
