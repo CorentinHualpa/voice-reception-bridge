@@ -46,8 +46,9 @@ import { jetonEleven, urlRealtimeEleven, sansBalisesEleven, creerPartNouvelle } 
 import { PARASITE_RE, peutEtreParasite } from "./lib/parasite.js";
 import { estRelecture, estQuestionEmail, partSure, parleDeLaVille } from "./lib/relecture.js";
 import { configLectureEleven, creerLectureEleven } from "./lib/lecture-eleven.js";
+import { envLectureDeLAppel, moteurDeLAppel } from "./lib/moteur-appel.js";
 import { saluerSelonHeure } from "./lib/accueil.js";
-import { creerGardeCredits } from "./lib/garde-credits.js";
+import { creerGardeCredits, lireSolde } from "./lib/garde-credits.js";
 import { creerFinDeTour } from "./lib/fin-de-tour.mjs";
 import { OUTILS_DE_COMMANDE, consigneClotureCommande, createPizzeria } from "./lib/pizzeria.js";
 import {
@@ -93,6 +94,7 @@ const GROK_SPEED = Number(process.env.GROK_SPEED || 1.0);          // vitesse de
 const GROK_VAD_THRESHOLD = Number(process.env.GROK_VAD_THRESHOLD || 0.6); // reactivite VAD (0.1..0.9 ; plus bas = plus sensible)
 const GROK_REASONING = process.env.GROK_REASONING || "high";       // "high" = profond, "none" = rapide
 const AGENT_LANG = process.env.AGENT_LANG || "fr";
+const AGENT_LANG_SERVICE = AGENT_LANG; // chaque appel la remplace par la langue de la session de son agent
 const AGENT_NAME = process.env.AGENT_NAME || "Dany";
 const BUSINESS_NAME = process.env.BUSINESS_NAME || "l'entreprise";
 const BUSINESS_DESC = process.env.BUSINESS_DESC || "";
@@ -173,7 +175,8 @@ const RELANCE_SUITE_MS = Number(process.env.RELANCE_SUITE_MS || 2500); // silenc
 // ⚠ CERVEAU=eleven : anticipation COUPEE par defaut (20/10/2026). Eleven Realtime ne sait pas effacer un element
 // (conversation.item.delete : not_implemented) et, apres un response.cancel en vol, relance de lui-meme une reponse
 // qui reste ouverte (« Conversation already has an active response »). ANTICIPATION_MS=250 reste possible pour mesurer.
-const ANTICIPATION_MS = Number(process.env.ANTICIPATION_MS ?? ((process.env.CERVEAU || "").toLowerCase() === "eleven" ? 0 : 250));
+// Depuis le 07/11/2026 le moteur se decide PAR APPEL (voir lib/moteur-appel.js) : la valeur se calcule pour le moteur de l'appel.
+const anticipationMs = (eleven) => Number(process.env.ANTICIPATION_MS ?? (eleven ? 0 : 250));
 const JOURNAL_GROK = process.env.JOURNAL_GROK === "1";
 // ATTENDRE LE TEXTE DU CLIENT (09/10/2026). Grok repond a partir de la TRANSCRIPTION de la phrase, pas du son, et il
 // REPOND DE LUI-MEME a chaque tampon envoye, meme avec turn_detection a null (banc : aucun response.create, deux
@@ -204,7 +207,7 @@ const ANNULATION_VOIX_MS = 150; // voix du client apres le lancement qui annule 
 // (51 tours mesures) : au-dela de REPONSE_IGNOREE_MS, la demande est perdue.
 // ⚠ CERVEAU=eleven : response.created n'arrive qu'APRES la transcription de la phrase (cascade), 0,3 a 1,5 s apres le commit
 // (email epele de 6 s : au-dela de 1 s au banc du 20/10, le pont croyait la demande perdue et relachait la voix). 4 s.
-const REPONSE_IGNOREE_MS = Number(process.env.REPONSE_IGNOREE_MS || ((process.env.CERVEAU || "").toLowerCase() === "eleven" ? 4000 : 1000));
+const reponseIgnoreeMs = (eleven) => Number(process.env.REPONSE_IGNOREE_MS || (eleven ? 4000 : 1000)); // par appel, comme anticipationMs
 // « MMM » D'ATTENTE (17/09/2026, choix de Coq). Une reponse sur cinq, Grok met 2,7 a 3,7 s a parler (cote xAI,
 // hors de portee du pont) : le client entend un blanc. Quand rien n'est encore joue MMM_APRES_MS apres la fin de sa
 // phrase et qu'une reponse est en route, l'agent fait « Mmm… » dans sa propre voix (Grok TTS, rendu en mu-law 8 kHz,
@@ -300,7 +303,8 @@ if (RELECTURE_UNIQUE) console.log(`[relecture] une seule relecture de l'email${L
 // LECTURE=elevenlabs et OPENAI_API_KEY ; sinon Grok. Reglages : OPENAI_REALTIME_MODEL (gpt-realtime),
 // OPENAI_TRANSCRIPTION (gpt-4o-mini-transcribe), OPENAI_VOIX (marin : voix de secours si ElevenLabs tombe).
 // Retour arriere sans code : CERVEAU=grok.
-const CERVEAU_OPENAI = (process.env.CERVEAU || "grok").toLowerCase() === "openai" && Boolean(LECTURE_ELEVEN) && Boolean(process.env.OPENAI_API_KEY);
+// Le moteur DU SERVICE : celui d'un appel dont l'agent Dale Voz n'a choisi aucun cran (07/11/2026, lib/moteur-appel.js).
+const CERVEAU_OPENAI_SERVICE = (process.env.CERVEAU || "grok").toLowerCase() === "openai" && Boolean(LECTURE_ELEVEN) && Boolean(process.env.OPENAI_API_KEY);
 const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime";
 const OPENAI_TRANSCRIPTION = process.env.OPENAI_TRANSCRIPTION || "gpt-4o-mini-transcribe";
 // Consigne de la transcription (05/10/2026). Sans elle, gpt-4o-mini-transcribe a saute tout un email epele au
@@ -326,18 +330,19 @@ const OPENAI_VOIX = process.env.OPENAI_VOIX || "marin";
 // Tours decides par le pont (turn_detection null : server_vad n'existe pas chez Eleven). Reglages : ELEVEN_REALTIME_MODEL,
 // ELEVEN_REALTIME_VOIX (id de voix de la bibliotheque ou d'un clone), ELEVEN_REALTIME_DUREE_S (600 par defaut chez Eleven).
 // Retour arriere sans code : CERVEAU=grok. N'est PAS le defaut.
-const CERVEAU_ELEVEN = (process.env.CERVEAU || "grok").toLowerCase() === "eleven" && Boolean(process.env.ELEVENLABS_API_KEY);
+const CERVEAU_ELEVEN_SERVICE = (process.env.CERVEAU || "grok").toLowerCase() === "eleven" && Boolean(process.env.ELEVENLABS_API_KEY);
 const ELEVEN_REALTIME_MODEL = process.env.ELEVEN_REALTIME_MODEL || "eleven_realtime_v1_max";
 const ELEVEN_REALTIME_VOIX = process.env.ELEVEN_REALTIME_VOIX || "brian";
 const ELEVEN_REALTIME_DUREE_S = Number(process.env.ELEVEN_REALTIME_DUREE_S || 1800);
 const ELEVEN_REALTIME_URL = process.env.ELEVEN_REALTIME_URL || "https://api.elevenlabs.io";
-if ((process.env.CERVEAU || "").toLowerCase() === "eleven" && !CERVEAU_ELEVEN) console.error("[cerveau] CERVEAU=eleven exige ELEVENLABS_API_KEY : Grok conserve");
+if ((process.env.CERVEAU || "").toLowerCase() === "eleven" && !CERVEAU_ELEVEN_SERVICE) console.error("[cerveau] CERVEAU=eleven exige ELEVENLABS_API_KEY : Grok conserve");
 // Les deux moteurs a protocole OpenAI (OpenAI Realtime, Eleven Realtime) partagent leurs reglages : audio mu-law en entree
 // comme en sortie, message du client cree au commit, reponse demandee par le pont sans attendre de texte.
-const MOTEUR_COMPAT = CERVEAU_OPENAI || CERVEAU_ELEVEN;
+// (MOTEUR_COMPAT et sansBalises vivent desormais dans chaque appel : le moteur se decide par appel.)
 // Session Eleven : `tools` DEJA a la forme OpenAI (type function). `complet` = avec la consigne et les outils (jeton de la
 // doublure, qui n'a pas de session.update a faire), sinon le strict necessaire pour obtenir un jeton.
-function configSessionEleven({ instructions = "", tools = [], modele = ELEVEN_REALTIME_MODEL, jeton = false } = {}) {
+// `voix` et `langue` : celles de l'appel (voix choisie pour l'agent dans Dale Voz, langue de sa session).
+function configSessionEleven({ instructions = "", tools = [], modele = ELEVEN_REALTIME_MODEL, jeton = false, voix = ELEVEN_REALTIME_VOIX, langue = AGENT_LANG } = {}) {
   return {
     type: "realtime",
     ...(jeton ? { model: modele, max_duration_seconds: ELEVEN_REALTIME_DUREE_S } : {}),
@@ -345,16 +350,30 @@ function configSessionEleven({ instructions = "", tools = [], modele = ELEVEN_RE
     ...(tools.length ? { tools, tool_choice: "auto" } : {}),
     output_modalities: ["audio"],
     audio: {
-      input: { format: { type: "audio/pcmu", rate: 8000 }, transcription: { language: AGENT_LANG }, turn_detection: null },
-      output: { format: { type: "audio/pcmu" }, voice: ELEVEN_REALTIME_VOIX },
+      input: { format: { type: "audio/pcmu", rate: 8000 }, transcription: { language: langue }, turn_detection: null },
+      output: { format: { type: "audio/pcmu" }, voice: voix },
     },
   };
 }
-// Eleven Realtime glisse des balises de jeu dans le texte de ses reponses (« [friendly] Pourriez-vous... ») : elles
-// n'appartiennent ni au dialogue, ni au recap, ni aux detecteurs de phrase.
-const sansBalises = (s) => (CERVEAU_ELEVEN ? sansBalisesEleven(s) : s);
-if ((process.env.CERVEAU || "").toLowerCase() === "openai" && !CERVEAU_OPENAI) console.error("[cerveau] CERVEAU=openai exige LECTURE=elevenlabs et OPENAI_API_KEY : Grok conserve");
-console.log(`[cerveau] ${CERVEAU_ELEVEN ? `Eleven Realtime ${ELEVEN_REALTIME_MODEL}, voix ${ELEVEN_REALTIME_VOIX}, audio mu-law de bout en bout` : CERVEAU_OPENAI ? `OpenAI ${OPENAI_REALTIME_MODEL}, sortie texte, transcription ${OPENAI_TRANSCRIPTION}${OPENAI_TRANSCRIPTION_PROMPT ? " avec consigne" : ""}` : "Grok"}`);
+// LE SOLDE ELEVENLABS POUR LES CHOIX PAR AGENT (07/11/2026). Le garde-fou de lib/garde-credits.js ne surveille qu'un
+// service en CERVEAU=eleven et basculait par l'API Railway, resiliee : un agent en Naturelle ou Reactive n'etait plus
+// protege du tout. Ici, le solde est relu au plus toutes les 10 min, en arriere-plan (un appel n'attend jamais), et
+// moteurDeLAppel passe en Grok sous GARDE_CREDITS_SEUIL (5000 caracteres par defaut). Inconnu : aucun repli.
+const soldeEleven = { valeur: null, le: 0, enCours: false };
+function soldeElevenAvecCache() {
+  const cle = process.env.ELEVENLABS_API_KEY;
+  if (cle && !soldeEleven.enCours && Date.now() - soldeEleven.le > 10 * 60 * 1000) {
+    soldeEleven.enCours = true;
+    lireSolde({ cle })
+      .then((s) => { soldeEleven.valeur = s.reste; })
+      .catch((e) => console.error(`[garde] solde ElevenLabs illisible : ${e.message}`))
+      .finally(() => { soldeEleven.le = Date.now(); soldeEleven.enCours = false; });
+  }
+  return soldeEleven.valeur;
+}
+soldeElevenAvecCache(); // premiere lecture au demarrage : le premier appel a deja un solde
+if ((process.env.CERVEAU || "").toLowerCase() === "openai" && !CERVEAU_OPENAI_SERVICE) console.error("[cerveau] CERVEAU=openai exige LECTURE=elevenlabs et OPENAI_API_KEY : Grok conserve");
+console.log(`[cerveau] service : ${CERVEAU_ELEVEN_SERVICE ? `Eleven Realtime ${ELEVEN_REALTIME_MODEL}, voix ${ELEVEN_REALTIME_VOIX}, audio mu-law de bout en bout` : CERVEAU_OPENAI_SERVICE ? `OpenAI ${OPENAI_REALTIME_MODEL}, sortie texte, transcription ${OPENAI_TRANSCRIPTION}${OPENAI_TRANSCRIPTION_PROMPT ? " avec consigne" : ""}` : "Grok"}`);
 console.log(`[lecture] ${LECTURE_ELEVEN ? `ElevenLabs voix=${LECTURE_ELEVEN.voix} modele=${LECTURE_ELEVEN.modele} balise=${LECTURE_ELEVEN.balise ? `« ${LECTURE_ELEVEN.balise} »` : "aucune"}` : "voix de Grok"}`);
 // Accueil fixe (ACCUEIL_TEXTE, pont sans Dale Voz comme Dany) : synthetise des le demarrage, pour que le premier
 // appel apres un redeploiement ne paie pas ~2 s de synthese au decroche (mesure au banc de Dany, 01/10/2026).
@@ -871,6 +890,23 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server, path: "/twilio" });
 
 wss.on("connection", (twilio, requete) => {
+  // LE MOTEUR DE CET APPEL (07/11/2026, lib/moteur-appel.js) : celui du service (CERVEAU) jusqu'a ce que l'agent Dale
+  // Voz soit connu, puis celui que l'agent a choisi dans la console (`sessionDV.oral`), voir appliquerMoteurDeLAgent.
+  // Memes noms que les anciennes constantes du module : tout le code de l'appel suit le moteur de l'appel.
+  let CERVEAU_ELEVEN = CERVEAU_ELEVEN_SERVICE;
+  let CERVEAU_OPENAI = CERVEAU_OPENAI_SERVICE;
+  let MOTEUR_COMPAT = CERVEAU_OPENAI || CERVEAU_ELEVEN;
+  let ANTICIPATION_MS = anticipationMs(CERVEAU_ELEVEN);
+  let REPONSE_IGNOREE_MS = reponseIgnoreeMs(CERVEAU_ELEVEN);
+  let voixElevenAppel = ELEVEN_REALTIME_VOIX;   // voix d'Eleven Realtime (Naturelle)
+  let modeleElevenAppel = ELEVEN_REALTIME_MODEL;
+  let modeleOpenaiAppel = OPENAI_REALTIME_MODEL;
+  let AGENT_LANG = AGENT_LANG_SERVICE;          // langue de transcription : celle de la session de l'agent
+  // Eleven Realtime glisse des balises de jeu dans le texte de ses reponses (« [friendly] Pourriez-vous... ») : elles
+  // n'appartiennent ni au dialogue, ni au recap, ni aux detecteurs de phrase.
+  const sansBalises = (s) => (CERVEAU_ELEVEN ? sansBalisesEleven(s) : s);
+  // La session Eleven de CET appel : modele, voix et langue de l'agent quand il les a choisis.
+  const sessionEleven = (o = {}) => configSessionEleven({ modele: modeleElevenAppel, voix: voixElevenAppel, langue: AGENT_LANG, ...o });
   const hotePont = requete?.headers?.host || ""; // pour l'adresse de fin de transfert
   let streamSid = null;
   let callSid = null;
@@ -997,10 +1033,47 @@ wss.on("connection", (twilio, requete) => {
   let finDoublureEnAttente = null;          // fin du tour de la doublure, en attente de la primaire soldee
   // Lecture ElevenLabs (voir LECTURE_ELEVEN) : un flux par reponse, pour la primaire et pour la doublure. La voix
   // de Grok est gardee de cote pendant la reponse en cours, pour le secours (`lectureEnEchec`).
-  const lecture = LECTURE_ELEVEN && !CERVEAU_ELEVEN ? creerLectureEleven(LECTURE_ELEVEN, { log: (m) => console.log(`${m.trimEnd()} ${t()} sid=${callSid}`) }) : null;
+  // `let` depuis le 07/11/2026 : refaites par appliquerMoteurDeLAgent quand l'agent a choisi son moteur et sa voix.
+  const journalLecture = { log: (m) => console.log(`${m.trimEnd()} ${t()} sid=${callSid}`) };
+  let lecture = LECTURE_ELEVEN && !CERVEAU_ELEVEN ? creerLectureEleven(LECTURE_ELEVEN, journalLecture) : null;
   // CERVEAU=eleven : le modele parle lui-meme, mais sa session met ~5 s a etre prete (session.update de la consigne). Avec
   // LECTURE=elevenlabs, la synthese ElevenLabs ne sert QU'A L'ACCUEIL (pre-enregistre, voir lancerAccueilEnregistre).
-  const lectureAccueil = CERVEAU_ELEVEN && LECTURE_ELEVEN ? creerLectureEleven(LECTURE_ELEVEN, { log: (m) => console.log(`${m.trimEnd()} ${t()} sid=${callSid}`) }) : null;
+  let lectureAccueil = CERVEAU_ELEVEN && LECTURE_ELEVEN ? creerLectureEleven(LECTURE_ELEVEN, journalLecture) : null;
+  // Le moteur et la voix choisis pour l'agent dans Dale Voz (`sessionDV.oral`), appliques des que la session est lue,
+  // avant l'accueil et le jeton. Sans choix : rien ne change, le service decide (CERVEAU).
+  function appliquerMoteurDeLAgent() {
+    const m = moteurDeLAppel({
+      oral: sessionDV?.oral,
+      service: { eleven: CERVEAU_ELEVEN_SERVICE, openai: CERVEAU_OPENAI_SERVICE },
+      env: process.env,
+      soldeEleven: soldeElevenAvecCache(),
+    });
+    if (m.source === "service") return;
+    if (m.raison) console.error(`[cerveau] choix de l'agent non suivi (${m.raison}) : Grok pour cet appel ${t()} sid=${callSid}`);
+    const langue = typeof sessionDV?.locale === "string" && /^[a-z]{2}/i.test(sessionDV.locale) ? sessionDV.locale.slice(0, 2).toLowerCase() : null;
+    // Voix `null` = celle de la ligne (envLectureDeLAppel retombe sur ELEVEN_VOIX du service).
+    const cfg = m.famille === "grok" ? null : configLectureEleven(envLectureDeLAppel(process.env, m.famille === "eleven" ? m.voixEleven : m.voixLecture, langue));
+    CERVEAU_ELEVEN = m.famille === "eleven";
+    CERVEAU_OPENAI = m.famille === "openai" && Boolean(cfg); // OpenAI ne parle qu'avec sa lecture ElevenLabs
+    MOTEUR_COMPAT = CERVEAU_ELEVEN || CERVEAU_OPENAI;
+    ANTICIPATION_MS = anticipationMs(CERVEAU_ELEVEN);
+    REPONSE_IGNOREE_MS = reponseIgnoreeMs(CERVEAU_ELEVEN);
+    if (langue) AGENT_LANG = langue;
+    if (CERVEAU_ELEVEN) { if (m.voixEleven) voixElevenAppel = m.voixEleven; if (m.modele) modeleElevenAppel = m.modele; }
+    if (CERVEAU_OPENAI) modeleOpenaiAppel = m.modele;
+    lecture = cfg && !CERVEAU_ELEVEN ? creerLectureEleven(cfg, journalLecture) : null;
+    lectureAccueil = cfg && CERVEAU_ELEVEN ? creerLectureEleven(cfg, journalLecture) : null;
+    console.log(`[cerveau] appel : ${CERVEAU_ELEVEN ? `eleven ${modeleElevenAppel} voix ${voixElevenAppel}` : CERVEAU_OPENAI ? `openai ${modeleOpenaiAppel} lu par ${cfg?.voix}` : "grok"} (choisi pour l'agent${m.raison ? ", repli" : ""}) langue ${AGENT_LANG} ${t()} sid=${callSid}`);
+  }
+  // Eleven injoignable a l'ouverture (jeton refuse) : l'appel part sur Grok au lieu de rester muet.
+  function basculerSurGrok() {
+    CERVEAU_ELEVEN = false;
+    CERVEAU_OPENAI = false;
+    MOTEUR_COMPAT = false;
+    ANTICIPATION_MS = anticipationMs(false);
+    REPONSE_IGNOREE_MS = reponseIgnoreeMs(false);
+    lecture = null;
+  }
   let redireApresEchec = 0;                 // reponse ecrite par OpenAI dont ElevenLabs n'a rien dit (voir terminerReponse)
   let lectureEnEchec = false;              // ElevenLabs a lache sur cet appel : voix de Grok jusqu'a la fin
   let fluxPrimaire = null, fluxDoublure = null;
@@ -1707,8 +1780,8 @@ wss.on("connection", (twilio, requete) => {
       cle: XAI_API_KEY,
       modele,
       etiquette: `sid=${callSid}`,
-      eleven: CERVEAU_ELEVEN ? { cle: process.env.ELEVENLABS_API_KEY, base: ELEVEN_REALTIME_URL, session: configSessionEleven({ jeton: true }) } : null,
-      config: CERVEAU_ELEVEN ? configSessionEleven({ instructions: sessionInstructions, tools: outilsPourOpenAI(outils) }) : {
+      eleven: CERVEAU_ELEVEN ? { cle: process.env.ELEVENLABS_API_KEY, base: ELEVEN_REALTIME_URL, session: sessionEleven({ jeton: true }) } : null,
+      config: CERVEAU_ELEVEN ? sessionEleven({ instructions: sessionInstructions, tools: outilsPourOpenAI(outils) }) : {
         instructions: sessionInstructions,
         ...(outils.length ? { tools: outils, tool_choice: "auto" } : {}),
         voice: sessionDV?.voice || GROK_VOICE,
@@ -2190,6 +2263,8 @@ wss.on("connection", (twilio, requete) => {
         }
       }
     }
+    // Le moteur et la voix choisis pour l'agent (07/11/2026) : AVANT l'accueil enregistre et le jeton.
+    appliquerMoteurDeLAgent();
     // Le transfert vient de l'agent Dale Voz ; les variables du pont ne valent que pour un pont sans Dale Voz
     // (un reglage de canal appartient a l'agent, jamais au service qui decroche pour tous les clients).
     reglageT = reglageTransfert(sessionDV?.telephone, sessionDV ? {} : { numero: TRANSFERT_NUMERO, nom: TRANSFERT_NOM });
@@ -2206,12 +2281,14 @@ wss.on("connection", (twilio, requete) => {
     let token;
     if (CERVEAU_ELEVEN) { // jeton ephemere contre la cle ElevenLabs ; la consigne et les outils suivent par session.update
       try {
-        token = await jetonEleven({ cle: process.env.ELEVENLABS_API_KEY, base: ELEVEN_REALTIME_URL, session: configSessionEleven({ jeton: true }) });
+        token = await jetonEleven({ cle: process.env.ELEVENLABS_API_KEY, base: ELEVEN_REALTIME_URL, session: sessionEleven({ jeton: true }) });
       } catch (e) {
-        console.error(`[eleven] ${e.message} sid=${callSid}`);
-        return;
+        // Avant le 07/11/2026 : `return`, et l'appel restait MUET. Desormais Grok prend l'appel.
+        console.error(`[eleven] ${e.message} : repli sur Grok pour cet appel sid=${callSid}`);
+        basculerSurGrok();
       }
-    } else if (!CERVEAU_OPENAI) { // OpenAI s'ouvre cote serveur avec la cle, sans jeton ephemere
+    }
+    if (!CERVEAU_ELEVEN && !CERVEAU_OPENAI) { // OpenAI s'ouvre cote serveur avec la cle, sans jeton ephemere
       try {
         const tok = await fetch("https://api.x.ai/v1/realtime/client_secrets", {
           method: "POST",
@@ -2227,7 +2304,7 @@ wss.on("connection", (twilio, requete) => {
     }
 
     // Le modele, la vitesse et le seuil VAD viennent de l'onglet Voix de l'agent Dale Voz quand il y en a un.
-    const modele = CERVEAU_ELEVEN ? ELEVEN_REALTIME_MODEL : CERVEAU_OPENAI ? OPENAI_REALTIME_MODEL : GROK_MODEL_IMPOSE || sessionDV?.model || GROK_MODEL;
+    const modele = CERVEAU_ELEVEN ? modeleElevenAppel : CERVEAU_OPENAI ? modeleOpenaiAppel : GROK_MODEL_IMPOSE || sessionDV?.oral?.famille === "grok" && /^grok-voice/.test(sessionDV.oral.modele || "") && sessionDV.oral.modele || sessionDV?.model || GROK_MODEL;
     modeleAppel = modele;
     const vitesse = Number(sessionDV?.speed) || GROK_SPEED;
     const seuilVad = Number(sessionDV?.threshold) || GROK_VAD_THRESHOLD;
@@ -2304,7 +2381,7 @@ wss.on("connection", (twilio, requete) => {
       if (CERVEAU_ELEVEN) {
         // Le modele parle lui-meme (mu-law 8 kHz). Consigne et outils par session.update, accepte des l'ouverture.
         sessionOpenAI = { instructions: sessionInstructions, outils };
-        grok.send(JSON.stringify({ type: "session.update", session: configSessionEleven({ instructions: sessionInstructions, tools: outilsPourOpenAI(outils) }) }));
+        grok.send(JSON.stringify({ type: "session.update", session: sessionEleven({ instructions: sessionInstructions, tools: outilsPourOpenAI(outils) }) }));
         // Doublure : une seconde session Eleven, meme consigne, qui n'entend jamais le client (historique en texte).
         if (TOURS_PAR_LE_PONT && HEDGE_APRES_MS > 0) ouvrirDoublure({ modele, vitesse, effort, sessionInstructions, outils });
         return;
@@ -2565,7 +2642,7 @@ wss.on("connection", (twilio, requete) => {
           if (MOTEUR_COMPAT && !grokReady && /^session/.test(e.error?.param || "") && sessionOpenAI && !sessionOpenAIReessayee) {
             sessionOpenAIReessayee = true;
             console.error(`[cerveau] session refusee par OpenAI (${e.error?.message}) : renvoyee SANS outils ${t()} sid=${callSid}`);
-            grok.send(JSON.stringify({ type: "session.update", session: CERVEAU_ELEVEN ? configSessionEleven({ instructions: sessionOpenAI.instructions }) : configSessionOpenAI(sessionOpenAI.instructions, [], !lectureActive()) }));
+            grok.send(JSON.stringify({ type: "session.update", session: CERVEAU_ELEVEN ? sessionEleven({ instructions: sessionOpenAI.instructions }) : configSessionOpenAI(sessionOpenAI.instructions, [], !lectureActive()) }));
             break;
           }
           // Ignorees en silence jusqu'au 16/09/2026 : une erreur de Grok ne laissait aucune trace.
@@ -3100,7 +3177,7 @@ wss.on("connection", (twilio, requete) => {
         // Le moteur qui a parle : sans lui, Dale Voz comptait toute minute au prix de Grok (26/10/2026). La
         // lecture ElevenLabs ne s'ajoute qu'a un cerveau Grok (celle d'OpenAI est dans son tarif, Eleven parle seul).
         voix: {
-          modele: modeleAppel || (CERVEAU_ELEVEN ? ELEVEN_REALTIME_MODEL : CERVEAU_OPENAI ? OPENAI_REALTIME_MODEL : GROK_MODEL_IMPOSE || GROK_MODEL),
+          modele: modeleAppel || (CERVEAU_ELEVEN ? modeleElevenAppel : CERVEAU_OPENAI ? modeleOpenaiAppel : GROK_MODEL_IMPOSE || GROK_MODEL),
           doublure: doublureOuverte,
           lecture: !CERVEAU_ELEVEN && !CERVEAU_OPENAI && reponsesLues > 0,
         },
