@@ -48,6 +48,8 @@ const OUTILS_ETAPE = [
 let etape = "accueil";          // ce que sert session-config
 let configEnPanne = false;      // la relecture répond 500
 let catalogueEtapeVide = false; // l'étape n'a aucun outil
+let appelAbsent = false;        // plateforme d'avant le 07/11/2026 : /api/voice/appel répond 404
+const FIL = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 const dv = []; // requêtes reçues, dans l'ordre
 const plateforme = http.createServer((req, res) => {
   let corps = "";
@@ -58,6 +60,7 @@ const plateforme = http.createServer((req, res) => {
     dv.push({ chemin, url: req.url, corps: json, a: Date.now() });
     const rendre = (statut, o) => { res.writeHead(statut, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
     if (chemin === "/api/voice/telephone") return rendre(200, { tenantId: "t-1", agentSlug: "palazzo", locale: "fr" });
+    if (chemin === "/api/voice/appel") return appelAbsent ? rendre(404, {}) : rendre(200, { sessionId: FIL, cree: true });
     if (chemin === "/api/voice/session-config") {
       if (etape !== "accueil" && configEnPanne) return rendre(500, { error: "panne" });
       return rendre(200, etape === "accueil"
@@ -197,6 +200,35 @@ for (const cerveau of ["grok", "eleven"]) {
   } finally {
     await fin();
   }
+}
+
+{
+  const { journal, fin } = await appel({ cerveau: "grok" });
+  try {
+    await cas("grok : le fil de l'appel s'ouvre au décroché et suit la session, les relectures et les outils", async () => {
+      await jusqua(() => sortiesOutils().length >= 2, 15000, "deux résultats d'outils");
+      const ouv = dv.filter((r) => r.chemin === "/api/voice/appel");
+      assert.equal(ouv.length, 1, "une ouverture au décroché");
+      assert.equal(ouv[0].corps.appelId, "CA-banc");
+      assert.equal(ouv[0].corps.agent, "palazzo");
+      assert.ok(ouv[0].a <= configs()[0].a, "ouvert AVANT la première lecture de config");
+      assert.ok(configs().every((r) => r.url.includes(`session=${FIL}`)), "chaque lecture de config porte le fil");
+      const outils = dv.filter((r) => r.chemin === "/api/voice/tool");
+      assert.ok(outils.length >= 1 && outils.every((r) => r.corps.sessionId === FIL), "chaque outil porte le fil");
+    });
+  } catch (e) { console.log(journal.slice(-60).join(String.fromCharCode(10))); throw e; } finally { await fin(); }
+}
+
+{
+  appelAbsent = true;
+  const { journal, fin } = await appel({ cerveau: "grok" });
+  try {
+    await cas("grok : plateforme sans /api/voice/appel, l'appel se joue comme avant (sans fil)", async () => {
+      await jusqua(() => sessions().length >= 1, 15000, "session ouverte");
+      assert.ok(!configs()[0].url.includes("session="), "aucun fil inventé");
+      assert.ok(journal.some((l) => l.includes("NON ouvert (pas de parcours)")));
+    });
+  } catch (e) { console.log(journal.slice(-60).join(String.fromCharCode(10))); throw e; } finally { appelAbsent = false; await fin(); }
 }
 
 {

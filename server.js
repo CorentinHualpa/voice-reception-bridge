@@ -52,6 +52,7 @@ import { creerFinDeTour } from "./lib/fin-de-tour.mjs";
 import { OUTILS_DE_COMMANDE, consigneClotureCommande, createPizzeria } from "./lib/pizzeria.js";
 import {
   chargerSession,
+  ouvrirAppel,
   dalevozActif,
   demandeReconfiguration,
   ecrireCommandeRestaurant,
@@ -2176,10 +2177,23 @@ wss.on("connection", (twilio, requete) => {
     if (dalevozActif && toNumber) {
       canalDV = (await resoudreNumero(toNumber, { reprise: true })).canal ?? null; // appel deja admis par /twiml : jamais refuse ici
       if (canalDV) {
+        // Le fil Dale Voz de l'appel, ouvert des le decroche (07/11/2026) : sans lui, aucun parcours n'est servi.
+        // En reprise apres transfert, c'est le fil de la premiere partie. Plateforme ancienne ou lente : null, comme avant.
+        if (!sessionIdDV) {
+          sessionIdDV = reprise?.sessionId || (await ouvrirAppel({
+            tenantId: canalDV.tenantId,
+            agentSlug: canalDV.agentSlug,
+            appelId: callSid,
+            userId: frPhone(fromNumber) || undefined,
+            locale: canalDV.locale,
+          }));
+          console.log(`[dalevoz] fil de l'appel ${sessionIdDV ? (reprise ? "repris " : "ouvert ") + sessionIdDV : "NON ouvert (pas de parcours)"} ${t()} sid=${callSid}`);
+        }
         sessionDV = await chargerSession({
           tenantId: canalDV.tenantId,
           agentSlug: canalDV.agentSlug,
           locale: canalDV.locale,
+          sessionId: sessionIdDV || undefined,
         });
         if (!sessionDV) console.error(`[dalevoz] config introuvable pour ${canalDV.agentSlug}, repli sur la config locale`);
         else {
