@@ -53,6 +53,7 @@ import { OUTILS_DE_COMMANDE, consigneClotureCommande, createPizzeria } from "./l
 import {
   chargerSession,
   dalevozActif,
+  demandeReconfiguration,
   ecrireCommandeRestaurant,
   ecrireRappelRestaurant,
   enregistrerAppel,
@@ -331,6 +332,9 @@ const ELEVEN_REALTIME_MODEL = process.env.ELEVEN_REALTIME_MODEL || "eleven_realt
 const ELEVEN_REALTIME_VOIX = process.env.ELEVEN_REALTIME_VOIX || "brian";
 const ELEVEN_REALTIME_DUREE_S = Number(process.env.ELEVEN_REALTIME_DUREE_S || 1800);
 const ELEVEN_REALTIME_URL = process.env.ELEVEN_REALTIME_URL || "https://api.elevenlabs.io";
+// BANC SEULEMENT : adresse de la session temps reel de xAI (jeton et WebSocket), pour jouer un faux Grok en local
+// (test/parcours-test.mjs). Absente en production : la vraie API.
+const XAI_REALTIME_BASE = (process.env.XAI_REALTIME_BASE || "https://api.x.ai").replace(/\/+$/, "");
 if ((process.env.CERVEAU || "").toLowerCase() === "eleven" && !CERVEAU_ELEVEN) console.error("[cerveau] CERVEAU=eleven exige ELEVENLABS_API_KEY : Grok conserve");
 // Les deux moteurs a protocole OpenAI (OpenAI Realtime, Eleven Realtime) partagent leurs reglages : audio mu-law en entree
 // comme en sortie, message du client cree au commit, reponse demandee par le pont sans attendre de texte.
@@ -2063,6 +2067,7 @@ wss.on("connection", (twilio, requete) => {
     };
   }
   let sessionOpenAI = null, sessionOpenAIReessayee = false;
+  let rejouerSession = null; // pose par openGrok : relit la config Dale Voz et rejoue session.update (parcours)
   let voixDeSecoursActive = false;
   function voixDeSecours() {
     if (!CERVEAU_OPENAI || voixDeSecoursActive || !(grok && grok.readyState === WebSocket.OPEN)) return;
@@ -2213,7 +2218,7 @@ wss.on("connection", (twilio, requete) => {
       }
     } else if (!CERVEAU_OPENAI) { // OpenAI s'ouvre cote serveur avec la cle, sans jeton ephemere
       try {
-        const tok = await fetch("https://api.x.ai/v1/realtime/client_secrets", {
+        const tok = await fetch(`${XAI_REALTIME_BASE}/v1/realtime/client_secrets`, {
           method: "POST",
           headers: { Authorization: `Bearer ${XAI_API_KEY}`, "Content-Type": "application/json" },
           body: JSON.stringify({ expires_after: { seconds: 600 } }),
@@ -2254,9 +2259,11 @@ wss.on("connection", (twilio, requete) => {
       ? new WebSocket(urlRealtimeEleven(modele, ELEVEN_REALTIME_URL), { headers: { Authorization: `Bearer ${token}` } })
       : CERVEAU_OPENAI
       ? new WebSocket(`wss://api.openai.com/v1/realtime?model=${modele}`, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } })
-      : new WebSocket(`wss://api.x.ai/v1/realtime?model=${modele}`, [`xai-client-secret.${token}`]);
+      : new WebSocket(`${XAI_REALTIME_BASE.replace(/^http/, "ws")}/v1/realtime?model=${modele}`, [`xai-client-secret.${token}`]);
 
-    grok.on("open", () => {
+    // Consigne et outils de l'appel, composes depuis `sessionDV` : a l'ouverture, puis de nouveau quand un outil de
+    // Dale Voz rend `reconfigurer: true` (parcours, casquette, 07/11/2026). Meme composition dans les deux cas.
+    const composerSession = () => {
       const callerFr = frPhone(fromNumber);
       const callerSpoken = callerFr ? frPhoneSpoken(callerFr) : "";
       const instructionsBase = sessionDV?.instructions || RECEPTION_PROMPT;
@@ -2300,25 +2307,28 @@ wss.on("connection", (twilio, requete) => {
       // envoyait toujours GROK_REASONING (defaut "high") : un agent regle sur « Rapide » dans l'onglet
       // Voix (Palazzo) reflechissait quand meme avant chaque reponse, d'ou la latence remontee par Jacky.
       const effort = sessionDV?.reasoning === "none" || sessionDV?.reasoning === "high" ? sessionDV.reasoning : GROK_REASONING;
-      console.log(`[session] cerveau=${CERVEAU_ELEVEN ? "eleven" : CERVEAU_OPENAI ? "openai" : "grok"} modele=${modele} reflexion=${effort} tours=${TOURS_PAR_LE_PONT ? "pont fin_de_tour=" + finDeTourMs + "ms" : "grok seuil=" + seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} carte=${carteAjoutee ? "ajoutee" : "non"} anticipation=${ANTICIPATION_MS}ms doublure=${HEDGE_APRES_MS ? HEDGE_APRES_MS + "ms" : "non"} ambiance=${ambiance ? ambiance.libelle : "non"} lecture=${lectureActive() ? "elevenlabs" : "grok"} fin_de_tour=${eot ? "modele seuil=" + EOT_SEUIL + " delai=" + EOT_DELAI_MS + "ms filet=" + finDeTourMs + "ms" : "silence seul"} ${t()} sid=${callSid}`);
+      return { sessionInstructions, outils, effort, carteAjoutee };
+    };
+    // `rejeu` : le nouveau catalogue REMPLACE l'ancien, meme vide. Sans `tools: []`, une session.update sans outils
+    // garderait ceux de l'etape precedente, donc le droit d'agir hors de l'etape. A l'ouverture, rien ne change.
+    const envoyerSession = ({ sessionInstructions, outils, effort }, rejeu = false) => {
+      const remplacer = (s) => (rejeu && !s.tools ? { ...s, tools: [] } : s);
       if (CERVEAU_ELEVEN) {
         // Le modele parle lui-meme (mu-law 8 kHz). Consigne et outils par session.update, accepte des l'ouverture.
         sessionOpenAI = { instructions: sessionInstructions, outils };
-        grok.send(JSON.stringify({ type: "session.update", session: configSessionEleven({ instructions: sessionInstructions, tools: outilsPourOpenAI(outils) }) }));
-        // Doublure : une seconde session Eleven, meme consigne, qui n'entend jamais le client (historique en texte).
-        if (TOURS_PAR_LE_PONT && HEDGE_APRES_MS > 0) ouvrirDoublure({ modele, vitesse, effort, sessionInstructions, outils });
+        grok.send(JSON.stringify({ type: "session.update", session: remplacer(configSessionEleven({ instructions: sessionInstructions, tools: outilsPourOpenAI(outils) })) }));
         return;
       }
       if (CERVEAU_OPENAI) {
         // Sortie TEXTE seule (ElevenLabs lit) ; l'audio du client arrive en mu-law tel que Twilio le donne.
         // ElevenLabs deja injoignable a l'ouverture : OpenAI parle lui-meme, avec sa voix (voir voixDeSecours).
         sessionOpenAI = { instructions: sessionInstructions, outils };
-        grok.send(JSON.stringify({ type: "session.update", session: configSessionOpenAI(sessionInstructions, outils, !lectureActive()) }));
+        grok.send(JSON.stringify({ type: "session.update", session: remplacer(configSessionOpenAI(sessionInstructions, outils, !lectureActive())) }));
         return;
       }
       grok.send(JSON.stringify({
         type: "session.update",
-        session: {
+        session: remplacer({
           instructions: sessionInstructions,
           ...(outils.length ? { tools: outils, tool_choice: "auto" } : {}),
           voice: sessionDV?.voice || GROK_VOICE,
@@ -2333,8 +2343,32 @@ wss.on("connection", (twilio, requete) => {
             },
             output: { format: { type: "audio/pcm", rate: GROK_RATE }, speed: vitesse },
           },
-        },
+        }),
       }));
+    };
+    // LES PARCOURS AU TELEPHONE (07/11/2026). Un outil de parcours de Dale Voz (demarrer_parcours, parcours_renseigner,
+    // etape_terminee) rend `reconfigurer: true` : la consigne et le catalogue de l'etape ont change cote plateforme. On
+    // relit la config de session (meme conversation) et on rejoue session.update AVANT de rendre le resultat de l'outil,
+    // comme le widget (use-grok-voice.ts). Seules la consigne et la liste d'outils changent : voix, modele, vitesse et
+    // reglages du telephone restent ceux du decroche, l'appel ne coupe pas. `false` = rien n'a ete applique.
+    rejouerSession = async () => {
+      if (!canalDV || !(grok && grok.readyState === WebSocket.OPEN)) return false;
+      const neuf = await chargerSession({ tenantId: canalDV.tenantId, agentSlug: canalDV.agentSlug, locale: canalDV.locale, sessionId: sessionIdDV });
+      if (!neuf || typeof neuf.instructions !== "string" || !(grok && grok.readyState === WebSocket.OPEN)) return false;
+      sessionDV = { ...(sessionDV || {}), instructions: neuf.instructions, tools: Array.isArray(neuf.tools) ? neuf.tools : [] };
+      const s = composerSession();
+      envoyerSession(s, true);
+      // La doublure garde la consigne et les outils du decroche : elle repondrait hors de l'etape. On la ferme.
+      if (doublure) { doublure.fermer(); doublure = null; console.log(`[doublure] fermee : la session a ete reconfiguree sid=${callSid}`); }
+      console.log(`[parcours] session rejouee : ${s.outils.length} outil(s) (${s.outils.map((o) => o.name).join(", ") || "aucun"}), consigne ${s.sessionInstructions.length} car ${t()} sid=${callSid}`);
+      return true;
+    };
+
+    grok.on("open", () => {
+      const { sessionInstructions, outils, effort, carteAjoutee } = composerSession();
+      console.log(`[session] cerveau=${CERVEAU_ELEVEN ? "eleven" : CERVEAU_OPENAI ? "openai" : "grok"} modele=${modele} reflexion=${effort} tours=${TOURS_PAR_LE_PONT ? "pont fin_de_tour=" + finDeTourMs + "ms" : "grok seuil=" + seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} carte=${carteAjoutee ? "ajoutee" : "non"} anticipation=${ANTICIPATION_MS}ms doublure=${HEDGE_APRES_MS ? HEDGE_APRES_MS + "ms" : "non"} ambiance=${ambiance ? ambiance.libelle : "non"} lecture=${lectureActive() ? "elevenlabs" : "grok"} fin_de_tour=${eot ? "modele seuil=" + EOT_SEUIL + " delai=" + EOT_DELAI_MS + "ms filet=" + finDeTourMs + "ms" : "silence seul"} ${t()} sid=${callSid}`);
+      envoyerSession({ sessionInstructions, outils, effort });
+      if (CERVEAU_OPENAI) return;
       // La doublure joue la MEME session, moins ce qui ne la concerne pas : elle n'entend jamais le client,
       // son historique lui arrive en texte. Elle garde les outils pour savoir qu'un tour en demande un : dans
       // ce cas on la jette et on attend la primaire, qui seule sait derouler le cycle.
@@ -2878,6 +2912,18 @@ wss.on("connection", (twilio, requete) => {
         });
         // La plateforme renvoie { output } deja serialise ; null = elle n'a pas repondu.
         out = reponse?.output ?? { ok: false, erreur: "outil indisponible" };
+        // PARCOURS (07/11/2026) : `reconfigurer: true` = l'etape a change cote plateforme. Consigne et outils sont rejoues
+        // AVANT de rendre le resultat, sinon le modele parlerait de la nouvelle etape avec l'ancien catalogue. Echec :
+        // le resultat devient une erreur, comme sur le widget, plutot qu'une etape appliquee a moitie.
+        if (demandeReconfiguration(out)) {
+          let applique = false;
+          try { applique = rejouerSession ? await rejouerSession() : false; }
+          catch (err) { console.error(`[parcours] rejeu de la session KO : ${err.message} sid=${callSid}`); }
+          if (!applique) {
+            console.log(`[parcours] ${c.name} demande une reconfiguration NON appliquee ${t()} sid=${callSid}`);
+            out = { error: "La suite de cette démarche n'a pas pu être chargée au téléphone. Ne la poursuis pas : propose au client de transmettre sa demande à l'équipe." };
+          }
+        }
         if (c.name === "enregistrer_commande" && typeof out === "string" && /"ok":\s*true/.test(out)) commandeEnregistreeDV = true;
         if (c.name === "demander_rappel" && typeof out === "string") {
           try {
