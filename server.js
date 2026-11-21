@@ -327,7 +327,7 @@ const OPENAI_TRANSCRIPTION_PROMPT = !TRANSCRIPTION_ACCEPTE_PROMPT ? "" : process
 // La consigne pour le modele de transcription d'UN appel : celle du service quand l'appel garde son modele (rien ne
 // change), sinon la meme regle appliquee au modele de l'appel (voix Eco : gpt-4o-transcribe) et a la langue de l'agent.
 function consigneTranscription(modele, langue) {
-  if (modele === OPENAI_TRANSCRIPTION) return OPENAI_TRANSCRIPTION_PROMPT;
+  if (modele === OPENAI_TRANSCRIPTION && langue === AGENT_LANG) return OPENAI_TRANSCRIPTION_PROMPT; // AGENT_LANG du module : celle du service
   if (!/^gpt-4o(-mini)?-transcribe(-\d{4}-\d{2}-\d{2})?$/.test(modele)) return "";
   return process.env.OPENAI_TRANSCRIPTION_PROMPT ?? (langue === "fr" && /^gpt-4o-transcribe/.test(modele)
     ? "Appel téléphonique en français. L'appelant épelle souvent son nom ou son adresse e-mail lettre par lettre (M, A, R, I, E), avec arobase, point, tiret, deux L, et des domaines comme gmail, hotmail, yahoo, orange, free."
