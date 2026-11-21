@@ -75,4 +75,19 @@ for (const [service, attendu] of [[eleven, "eleven"], [grokService, "grok"], [op
   ok(envLectureDeLAppel(env, null).ELEVEN_VOIX === env.ELEVEN_VOIX && envLectureDeLAppel(env, null).ELEVEN_LANGUE === undefined, "sans voix ni langue : la voix du service, langue inchangee");
 }
 
+// Eco (20/11/2026) : gpt-realtime-mini parle de sa propre voix, sans ElevenLabs.
+{
+  const m = moteurDeLAppel({ oral: { cran: "eco", famille: "openai-mini", modele: "gpt-realtime-mini", voix: "cedar" }, service: eleven, env });
+  ok(m.famille === "openai" && m.source === "agent" && m.modele === "gpt-realtime-mini" && m.voixNative === "cedar" && m.voixLecture === null, "Eco : gpt-realtime-mini avec sa voix OpenAI");
+  ok(moteurDeLAppel({ oral: { famille: "openai-mini", voix: null }, service: eleven, env }).voixNative === "marin", "Eco sans voix : marin par defaut");
+  ok(moteurDeLAppel({ oral: { famille: "openai-mini", voix: null }, service: eleven, env: { ...env, OPENAI_VOIX: "alloy" } }).voixNative === "alloy", "Eco sans voix : OPENAI_VOIX du service");
+  ok(moteurDeLAppel({ oral: { famille: "openai-mini", voix: JADE }, service: eleven, env }).voixNative === "marin", "Eco avec une voix ElevenLabs : ignoree, voix OpenAI");
+  ok(moteurDeLAppel({ oral: { famille: "openai-mini", modele: "eleven_realtime_v1_max" }, service: eleven, env }).modele === "gpt-realtime-mini", "Eco : un modele non OpenAI est remplace par gpt-realtime-mini");
+  ok(moteurDeLAppel({ oral: { famille: "openai-mini" }, service: eleven, env: { ...env, ELEVENLABS_API_KEY: "" } }).famille === "openai", "Eco sans cle ElevenLabs : reste Eco (n'en a pas besoin)");
+  ok(moteurDeLAppel({ oral: { famille: "openai-mini" }, service: eleven, env: { ...env, GARDE_BASCULE_LE: "x" }, soldeEleven: 10 }).famille === "openai", "Eco apres la bascule ElevenLabs et credits bas : reste Eco");
+  const g = moteurDeLAppel({ oral: { famille: "openai-mini" }, service: eleven, env: { ...env, OPENAI_API_KEY: "" } });
+  ok(g.famille === "grok" && /OPENAI_API_KEY/.test(g.raison), "Eco sans cle OpenAI : Grok");
+  ok(moteurDeLAppel({ oral: { famille: "openai-realtime", voix: JADE }, service: eleven, env }).voixNative === undefined, "Reactive : jamais de voix native");
+}
+
 console.log(`\n${n} verifications passees`);

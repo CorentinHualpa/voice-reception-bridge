@@ -324,6 +324,15 @@ const TRANSCRIPTION_ACCEPTE_PROMPT = /^gpt-4o(-mini)?-transcribe(-\d{4}-\d{2}-\d
 const OPENAI_TRANSCRIPTION_PROMPT = !TRANSCRIPTION_ACCEPTE_PROMPT ? "" : process.env.OPENAI_TRANSCRIPTION_PROMPT ?? (AGENT_LANG === "fr" && /^gpt-4o-transcribe/.test(OPENAI_TRANSCRIPTION)
   ? "Appel téléphonique en français. L'appelant épelle souvent son nom ou son adresse e-mail lettre par lettre (M, A, R, I, E), avec arobase, point, tiret, deux L, et des domaines comme gmail, hotmail, yahoo, orange, free."
   : "");
+// La consigne pour le modele de transcription d'UN appel : celle du service quand l'appel garde son modele (rien ne
+// change), sinon la meme regle appliquee au modele de l'appel (voix Eco : gpt-4o-transcribe) et a la langue de l'agent.
+function consigneTranscription(modele, langue) {
+  if (modele === OPENAI_TRANSCRIPTION) return OPENAI_TRANSCRIPTION_PROMPT;
+  if (!/^gpt-4o(-mini)?-transcribe(-\d{4}-\d{2}-\d{2})?$/.test(modele)) return "";
+  return process.env.OPENAI_TRANSCRIPTION_PROMPT ?? (langue === "fr" && /^gpt-4o-transcribe/.test(modele)
+    ? "Appel téléphonique en français. L'appelant épelle souvent son nom ou son adresse e-mail lettre par lettre (M, A, R, I, E), avec arobase, point, tiret, deux L, et des domaines comme gmail, hotmail, yahoo, orange, free."
+    : "");
+}
 const OPENAI_VOIX = process.env.OPENAI_VOIX || "marin";
 // CERVEAU=eleven (20/10/2026, essai local) : Eleven Realtime (eleven_realtime_v1_max | _mini), API WebSocket compatible
 // OpenAI Realtime (wss://api.elevenlabs.io/v1/convai/realtime), architecture en CASCADE (STT, LLM, TTS d'ElevenLabs).
@@ -906,6 +915,13 @@ wss.on("connection", (twilio, requete) => {
   let voixElevenAppel = ELEVEN_REALTIME_VOIX;   // voix d'Eleven Realtime (Naturelle)
   let modeleElevenAppel = ELEVEN_REALTIME_MODEL;
   let modeleOpenaiAppel = OPENAI_REALTIME_MODEL;
+  // VOIX ECO (20/11/2026) : gpt-realtime-mini parle de sa propre voix. Reglage mesure sur la branche
+  // feat/openai-realtime-mini (6 vrais appels) : reponse sur la transcription gpt-4o-transcribe, sans anticipation
+  // (sur le son, scenario rate 3 fois sur 3 ; sur le texte, 3 sur 3 justes en 2,7 s). Ces trois valeurs sont donc
+  // PAR APPEL : celles du service, remplacees pour un agent en Eco (OPENAI_TRANSCRIPTION_ECO, REPONSE_SUR_TEXTE_ECO).
+  let voixOpenaiAppel = OPENAI_VOIX;
+  let transcriptionAppel = OPENAI_TRANSCRIPTION;
+  let reponseSurTexteAppel = REPONSE_SUR_TEXTE;
   let AGENT_LANG = AGENT_LANG_SERVICE;          // langue de transcription : celle de la session de l'agent
   // Eleven Realtime glisse des balises de jeu dans le texte de ses reponses (« [friendly] Pourriez-vous... ») : elles
   // n'appartiennent ni au dialogue, ni au recap, ni aux detecteurs de phrase.
@@ -1001,7 +1017,7 @@ wss.on("connection", (twilio, requete) => {
   // se comptent, et un doublon (meme texte que la finale precedente du message) ne compte pas.
   let commitsSansAccuse = 0, reponseDifferee = null;
   const finalesAttendues = new Map(), derniereFinale = new Map();
-  const surTexte = () => CERVEAU_OPENAI && REPONSE_SUR_TEXTE && TOURS_PAR_LE_PONT; // voir REPONSE_SUR_TEXTE
+  const surTexte = () => CERVEAU_OPENAI && reponseSurTexteAppel && TOURS_PAR_LE_PONT; // voir REPONSE_SUR_TEXTE
   const attendreLeTexte = () => surTexte() || (!MOTEUR_COMPAT && TOURS_PAR_LE_PONT && ATTENTE_TEXTE_MS > 0);
   // Reponse sur le texte : les messages du client (son) envoyes depuis la derniere reponse, et leur transcription
   // finale. Ils sont remplaces par UN message texte juste avant la demande de reponse.
@@ -1030,6 +1046,23 @@ wss.on("connection", (twilio, requete) => {
   // Ce que Dale Voz doit savoir pour payer la minute au prix du moteur qui a parle (26/10/2026) : le modele de la
   // session et si une doublure a tourne (elle double le cout). Envoye a la fin de l'appel, voir enregistrerAppel.
   let modeleAppel = null, doublureOuverte = false, reponsesLues = 0;
+  // CONSOMMATION REELLE DE L'APPEL (20/11/2026, repris de feat/openai-realtime-mini) : jetons de chaque `response.done`
+  // et de chaque transcription, ecrits en une ligne `[usage]` a la fin de l'appel, pour chiffrer la minute reelle.
+  const usageAppel = { reponses: 0, in_texte: 0, in_audio: 0, cache_texte: 0, cache_audio: 0, out_texte: 0, out_audio: 0, tr_secondes: 0, tr_in: 0, tr_out: 0, transcriptions: 0 };
+  function cumulerUsage(u) {
+    if (!u || typeof u !== "object") return;
+    const di = u.input_token_details || {}, cd = di.cached_tokens_details || {}, dout = u.output_token_details || {};
+    usageAppel.reponses++;
+    usageAppel.in_texte += di.text_tokens || 0; usageAppel.in_audio += di.audio_tokens || 0;
+    usageAppel.cache_texte += cd.text_tokens || 0; usageAppel.cache_audio += cd.audio_tokens || 0;
+    usageAppel.out_texte += dout.text_tokens || 0; usageAppel.out_audio += dout.audio_tokens || 0;
+  }
+  function cumulerUsageTranscription(u) {
+    if (!u || typeof u !== "object") return;
+    usageAppel.transcriptions++;
+    if (u.type === "duration") usageAppel.tr_secondes += Number(u.seconds) || 0;
+    else { usageAppel.tr_in += u.input_tokens || 0; usageAppel.tr_out += u.output_tokens || 0; }
+  }
   let doublureGagnante = false; // la reponse en cours est jouee par la doublure, pas par la primaire
   let resteAudioDoublure = Buffer.alloc(0); // octet impair en attente, comme pour la primaire
   let primaireJetee = 0;                    // n° de la reponse de la primaire dont le son ne doit plus partir
@@ -1057,18 +1090,24 @@ wss.on("connection", (twilio, requete) => {
     if (m.raison) console.error(`[cerveau] choix de l'agent non suivi (${m.raison}) : Grok pour cet appel ${t()} sid=${callSid}`);
     const langue = typeof sessionDV?.locale === "string" && /^[a-z]{2}/i.test(sessionDV.locale) ? sessionDV.locale.slice(0, 2).toLowerCase() : null;
     // Voix `null` = celle de la ligne (envLectureDeLAppel retombe sur ELEVEN_VOIX du service).
-    const cfg = m.famille === "grok" ? null : configLectureEleven(envLectureDeLAppel(process.env, m.famille === "eleven" ? m.voixEleven : m.voixLecture, langue));
+    const cfg = m.famille === "grok" || m.voixNative ? null : configLectureEleven(envLectureDeLAppel(process.env, m.famille === "eleven" ? m.voixEleven : m.voixLecture, langue));
     CERVEAU_ELEVEN = m.famille === "eleven";
-    CERVEAU_OPENAI = m.famille === "openai" && Boolean(cfg); // OpenAI ne parle qu'avec sa lecture ElevenLabs
+    // OpenAI parle avec sa lecture ElevenLabs (Reactive), ou de sa propre voix (Eco, `voixNative`).
+    CERVEAU_OPENAI = m.famille === "openai" && (Boolean(cfg) || Boolean(m.voixNative));
     MOTEUR_COMPAT = CERVEAU_ELEVEN || CERVEAU_OPENAI;
-    ANTICIPATION_MS = anticipationMs(CERVEAU_ELEVEN);
+    ANTICIPATION_MS = anticipationMs(CERVEAU_ELEVEN || Boolean(m.voixNative));
+    if (CERVEAU_OPENAI && m.voixNative) {
+      voixOpenaiAppel = m.voixNative;
+      transcriptionAppel = process.env.OPENAI_TRANSCRIPTION_ECO || "gpt-4o-transcribe";
+      reponseSurTexteAppel = (process.env.REPONSE_SUR_TEXTE_ECO ?? "1") === "1";
+    }
     REPONSE_IGNOREE_MS = reponseIgnoreeMs(CERVEAU_ELEVEN);
     if (langue) AGENT_LANG = langue;
     if (CERVEAU_ELEVEN) { if (m.voixEleven) voixElevenAppel = m.voixEleven; if (m.modele) modeleElevenAppel = m.modele; }
     if (CERVEAU_OPENAI) modeleOpenaiAppel = m.modele;
     lecture = cfg && !CERVEAU_ELEVEN ? creerLectureEleven(cfg, journalLecture) : null;
     lectureAccueil = cfg && CERVEAU_ELEVEN ? creerLectureEleven(cfg, journalLecture) : null;
-    console.log(`[cerveau] appel : ${CERVEAU_ELEVEN ? `eleven ${modeleElevenAppel} voix ${voixElevenAppel}` : CERVEAU_OPENAI ? `openai ${modeleOpenaiAppel} lu par ${cfg?.voix}` : "grok"} (choisi pour l'agent${m.raison ? ", repli" : ""}) langue ${AGENT_LANG} ${t()} sid=${callSid}`);
+    console.log(`[cerveau] appel : ${CERVEAU_ELEVEN ? `eleven ${modeleElevenAppel} voix ${voixElevenAppel}` : CERVEAU_OPENAI ? (m.voixNative ? `openai ${modeleOpenaiAppel} voix native ${voixOpenaiAppel}, transcription ${transcriptionAppel}${reponseSurTexteAppel ? ", reponse sur le texte" : ""}` : `openai ${modeleOpenaiAppel} lu par ${cfg?.voix}`) : "grok"} (choisi pour l'agent${m.raison ? ", repli" : ""}) langue ${AGENT_LANG} ${t()} sid=${callSid}`);
   }
   // Eleven injoignable a l'ouverture (jeton refuse) : l'appel part sur Grok au lieu de rester muet.
   function basculerSurGrok() {
@@ -2135,8 +2174,8 @@ wss.on("connection", (twilio, requete) => {
       ...(normes.length ? { tools: normes, tool_choice: "auto" } : {}),
       output_modalities: voix ? ["audio"] : ["text"],
       audio: {
-        input: { format: { type: "audio/pcmu" }, transcription: { model: OPENAI_TRANSCRIPTION, language: AGENT_LANG, ...(OPENAI_TRANSCRIPTION_PROMPT ? { prompt: OPENAI_TRANSCRIPTION_PROMPT } : {}) }, turn_detection: null },
-        ...(voix ? { output: { format: { type: "audio/pcmu" }, voice: OPENAI_VOIX } } : {}),
+        input: { format: { type: "audio/pcmu" }, transcription: { model: transcriptionAppel, language: AGENT_LANG, ...(consigneTranscription(transcriptionAppel, AGENT_LANG) ? { prompt: consigneTranscription(transcriptionAppel, AGENT_LANG) } : {}) }, turn_detection: null },
+        ...(voix ? { output: { format: { type: "audio/pcmu" }, voice: voixOpenaiAppel } } : {}),
       },
     };
   }
@@ -2146,8 +2185,8 @@ wss.on("connection", (twilio, requete) => {
   function voixDeSecours() {
     if (!CERVEAU_OPENAI || voixDeSecoursActive || !(grok && grok.readyState === WebSocket.OPEN)) return;
     voixDeSecoursActive = true;
-    grok.send(JSON.stringify({ type: "session.update", session: { type: "realtime", output_modalities: ["audio"], audio: { output: { format: { type: "audio/pcmu" }, voice: OPENAI_VOIX } } } }));
-    console.log(`[cerveau] OpenAI parle avec sa voix (${OPENAI_VOIX}) jusqu'a la fin de l'appel ${t()} sid=${callSid}`);
+    grok.send(JSON.stringify({ type: "session.update", session: { type: "realtime", output_modalities: ["audio"], audio: { output: { format: { type: "audio/pcmu" }, voice: voixOpenaiAppel } } } }));
+    console.log(`[cerveau] OpenAI parle avec sa voix (${voixOpenaiAppel}) jusqu'a la fin de l'appel ${t()} sid=${callSid}`);
   }
 
   // ---- Accueil ----
@@ -2457,7 +2496,7 @@ wss.on("connection", (twilio, requete) => {
 
     grok.on("open", () => {
       const { sessionInstructions, outils, effort, carteAjoutee } = composerSession();
-      console.log(`[session] cerveau=${CERVEAU_ELEVEN ? "eleven" : CERVEAU_OPENAI ? "openai" : "grok"} modele=${modele} reflexion=${effort} tours=${TOURS_PAR_LE_PONT ? "pont fin_de_tour=" + finDeTourMs + "ms" : "grok seuil=" + seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} carte=${carteAjoutee ? "ajoutee" : "non"} anticipation=${ANTICIPATION_MS}ms doublure=${HEDGE_APRES_MS ? HEDGE_APRES_MS + "ms" : "non"} ambiance=${ambiance ? ambiance.libelle : "non"} lecture=${lectureActive() ? "elevenlabs" : "grok"} fin_de_tour=${eot ? "modele seuil=" + EOT_SEUIL + " delai=" + EOT_DELAI_MS + "ms filet=" + finDeTourMs + "ms" : "silence seul"} ${t()} sid=${callSid}`);
+      console.log(`[session] cerveau=${CERVEAU_ELEVEN ? "eleven" : CERVEAU_OPENAI ? "openai" : "grok"} modele=${modele} reflexion=${effort} tours=${TOURS_PAR_LE_PONT ? "pont fin_de_tour=" + finDeTourMs + "ms" : "grok seuil=" + seuilVad} vitesse=${vitesse} coupure=${bargeIn ? "oui" : "non"} carte=${carteAjoutee ? "ajoutee" : "non"} anticipation=${ANTICIPATION_MS}ms doublure=${HEDGE_APRES_MS ? HEDGE_APRES_MS + "ms" : "non"} ambiance=${ambiance ? ambiance.libelle : "non"} lecture=${lectureActive() ? "elevenlabs" : CERVEAU_OPENAI ? "openai-" + voixOpenaiAppel : "grok"} fin_de_tour=${eot ? "modele seuil=" + EOT_SEUIL + " delai=" + EOT_DELAI_MS + "ms filet=" + finDeTourMs + "ms" : "silence seul"} ${t()} sid=${callSid}`);
       envoyerSession({ sessionInstructions, outils, effort });
       if (CERVEAU_OPENAI) return;
       // La doublure joue la MEME session, moins ce qui ne la concerne pas : elle n'entend jamais le client,
@@ -2557,6 +2596,7 @@ wss.on("connection", (twilio, requete) => {
           }
           break;
         case "response.done": {
+          cumulerUsage(e.response?.usage); // toutes les reponses facturees, y compris spontanees, annulees ou doublees
           if (reponseSpontanee) { reponseSpontanee = false; break; } // fin de la reponse ignoree ci-dessus
           if (primaireASolder && respSeq === primaireASolder) { solderPrimaire(e); break; }
           libererTamponLecture(); // un début retenu qui n'était pas un mot parasite part à la lecture avant sa fin
@@ -2579,6 +2619,7 @@ wss.on("connection", (twilio, requete) => {
         }
         case "conversation.item.input_audio_transcription.updated":
         case "conversation.item.input_audio_transcription.completed":
+          if (e.type.endsWith(".completed")) cumulerUsageTranscription(e.usage);
           // Eleven ne consomme pas son tampon d'entree : la transcription reprend TOUT l'appel. On ne garde que le neuf.
           if (CERVEAU_ELEVEN && typeof e.transcript === "string") e = { ...e, transcript: partNouvelleEleven(e.transcript) };
           if (process.env.JOURNAL_DIALOGUE === "1") console.log(`[transcription] ${e.type.split(".").pop()} item=${e.item_id} ligne=${tourClient ? tourClient.idx : "aucune"} « ${e.transcript} » ${t()}`);
@@ -3177,6 +3218,7 @@ wss.on("connection", (twilio, requete) => {
   async function finalize() {
     if (finalized) return;
     finalized = true;
+    if (usageAppel.reponses || usageAppel.transcriptions) console.log(`[usage] modele=${modeleAppel || "-"} transcription=${CERVEAU_OPENAI ? transcriptionAppel : "-"} duree=${Math.round((Date.now() - debutAppelMs) / 1000)}s ${JSON.stringify(usageAppel)} sid=${callSid}`);
     clearInterval(inactivityTimer);
     fluxPrimaire?.couper(); fluxDoublure?.couper();
     abandonnerReponseDifferee();
